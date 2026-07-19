@@ -144,9 +144,6 @@ def start_live_loop():
     return True
 
 
-start_live_loop()
-
-
 @app.get("/")
 @app.get("/dashboard")
 def index(): return render_template("dashboard.html")
@@ -154,6 +151,7 @@ def index(): return render_template("dashboard.html")
 
 @app.get("/health")
 def health():
+    start_live_loop()
     with live_lock: state = dict(live_state)
     return jsonify({"status":"ok","service":"btc-structure-flow-predictor","paper_only":True,"market_feed":state["status"],"live_loop_owner":live_thread_started,"live_thread_alive":bool(live_thread and live_thread.is_alive())})
 
