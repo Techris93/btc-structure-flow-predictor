@@ -1,5 +1,6 @@
 import app as web_app
 from app import _upsert_subscription
+from pathlib import Path
 
 
 def test_existing_push_endpoint_replaces_rotated_encryption_keys():
@@ -35,3 +36,12 @@ def test_webpush_receives_persistent_pem_file_path(monkeypatch):
     assert web_app._send_push({"title": "test"}, [subscription]) == (1, 0)
     assert captured["vapid_private_key"] == str(web_app.vapid_path)
     assert captured["vapid_private_key"].endswith("vapid_private.pem")
+
+
+def test_dashboard_restores_enabled_push_state_after_reload():
+    dashboard = (Path(__file__).parents[1] / "templates" / "dashboard.html").read_text()
+
+    assert "async function syncPushButton()" in dashboard
+    assert "await navigator.serviceWorker.getRegistration()" in dashboard
+    assert 'b.textContent = sub ? "Notifications enabled"' in dashboard
+    assert "syncPushButton();" in dashboard

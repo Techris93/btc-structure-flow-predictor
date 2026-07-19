@@ -231,6 +231,25 @@
           });
         last = key;
       }
+      async function syncPushButton() {
+        const b = $("notify");
+        if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+          b.textContent = "Push unsupported";
+          return;
+        }
+        if (!("Notification" in window) || Notification.permission !== "granted") {
+          b.textContent = "Enable push notifications";
+          return;
+        }
+        try {
+          const reg = await navigator.serviceWorker.getRegistration();
+          const sub = reg ? await reg.pushManager.getSubscription() : null;
+          b.textContent = sub ? "Notifications enabled" : "Enable push notifications";
+          b.title = sub ? "Click to send a test notification" : "";
+        } catch (_) {
+          b.textContent = "Enable push notifications";
+        }
+      }
       async function enablePush() {
         const b = $("notify");
         if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
@@ -267,8 +286,9 @@
             })
           ).json();
           b.textContent = test.sent
-            ? "Test notification sent"
+            ? "Notifications enabled"
             : "Push registered; test failed";
+          if (test.sent) b.title = "Click to send a test notification";
         } catch (e) {
           b.textContent = "Push setup failed";
           $("reason").textContent = e.message;
@@ -286,6 +306,7 @@
         }
       }
       $("notify").onclick = enablePush;
+      syncPushButton();
       refresh();
       setInterval(refresh, 15000);
     </script>
