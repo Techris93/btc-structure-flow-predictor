@@ -10,13 +10,36 @@ from .footprint import orderflow_features
 class Predictor:
     def __init__(self, risk_fraction=.0025, atr_mult=1.5, min_rr=1.5, sweep_atr=(.05, 2.0)):
         self.risk_fraction, self.atr_mult, self.min_rr, self.sweep_atr = risk_fraction, atr_mult, min_rr, sweep_atr
+        self._held_bias = "neutral"
 
-    def predict(self, ohlc: pd.DataFrame, trades: pd.DataFrame, equity: float = 100_000) -> PredictorOutput:
+    def _regime_bias(self, frames: dict[str, pd.DataFrame]) -> str:
+        signals = []
+        for name in ("4h", "1h"):
+            frame = frames.get(name)
+            if frame is None or len(frame) < 40: return "neutral"
+            events = structure_events(frame)
+            signals.append(events.iloc[-1].bias if not events.empty else "neutral")
+        candidate = signals[0] if signals[0] == signals[1] else "neutral"
+        # A held directional regime can only reverse after an explicitly
+        # confirmed opposing CHoCH on the higher-timeframe frames.
+        if self._held_bias in ("bullish", "bearish") and candidate in ("bullish", "bearish") and candidate != self._held_bias:
+            opposing_choch = any(
+                (not structure_events(frames[n]).empty and structure_events(frames[n]).iloc[-1].event == "CHoCH")
+                for n in ("4h", "1h")
+            )
+            if not opposing_choch: return self._held_bias
+        if candidate in ("bullish", "bearish"): self._held_bias = candidate
+        return self._held_bias
+
+    def predict(self, ohlc: pd.DataFrame, trades: pd.DataFrame, equity: float = 100_000, frames: dict[str, pd.DataFrame] | None = None) -> PredictorOutput:
         if len(ohlc) < 80 or trades.empty: return PredictorOutput(ohlc.index[-1], "neutral", no_trade_reason="insufficient_history")
         o=ohlc.copy(); o.index=pd.to_datetime(o.index,utc=True); t=trades.copy(); t["time"]=pd.to_datetime(t.time,utc=True)
-        ev=structure_events(o); bias=ev.iloc[-1].bias if not ev.empty else "neutral"; now=o.index[-1]; price=float(o.close.iloc[-1]); a=float(atr(o).iloc[-1])
+        frames = frames or {}
+        setup = frames.get("15m", o)
+        bias = self._regime_bias(frames) if frames else (structure_events(o).iloc[-1].bias if not structure_events(o).empty else "neutral")
+        ev=structure_events(setup); now=o.index[-1]; price=float(o.close.iloc[-1]); a=float(atr(o).iloc[-1])
         if bias == "neutral" or not np.isfinite(a): return PredictorOutput(now,bias,no_trade_reason="neutral_or_unready_structure")
-        zones=build_projected_zones(o); candidates=[z for z in zones if z.available_at <= now and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above")) and z.swept_at is None]
+        zones=build_projected_zones(setup); candidates=[z for z in zones if z.available_at <= now and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above")) and z.swept_at is None]
         if not candidates: return PredictorOutput(now,bias,no_trade_reason="no_projected_zone")
         z=min(candidates,key=lambda q: abs(price-q.midpoint)); f=orderflow_features(t); flow=f.iloc[-1]
         swept=(bias=="bullish" and o.low.iloc[-1] < z.low and price > z.high) or (bias=="bearish" and o.high.iloc[-1] > z.high and price < z.low)

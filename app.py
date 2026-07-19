@@ -82,15 +82,17 @@ def one_year_backtest_status():
 
 def _bybit_data():
     base = "https://api.bybit.com/v5/market"
-    k = requests.get(f"{base}/kline", params={"category":"linear","symbol":"BTCUSDT","interval":"1","limit":"300"}, timeout=10).json()
-    rows = list(reversed(k["result"]["list"]))
-    ohlc = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume","turnover"])
-    ohlc["timestamp"] = pd.to_datetime(pd.to_numeric(ohlc.timestamp), unit="ms", utc=True)
-    for c in ["open","high","low","close","volume"]: ohlc[c] = pd.to_numeric(ohlc[c])
-    ohlc = ohlc.set_index("timestamp")
+    def candles(interval, limit="300"):
+        k = requests.get(f"{base}/kline", params={"category":"linear","symbol":"BTCUSDT","interval":interval,"limit":limit}, timeout=10).json()
+        rows = list(reversed(k["result"]["list"]))
+        frame = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume","turnover"])
+        frame["timestamp"] = pd.to_datetime(pd.to_numeric(frame.timestamp), unit="ms", utc=True)
+        for c in ["open","high","low","close","volume"]: frame[c] = pd.to_numeric(frame[c])
+        return frame.set_index("timestamp")
+    ohlc, frames = candles("1"), {"15m":candles("15"), "1h":candles("60"), "4h":candles("240")}
     tr = requests.get(f"{base}/recent-trade", params={"category":"linear","symbol":"BTCUSDT","limit":"1000"}, timeout=10).json()["result"]["list"]
     trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in tr],unit="ms",utc=True),"price":[float(x["price"]) for x in tr],"qty":[float(x["size"]) for x in tr],"side":[x["side"].lower() for x in tr],"exchange":"bybit"})
-    return ohlc, trades
+    return ohlc, trades, frames
 
 
 def _binance_trades():
@@ -102,14 +104,14 @@ def _live_loop():
     global live_state
     while True:
         try:
-            ohlc, trades = _bybit_data()
+            ohlc, trades, frames = _bybit_data()
             sources = "bybit"
             try:
                 trades = pd.concat([trades, _binance_trades()], ignore_index=True)
                 sources = "bybit+binance"
             except Exception:
                 pass
-            result = predictor.predict(ohlc, trades, 100000)
+            result = predictor.predict(ohlc, trades, 100000, frames=frames)
             with live_lock:
                 live_state = {"status":"live", "source":sources, "prediction":dict(result.__dict__), "updated_at":pd.Timestamp.utcnow().isoformat(), "error":None}
         except Exception as exc:
