@@ -163,6 +163,21 @@
               ? v.toFixed(2)
               : v;
       let last = "";
+      function vapidBytes(value) {
+        const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+        const raw = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
+        return Uint8Array.from(raw, (character) => character.charCodeAt(0));
+      }
+      function subscriptionUsesKey(subscription, publicKey) {
+        const existing = subscription?.options?.applicationServerKey;
+        if (!existing) return false;
+        const current = new Uint8Array(existing);
+        const expected = vapidBytes(publicKey);
+        return (
+          current.length === expected.length &&
+          current.every((value, index) => value === expected[index])
+        );
+      }
       function render(s) {
         const x = s.prediction || {},
           bias = x.bias || "neutral";
@@ -230,6 +245,10 @@
           if (permission !== "granted")
             throw Error("Browser permission was not granted");
           let sub = await reg.pushManager.getSubscription();
+          if (sub && !subscriptionUsesKey(sub, c.vapid_public_key)) {
+            await sub.unsubscribe();
+            sub = null;
+          }
           if (!sub)
             sub = await reg.pushManager.subscribe({
               userVisibleOnly: true,
