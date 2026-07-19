@@ -13,7 +13,7 @@ services:
     disk:
       name: btc-predictor-state
       mountPath: /var/data
-      sizeGB: 10
+      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: "3.12"
