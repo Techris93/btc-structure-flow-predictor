@@ -8,8 +8,8 @@ from .zones import build_projected_zones
 from .footprint import orderflow_features
 
 class Predictor:
-    def __init__(self, risk_fraction=.0025, atr_mult=1.5, min_rr=1.5, sweep_atr=(.05, 2.0)):
-        self.risk_fraction, self.atr_mult, self.min_rr, self.sweep_atr = risk_fraction, atr_mult, min_rr, sweep_atr
+    def __init__(self, risk_fraction=.0025, atr_mult=1.5, min_rr=1.5, sweep_atr=(.05, 2.0), flow_freq="1min"):
+        self.risk_fraction, self.atr_mult, self.min_rr, self.sweep_atr, self.flow_freq = risk_fraction, atr_mult, min_rr, sweep_atr, flow_freq
         self._held_bias = "neutral"
 
     def _regime_bias(self, frames: dict[str, pd.DataFrame]) -> str:
@@ -41,7 +41,7 @@ class Predictor:
         if bias == "neutral" or not np.isfinite(a): return PredictorOutput(now,bias,no_trade_reason="neutral_or_unready_structure")
         zones=build_projected_zones(setup); candidates=[z for z in zones if z.available_at <= now and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above")) and z.swept_at is None]
         if not candidates: return PredictorOutput(now,bias,no_trade_reason="no_projected_zone")
-        z=min(candidates,key=lambda q: abs(price-q.midpoint)); f=orderflow_features(t); flow=f.iloc[-1]
+        z=min(candidates,key=lambda q: abs(price-q.midpoint)); f=orderflow_features(t, freq=self.flow_freq); flow=f.iloc[-1]
         swept=(bias=="bullish" and o.low.iloc[-1] < z.low and price > z.high) or (bias=="bearish" and o.high.iloc[-1] > z.high and price < z.low)
         confirm=bool(flow.delta_reversal if bias=="bullish" else (flow.delta_z < -1 if np.isfinite(flow.delta_z) else False))
         if not swept: return PredictorOutput(now,bias,zone=z.zone_id,sweep_status="approaching",no_trade_reason="sweep_not_confirmed")
