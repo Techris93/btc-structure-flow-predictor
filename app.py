@@ -15,6 +15,7 @@ predictor = Predictor()
 live_lock = threading.Lock()
 live_state = {"status": "starting", "source": None, "prediction": None, "updated_at": None, "error": None}
 live_thread_started = False
+live_thread = None
 
 
 def _bybit_data():
@@ -56,10 +57,11 @@ def _live_loop():
 
 
 def start_live_loop():
-    global live_thread_started
-    if not live_thread_started:
+    global live_thread_started, live_thread
+    if not live_thread_started or live_thread is None or not live_thread.is_alive():
         live_thread_started = True
-        threading.Thread(target=_live_loop, name="live-predictor", daemon=True).start()
+        live_thread = threading.Thread(target=_live_loop, name="live-predictor", daemon=True)
+        live_thread.start()
 
 
 start_live_loop()
@@ -79,6 +81,7 @@ def health():
 
 @app.get("/api/live")
 def api_live():
+    start_live_loop()
     with live_lock: state = dict(live_state)
     if state.get("prediction"):
         state["prediction"] = dict(state["prediction"])
