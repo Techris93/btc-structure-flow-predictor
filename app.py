@@ -88,7 +88,9 @@ def _bybit_data():
         frame = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume","turnover"])
         frame["timestamp"] = pd.to_datetime(pd.to_numeric(frame.timestamp), unit="ms", utc=True)
         for c in ["open","high","low","close","volume"]: frame[c] = pd.to_numeric(frame[c])
-        return frame.set_index("timestamp")
+        # The final exchange candle is still forming; exclude it so structure
+        # and regime features only use completed bars.
+        return frame.set_index("timestamp").iloc[:-1]
     ohlc, frames = candles("1"), {"15m":candles("15"), "1h":candles("60"), "4h":candles("240")}
     tr = requests.get(f"{base}/recent-trade", params={"category":"linear","symbol":"BTCUSDT","limit":"1000"}, timeout=10).json()["result"]["list"]
     trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in tr],unit="ms",utc=True),"price":[float(x["price"]) for x in tr],"qty":[float(x["size"]) for x in tr],"side":[x["side"].lower() for x in tr],"exchange":"bybit"})
