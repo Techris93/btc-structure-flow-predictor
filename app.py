@@ -50,7 +50,6 @@ else:
     _vapid_key = ec.generate_private_key(ec.SECP256R1())
     vapid_path.write_bytes(_vapid_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
     os.chmod(vapid_path, 0o600)
-_vapid_private_pem = _vapid_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
 _vapid_public_key = base64.urlsafe_b64encode(_vapid_key.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)).rstrip(b"=").decode()
 _vapid_subject = os.getenv("VAPID_SUBJECT", "mailto:onyedikachristopher.agada@st.uskudar.edu.tr")
 secret_path = data_dir / "push_test_secret"
@@ -110,7 +109,7 @@ def _send_push(payload, subscriptions=None):
     sent, failed, stale = 0, 0, []
     for sub in targets:
         try:
-            webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=_vapid_private_pem, vapid_claims={"sub":_vapid_subject})
+            webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=str(vapid_path), vapid_claims={"sub":_vapid_subject})
             sent += 1
         except Exception as exc:
             logger.warning("Web Push delivery failed: %s", exc)
