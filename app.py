@@ -95,6 +95,15 @@ def _persist_subscriptions():
     subscription_store.write(push_subscriptions)
 
 
+def _upsert_subscription(subscriptions, subscription):
+    for index, existing in enumerate(subscriptions):
+        if existing.get("endpoint") == subscription.get("endpoint"):
+            subscriptions[index] = subscription
+            return False
+    subscriptions.append(subscription)
+    return True
+
+
 def _send_push(payload, subscriptions=None):
     if webpush is None: return 0, 0
     with push_lock: targets = list(subscriptions if subscriptions is not None else push_subscriptions)
@@ -104,6 +113,7 @@ def _send_push(payload, subscriptions=None):
             webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=_vapid_private_pem, vapid_claims={"sub":_vapid_subject})
             sent += 1
         except Exception as exc:
+            logger.warning("Web Push delivery failed: %s", exc)
             failed += 1
             if "404" in str(exc) or "410" in str(exc): stale.append(sub.get("endpoint"))
     if stale:
@@ -222,7 +232,7 @@ def push_subscribe():
     data = request.get_json(silent=True) or {}
     if not data.get("endpoint") or not data.get("keys"): return jsonify({"error":"invalid subscription"}), 400
     with push_lock:
-        if not any(x.get("endpoint") == data["endpoint"] for x in push_subscriptions): push_subscriptions.append(data)
+        _upsert_subscription(push_subscriptions, data)
         _persist_subscriptions()
     token = hmac.new(_push_secret, data["endpoint"].encode(), hashlib.sha256).hexdigest()
     return jsonify({"ok":True,"subscriptions":len(push_subscriptions),"test_token":token})
