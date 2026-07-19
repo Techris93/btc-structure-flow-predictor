@@ -10,6 +10,16 @@ app = Flask(__name__)
 predictor = Predictor()
 
 
+@app.get("/")
+def index():
+    return jsonify({
+        "service": "btc-structure-flow-predictor",
+        "status": "ok",
+        "paper_only": True,
+        "endpoints": {"health": "/health", "predict": "POST /predict"},
+    })
+
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "service": "btc-structure-flow-predictor", "paper_only": True})
