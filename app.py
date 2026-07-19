@@ -34,17 +34,12 @@ _vapid_private_pem = _vapid_key.private_bytes(serialization.Encoding.PEM, serial
 _vapid_public_key = base64.urlsafe_b64encode(_vapid_key.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)).rstrip(b"=").decode()
 _vapid_subject = os.getenv("VAPID_SUBJECT", "mailto:onyedikachristopher.agada@st.uskudar.edu.tr")
 backtest_lock = threading.Lock()
-backtest_state = {"status": "idle", "phase": "idle", "progress": 0, "checkpoint": "Not started", "bars": 0, "elapsed_seconds": 0, "result": None, "error": None}
+backtest_state = {"status": "idle", "result": None, "error": None}
 
 
 def _one_year_replay():
     global backtest_state
-    started = time.time()
-    def checkpoint(phase, progress, message, bars=0):
-        with backtest_lock:
-            backtest_state.update({"phase":phase,"progress":progress,"checkpoint":message,"bars":bars,"elapsed_seconds":round(time.time()-started,1)})
     try:
-        checkpoint("fetching", 1, "Starting Binance historical download")
         now = int(time.time() * 1000)
         start = now - 365 * 24 * 3600 * 1000
         rows = []
@@ -52,34 +47,30 @@ def _one_year_replay():
             payload = requests.get("https://fapi.binance.com/fapi/v1/klines", params={"symbol":"BTCUSDT","interval":"4h","startTime":start,"endTime":now,"limit":1000}, timeout=20).json()
             if not payload: break
             rows.extend(payload)
-            checkpoint("fetching", min(35, 5 + len(rows) / 65), f"Downloaded {len(rows)} candles", len(rows))
             next_start = int(payload[-1][0]) + 1
             if next_start <= start: break
             start = next_start
             if len(payload) < 1000: break
         o = pd.DataFrame(rows).drop_duplicates(subset=[0]).sort_values(0)
-        checkpoint("preparing", 40, f"Preparing {len(o)} unique candles", len(o))
         ohlc = pd.DataFrame({"open":pd.to_numeric(o[1]),"high":pd.to_numeric(o[2]),"low":pd.to_numeric(o[3]),"close":pd.to_numeric(o[4]),"volume":pd.to_numeric(o[5])}, index=pd.to_datetime(pd.to_numeric(o[0]),unit="ms",utc=True))
         buy = pd.to_numeric(o[9]); total = pd.to_numeric(o[5]); close = pd.to_numeric(o[4]); ts = pd.to_datetime(pd.to_numeric(o[0])+int(4*3600*1000-1),unit="ms",utc=True)
         trades = pd.concat([pd.DataFrame({"time":ts,"price":close,"qty":buy,"side":"buy"}),pd.DataFrame({"time":ts,"price":close,"qty":(total-buy).clip(lower=0),"side":"sell"})],ignore_index=True)
         trades = trades[trades.qty > 0]
-        checkpoint("backtesting", 45, "Running causal baseline replay", len(ohlc))
         ledger, stats = run_event_backtest(ohlc, trades, predictor=Predictor(), initial_equity=100000, decision_stride=12)
-        checkpoint("summarizing", 90, f"Summarizing {len(ledger)} completed trades", len(ohlc))
         wins = int((ledger.pnl > 0).sum()) if not ledger.empty else 0; losses = int((ledger.pnl <= 0).sum()) if not ledger.empty else 0
         gross_win = float(ledger.loc[ledger.pnl > 0, "pnl"].sum()) if not ledger.empty else 0.0; gross_loss = float(-ledger.loc[ledger.pnl < 0, "pnl"].sum()) if not ledger.empty else 0.0
         equity = ledger.equity if not ledger.empty else pd.Series([100000]); dd = float((equity.cummax()-equity).max())
         result = {**stats,"bars":len(ohlc),"wins":wins,"losses":losses,"profit_factor":(gross_win/gross_loss if gross_loss else None),"gross_profit":gross_win,"gross_loss":gross_loss,"max_drawdown":dd,"data_source":"Binance 4h klines + taker-buy volume proxy","flow_note":"Historical tick-level footprint was unavailable; buy/sell volume is bar-level."}
-        with backtest_lock: backtest_state = {"status":"complete","phase":"complete","progress":100,"checkpoint":"Replay complete","bars":len(ohlc),"elapsed_seconds":round(time.time()-started,1),"result":result,"error":None}
+        with backtest_lock: backtest_state = {"status":"complete","result":result,"error":None}
     except Exception as exc:
-        with backtest_lock: backtest_state.update({"status":"failed","phase":"failed","checkpoint":"Replay failed","elapsed_seconds":round(time.time()-started,1),"result":None,"error":str(exc)})
+        with backtest_lock: backtest_state = {"status":"failed","result":None,"error":str(exc)}
 
 
 @app.post("/api/backtest/one-year")
 def start_one_year_backtest():
     with backtest_lock:
         if backtest_state["status"] == "running": return jsonify(backtest_state), 202
-        backtest_state.update({"status":"running","phase":"queued","progress":0,"checkpoint":"Worker queued","bars":0,"elapsed_seconds":0,"result":None,"error":None})
+        backtest_state.update({"status":"running","result":None,"error":None})
     threading.Thread(target=_one_year_replay, name="one-year-backtest", daemon=True).start()
     return jsonify({"status":"running","poll":"/api/backtest/one-year"}), 202
 
