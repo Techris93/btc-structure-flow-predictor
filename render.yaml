@@ -1,6 +1,7 @@
 services:
   - type: web
     name: btc-structure-flow-predictor
+    repo: https://github.com/Techris93/btc-structure-flow-predictor
     runtime: python
     plan: starter
     region: singapore
