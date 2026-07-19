@@ -104,6 +104,7 @@ def _binance_trades():
 
 def _live_loop():
     global live_state
+    previous_push_key = None
     while True:
         try:
             ohlc, trades, frames = _bybit_data()
@@ -114,12 +115,33 @@ def _live_loop():
             except Exception:
                 pass
             result = predictor.predict(ohlc, trades, 100000, frames=frames)
+            push_key = "|".join(str(getattr(result, k, None)) for k in ("bias", "setup_type", "zone", "sweep_status", "entry", "stop", "target"))
+            if previous_push_key is not None and push_key != previous_push_key:
+                _send_prediction_push(result)
+            previous_push_key = push_key
             with live_lock:
                 live_state = {"status":"live", "source":sources, "prediction":dict(result.__dict__), "updated_at":pd.Timestamp.utcnow().isoformat(), "error":None}
         except Exception as exc:
             with live_lock:
                 live_state.update({"status":"degraded", "error":str(exc), "updated_at":pd.Timestamp.utcnow().isoformat()})
         time.sleep(max(15, int(os.getenv("LIVE_POLL_SECONDS", "30"))))
+
+
+def _send_prediction_push(result):
+    if webpush is None:
+        return
+    payload = {"title": "BTC Predictor update", "body": f"{result.bias.upper()} · {result.setup_type or result.no_trade_reason or result.sweep_status}"}
+    with push_lock:
+        subscriptions = list(push_subscriptions)
+    stale = []
+    for sub in subscriptions:
+        try:
+            webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=_vapid_private_pem, vapid_claims={"sub": _vapid_subject})
+        except Exception as exc:
+            if "404" in str(exc) or "410" in str(exc): stale.append(sub.get("endpoint"))
+    if stale:
+        with push_lock:
+            push_subscriptions[:] = [s for s in push_subscriptions if s.get("endpoint") not in stale]
 
 
 def start_live_loop():
