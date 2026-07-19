@@ -42,6 +42,11 @@ class TradeStore:
     def prune(self,before):
         with self.lock,self._connect() as db: db.execute("DELETE FROM trades WHERE time_us<?",(int(pd.Timestamp(before).value//1000),))
 
+    def stats(self):
+        with self.lock,self._connect() as db:
+            rows=db.execute("SELECT exchange,COUNT(*),MIN(time_us),MAX(time_us) FROM trades GROUP BY exchange").fetchall()
+        return {exchange:{"trades":count,"oldest":pd.to_datetime(oldest,unit="us",utc=True).isoformat(),"latest":pd.to_datetime(latest,unit="us",utc=True).isoformat()} for exchange,count,oldest,latest in rows}
+
 
 async def _binance(store):
     import websockets

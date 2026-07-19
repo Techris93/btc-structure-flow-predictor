@@ -34,3 +34,4 @@ def test_trade_store_deduplicates_and_persists(tmp_path):
     assert store.append(row)==1 and store.append(row)==0
     reopened=TradeStore(path); out=reopened.query(now-pd.Timedelta(seconds=1),now+pd.Timedelta(seconds=1))
     assert len(out)==1 and out.iloc[0].exchange=="binance"
+    assert reopened.stats()["binance"]["trades"]==1
