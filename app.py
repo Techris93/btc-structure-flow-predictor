@@ -125,7 +125,11 @@ def _live_loop():
             try:
                 trade_store.append(_binance_trades()); sources = "bybit+binance"
             except Exception: pass
-            now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(hours=3),now); flow_bars=_binance_flow_bars().loc[lambda x:x.index<=now]
+            now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(hours=3),now); flow_bars=None
+            try:
+                flow_bars=_binance_flow_bars().loc[lambda x:x.index<=now]
+            except Exception as exc:
+                logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
             trade_store.prune(now-pd.Timedelta(hours=6))
             key = "|".join(str(getattr(result,k,None)) for k in ("bias","regime_4h","regime_1h","setup_type","zone","sweep_status","orderflow_confirmation","orderflow_reason","entry","stop","target"))
