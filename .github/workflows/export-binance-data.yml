@@ -1,0 +1,18 @@
+name: Export Binance research data
+on:
+  workflow_dispatch:
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas requests
+      - run: python scripts/fetch_binance_vision.py --start 2025-07-19T00:00:00Z --end 2026-07-19T00:00:00Z --output export/binance_1m.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binance-1m-2025-07-19-to-2026-07-19
+          path: export/binance_1m.csv
+          retention-days: 7
