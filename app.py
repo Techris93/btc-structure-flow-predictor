@@ -2,27 +2,35 @@ from __future__ import annotations
 
 import os
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 
 from btc_predictor.strategy import Predictor
+from btc_predictor.synthetic import make_synthetic
 
 app = Flask(__name__)
 predictor = Predictor()
 
 
+@app.get("/dashboard")
 @app.get("/")
 def index():
-    return jsonify({
-        "service": "btc-structure-flow-predictor",
-        "status": "ok",
-        "paper_only": True,
-        "endpoints": {"health": "/health", "predict": "POST /predict"},
-    })
+    return render_template("dashboard.html")
 
 
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "service": "btc-structure-flow-predictor", "paper_only": True})
+
+
+@app.get("/demo")
+def demo():
+    ohlc, trades = make_synthetic(days=1)
+    ohlc = ohlc.iloc[-240:]
+    trades = trades[trades.time >= ohlc.index[0]]
+    result = predictor.predict(ohlc, trades, 100000)
+    output = dict(result.__dict__)
+    output["timestamp"] = str(output["timestamp"])
+    return jsonify({"paper_only": True, "source": "synthetic_demo", **output})
 
 
 @app.post("/predict")
