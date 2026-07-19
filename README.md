@@ -40,8 +40,10 @@ This remains research-only: it does not place orders, and `probability_tp_before
 
 - 4h and 1h completed candles establish regime; disagreement is neutral.
 - A reversal of the held regime requires an opposing confirmed CHoCH.
-- 15m completed candles produce setup structure, zones, and ATR risk.
-- 1m completed candles and trades strictly before the decision time provide footprint confirmation.
+- 15m completed candles produce swing/equal-level, prior day/week, session, breakout, volume-profile and VWAP zones plus ATR risk.
+- ATR-bounded sweeps may reclaim over multiple closed 1m candles.
+- A durable SQLite buffer receives Binance and Bybit WebSocket trades; 1m taker-buy bars provide flow baselines.
+- Confirmation requires symmetric delta reversal, absorption/extreme delta, low price response, footprint imbalance, and Binance/Bybit agreement.
 - Every projected zone has immutable identity plus creation, availability, expiry, touch, sweep, and invalidation state.
 
 ## Causal research

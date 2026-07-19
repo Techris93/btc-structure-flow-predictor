@@ -73,3 +73,10 @@ class PredictorOutput:
     probability_tp_before_sl: float | None = None
     position_size: float = 0.0
     no_trade_reason: str | None = None
+    regime_4h: str | None = None
+    regime_1h: str | None = None
+    setup_15m: str | None = None
+    zone_kind: str | None = None
+    sweep_depth_atr: float | None = None
+    orderflow_reason: str | None = None
+    exchange_agreement: bool | None = None

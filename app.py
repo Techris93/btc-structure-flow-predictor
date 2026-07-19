@@ -23,6 +23,7 @@ except ImportError:
 
 from btc_predictor.persistence import JsonStore, runtime_dir
 from btc_predictor.strategy import Predictor
+from btc_predictor.trade_store import TradeStore, start_collectors
 
 app = Flask(__name__)
 logger = logging.getLogger("btc_predictor")
@@ -33,6 +34,7 @@ push_lock = threading.Lock()
 live_state = {"status":"starting","source":None,"prediction":None,"updated_at":None,"error":None}
 live_thread_started = False
 live_thread = None
+collector_thread = None
 _live_lock_handle = None
 
 subscription_store = JsonStore(data_dir / "push_subscriptions.json")
@@ -55,6 +57,7 @@ secret_path = data_dir / "push_test_secret"
 if not secret_path.exists():
     secret_path.write_bytes(os.urandom(32)); os.chmod(secret_path, 0o600)
 _push_secret = secret_path.read_bytes()
+trade_store = TradeStore(data_dir / "live_trades.sqlite3")
 
 
 def _bybit_data():
@@ -68,17 +71,24 @@ def _bybit_data():
         for column in ["open","high","low","close","volume"]: frame[column] = pd.to_numeric(frame[column])
         frame = frame.set_index("timestamp")
         return frame.loc[frame.index <= pd.Timestamp.now(tz="UTC")]
-    ohlc, frames = candles("1"), {"15m":candles("15"),"1h":candles("60"),"4h":candles("240")}
+    ohlc, frames = candles("1","300"), {"15m":candles("15","1000"),"1h":candles("60","1000"),"4h":candles("240","1000")}
     response = requests.get(f"{base}/recent-trade", params={"category":"linear","symbol":"BTCUSDT","limit":"1000"}, timeout=10)
     response.raise_for_status(); raw = response.json()["result"]["list"]
-    trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in raw],unit="ms",utc=True),"price":[float(x["price"]) for x in raw],"qty":[float(x["size"]) for x in raw],"side":[x["side"].lower() for x in raw],"exchange":"bybit"})
+    trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in raw],unit="ms",utc=True),"price":[float(x["price"]) for x in raw],"qty":[float(x["size"]) for x in raw],"side":[x["side"].lower() for x in raw],"exchange":"bybit","trade_id":[str(x.get("execId",x.get("i",""))) for x in raw]})
     return ohlc, trades, frames
 
 
 def _binance_trades():
     response = requests.get("https://fapi.binance.com/fapi/v1/aggTrades", params={"symbol":"BTCUSDT","limit":1000}, timeout=10)
     response.raise_for_status(); raw = response.json()
-    return pd.DataFrame({"time":pd.to_datetime([x["T"] for x in raw],unit="ms",utc=True),"price":[float(x["p"]) for x in raw],"qty":[float(x["q"]) for x in raw],"side":["sell" if x["m"] else "buy" for x in raw],"exchange":"binance"})
+    return pd.DataFrame({"time":pd.to_datetime([x["T"] for x in raw],unit="ms",utc=True),"price":[float(x["p"]) for x in raw],"qty":[float(x["q"]) for x in raw],"side":["sell" if x["m"] else "buy" for x in raw],"exchange":"binance","trade_id":[str(x["a"]) for x in raw]})
+
+
+def _binance_flow_bars(limit=180):
+    response=requests.get("https://fapi.binance.com/fapi/v1/klines",params={"symbol":"BTCUSDT","interval":"1m","limit":limit},timeout=10)
+    response.raise_for_status(); raw=pd.DataFrame(response.json())
+    frame=pd.DataFrame({"close_time":pd.to_datetime(pd.to_numeric(raw[6]),unit="ms",utc=True),"open":pd.to_numeric(raw[1]),"high":pd.to_numeric(raw[2]),"low":pd.to_numeric(raw[3]),"close":pd.to_numeric(raw[4]),"volume":pd.to_numeric(raw[5]),"trades":pd.to_numeric(raw[8]),"taker_buy_volume":pd.to_numeric(raw[9])}).set_index("close_time")
+    return frame.loc[frame.index<=pd.Timestamp.now(tz="UTC")]
 
 
 def _persist_subscriptions():
@@ -111,12 +121,14 @@ def _live_loop():
     while True:
         try:
             with live_lock: live_state.update({"status":"polling","updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
-            ohlc, trades, frames = _bybit_data(); sources = "bybit"
+            ohlc, recent, frames = _bybit_data(); sources = "bybit"; trade_store.append(recent)
             try:
-                trades = pd.concat([trades, _binance_trades()], ignore_index=True); sources = "bybit+binance"
+                trade_store.append(_binance_trades()); sources = "bybit+binance"
             except Exception: pass
-            result = predictor.predict(ohlc, trades, 100_000, frames=frames)
-            key = "|".join(str(getattr(result, k, None)) for k in ("bias","setup_type","zone","sweep_status","entry","stop","target"))
+            now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(hours=3),now); flow_bars=_binance_flow_bars().loc[lambda x:x.index<=now]
+            result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
+            trade_store.prune(now-pd.Timedelta(hours=6))
+            key = "|".join(str(getattr(result,k,None)) for k in ("bias","regime_4h","regime_1h","setup_type","zone","sweep_status","orderflow_confirmation","orderflow_reason","entry","stop","target"))
             now = pd.Timestamp.now(tz="UTC"); cooldown = pd.Timedelta(seconds=int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
             if previous_key is not None and key != previous_key and (last_sent is None or now-last_sent >= cooldown):
                 _send_push({"title":"BTC Predictor update","body":f"{result.bias.upper()} · {result.setup_type or result.no_trade_reason or result.sweep_status}"})
@@ -133,13 +145,14 @@ def _live_loop():
 
 
 def start_live_loop():
-    global live_thread_started, live_thread, _live_lock_handle
+    global live_thread_started, live_thread, collector_thread, _live_lock_handle
     if live_thread_started and live_thread is not None and live_thread.is_alive(): return True
     try:
         _live_lock_handle = open(data_dir / "live-loop.lock", "w")
         fcntl.flock(_live_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError): return False
     live_thread_started = True
+    collector_thread=start_collectors(trade_store)
     live_thread = threading.Thread(target=_live_loop, name="live-predictor", daemon=True); live_thread.start()
     return True
 

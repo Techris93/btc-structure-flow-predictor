@@ -17,7 +17,7 @@ def test_strategy_uses_setup_atr_checks_all_zones_and_leaves_probability_uncalib
     monkeypatch.setattr(Predictor,"_regime_bias",lambda self,frames:"bullish")
     monkeypatch.setattr("btc_predictor.strategy.build_projected_zones",lambda frame:[near,swept,target])
     monkeypatch.setattr("btc_predictor.strategy.atr",lambda frame:pd.Series(5.,index=frame.index))
-    monkeypatch.setattr("btc_predictor.strategy.orderflow_features",lambda *a,**k:pd.DataFrame([{"delta_reversal":True,"delta_z":2.}],index=[idx[-1]]))
+    monkeypatch.setattr("btc_predictor.strategy.footprint_confirmation",lambda *a,**k:(True,{"reason":"confirmed","agreement":True}))
     result=Predictor(min_rr=.1).predict(o,trades,frames=frames)
     assert result.zone == "swept"
     assert result.stop <= result.entry - 1.5*5

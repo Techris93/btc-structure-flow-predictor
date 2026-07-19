@@ -1,37 +1,116 @@
 from __future__ import annotations
-import pandas as pd
+
+import hashlib
 import numpy as np
+import pandas as pd
+
 from .indicators import atr
 from .models import Zone
-from .structure import confirmed_pivots
+from .structure import confirmed_pivots, structure_events
 
-def build_projected_zones(ohlc: pd.DataFrame, lookback: int = 300, pivot_left: int = 2, pivot_right: int = 2, expiry_bars: int = 120) -> list[Zone]:
-    """Build an as-of zone book; every state transition uses only later closed bars."""
-    x = ohlc.tail(lookback).copy(); a = atr(x).ffill(); piv = confirmed_pivots(x, pivot_left, pivot_right); zones=[]
-    for n, p in piv.iterrows():
-        width = max(float(a.get(p.available_at, np.nan) or 0) * .12, p.price * .0005)
-        if not np.isfinite(width): continue
-        side = "above" if p.kind == "high" else "below"
-        available_pos = x.index.get_indexer([p.available_at])[0]
-        expiry_pos = min(available_pos + expiry_bars, len(x) - 1)
-        expires_at = x.index[expiry_pos] if available_pos + expiry_bars < len(x) else None
-        future = x.iloc[available_pos + 1:]
-        if expires_at is not None:
-            future = future.loc[future.index < expires_at]
-        touched = ((future["high"] >= p.price-width) & (future["low"] <= p.price+width))
-        swept = (future["low"] < p.price-width) if side == "below" else (future["high"] > p.price+width)
-        swept_at = swept[swept].index[0] if swept.any() else None
-        before_sweep = future if swept_at is None else future.loc[future.index < swept_at]
-        touches = int(((before_sweep["high"] >= p.price-width) & (before_sweep["low"] <= p.price+width)).sum())
-        score = 1.0 - min(touches, 4) * .15
-        zones.append(Zone(p.swing_id, "swing", side, p.price-width, p.price+width, score, p.pivot_time, p.available_at,
-                          expires_at=expires_at, swept_at=swept_at, invalidated_at=swept_at, sources=("confirmed_swing",), touches=touches))
-    # Deliberately do not mutate/merge older zones when a later pivot arrives.
-    return sorted(zones, key=lambda z: (pd.Timestamp(z.available_at), z.zone_id))
+
+def _zone_id(kind, side, level, available_at, extra=""):
+    raw=f"{kind}|{side}|{level:.8f}|{pd.Timestamp(available_at).isoformat()}|{extra}"
+    return f"{kind}:{hashlib.sha1(raw.encode()).hexdigest()[:14]}"
+
+
+def _candidate(kind, side, level, width, created, available, score, sources, expiry_bars):
+    return {"zone_id":_zone_id(kind,side,level,available),"kind":kind,"side":side,"low":level-width,"high":level+width,
+            "score":score,"created_at":created,"available_at":available,"sources":tuple(sources),"expiry_bars":expiry_bars}
+
+
+def _period_levels(x, rule, kind, expiry_bars):
+    shifted=x.copy(); shifted["period"]=(shifted.index-pd.Timedelta(nanoseconds=1)).tz_localize(None).to_period(rule)
+    rows=[]
+    for period, group in shifted.groupby("period"):
+        available=period.end_time.tz_localize(x.index.tz)+pd.Timedelta(nanoseconds=1)
+        if available>x.index[-1]: continue
+        for label,column,side in (("high","high","above"),("low","low","below")):
+            level=float(group[column].max() if label=="high" else group[column].min())
+            rows.append((f"previous_{kind}_{label}",side,level,group.index[0],available,1.35,(f"previous_{kind}",),expiry_bars))
+    return rows[-6:]
+
+
+def _session_levels(x):
+    y=x.copy(); opened=y.index-pd.Timedelta(minutes=15)
+    hour=opened.hour
+    session=np.select([hour<8,hour<16],["asia","london"],default="new_york")
+    y["session"]=session; y["day"]=opened.floor("D")
+    ends={"asia":8,"london":16,"new_york":24}; rows=[]
+    for (day,name),group in y.groupby(["day","session"]):
+        available=day+pd.Timedelta(hours=ends[name])
+        if available>x.index[-1] or group.index[0]>available: continue
+        for label,column,side in (("high","high","above"),("low","low","below")):
+            level=float(group[column].max() if label=="high" else group[column].min())
+            rows.append((f"{name}_{label}",side,level,group.index[0],available,1.2,("session_extreme",name),192))
+    return rows[-18:]
+
+
+def _profile_and_vwap(x, width):
+    history=x.iloc[-193:-1] if len(x)>193 else x.iloc[:-1]
+    if len(history)<40 or history.volume.sum()<=0: return []
+    typical=(history.high+history.low+history.close)/3
+    bucket_size=max(width*2,float(typical.iloc[-1])*.001)
+    bucket=(typical/bucket_size).round()*bucket_size
+    profile=history.groupby(bucket).volume.sum().sort_values()
+    levels=[]; available=x.index[-1]; price=float(x.close.iloc[-1])
+    if len(profile)>=3:
+        hvn=float(profile.index[-1]); lvn=float(profile.index[0])
+        for kind,level,score in (("volume_hvn",hvn,1.15),("volume_lvn",lvn,1.05)):
+            levels.append((kind,"above" if level>price else "below",level,history.index[0],available,score,("volume_profile",),192))
+    vwap=float((typical*history.volume).sum()/history.volume.sum())
+    variance=float((((typical-vwap)**2)*history.volume).sum()/history.volume.sum()); deviation=variance**.5
+    for name,level in (("anchored_vwap",vwap),("vwap_upper",vwap+deviation),("vwap_lower",vwap-deviation)):
+        levels.append((name,"above" if level>price else "below",level,history.index[0],available,1.1,("vwap",),96))
+    return levels
+
+
+def build_projected_zones(ohlc: pd.DataFrame, lookback: int = 1000, pivot_left: int = 2, pivot_right: int = 2, expiry_bars: int = 120) -> list[Zone]:
+    """Causal 15m zone book from swings, equal levels, periods, sessions, profile and VWAP."""
+    x=ohlc.tail(lookback).copy().sort_index(); a=atr(x).ffill(); piv=confirmed_pivots(x,pivot_left,pivot_right)
+    if x.empty: return []
+    last_atr=float(a.iloc[-1]) if np.isfinite(a.iloc[-1]) else float(x.close.iloc[-1])*.005
+    base_width=max(last_atr*.12,float(x.close.iloc[-1])*.0005); raw=[]
+    for _,p in piv.iterrows():
+        width=max((float(a.get(p.available_at)) if np.isfinite(a.get(p.available_at,np.nan)) else last_atr)*.12,p.price*.0005)
+        side="above" if p.kind=="high" else "below"
+        raw.append(_candidate("swing",side,float(p.price),width,p.pivot_time,p.available_at,1.0,("confirmed_swing",),expiry_bars))
+    ordered=piv.sort_values("available_at")
+    for kind in ("high","low"):
+        same=ordered[ordered.kind==kind]
+        for (_,p),(_,q) in zip(same.iloc[:-1].iterrows(),same.iloc[1:].iterrows()):
+            tolerance=round(max(base_width,float(q.price)*.0007),8)
+            if abs(float(p.price)-float(q.price))<=tolerance:
+                level=(float(p.price)+float(q.price))/2; side="above" if kind=="high" else "below"
+                raw.append(_candidate(f"equal_{kind}s",side,level,tolerance,min(p.pivot_time,q.pivot_time),q.available_at,1.5,("equal_levels",p.swing_id,q.swing_id),192))
+    for spec in _period_levels(x,"D","day",384)+_period_levels(x,"W","week",2688)+_session_levels(x)+_profile_and_vwap(x,base_width):
+        kind,side,level,created,available,score,sources,expiry=spec
+        raw.append(_candidate(kind,side,float(level),base_width,created,available,score,sources,expiry))
+    events=structure_events(x)
+    if not events.empty:
+        for ts,event in events.tail(20).iterrows():
+            side="below" if event.bias=="bullish" else "above"; level=float(event.level)
+            raw.append(_candidate("untested_breakout",side,level,base_width,ts,ts,1.3,("structure_break",str(event.swing_id)),192))
+
+    zones=[]
+    for item in raw:
+        available=pd.Timestamp(item.pop("available_at")).as_unit(x.index.unit,round_ok=True); pos=x.index.searchsorted(available,side="right")
+        expiry_bars_for_zone=item.pop("expiry_bars"); expiry_pos=pos+expiry_bars_for_zone
+        expires=x.index[expiry_pos] if expiry_pos<len(x) else None
+        future=x.iloc[pos:]; future=future if expires is None else future.loc[future.index<expires]
+        swept=(future.low<item["low"]) if item["side"]=="below" else (future.high>item["high"])
+        swept_at=swept[swept].index[0] if swept.any() else None
+        before=future if swept_at is None else future.loc[future.index<swept_at]
+        touches=int(((before.high>=item["low"])&(before.low<=item["high"])).sum())
+        item["score"]-=min(touches,4)*.15
+        zones.append(Zone(**item,available_at=available,expires_at=expires,swept_at=swept_at,invalidated_at=swept_at,touches=touches))
+    unique={z.zone_id:z for z in zones}
+    return sorted(unique.values(),key=lambda z:(pd.Timestamp(z.available_at),z.zone_id))
+
 
 def mark_zone_state(zones: list[Zone], ohlc: pd.DataFrame) -> list[Zone]:
     for z in zones:
-        future = ohlc.loc[ohlc.index >= pd.Timestamp(z.available_at, tz="UTC") if ohlc.index.tz is not None else ohlc.index >= z.available_at]
-        for ts, b in future.iterrows():
-            if (z.side == "below" and b.low < z.low) or (z.side == "above" and b.high > z.high): z.swept_at = ts; z.invalidated_at = ts; break
+        future=ohlc.loc[ohlc.index>=pd.Timestamp(z.available_at)]
+        for ts,b in future.iterrows():
+            if (z.side=="below" and b.low<z.low) or (z.side=="above" and b.high>z.high): z.swept_at=ts; z.invalidated_at=ts; break
     return zones

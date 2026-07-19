@@ -134,9 +134,15 @@
             <span>Feed</span><span id="feed">STARTING</span>
           </div>
           <div class="row"><span>Setup</span><span id="setup">—</span></div>
+          <div class="row"><span>4h regime</span><span id="regime4h">—</span></div>
+          <div class="row"><span>1h regime</span><span id="regime1h">—</span></div>
+          <div class="row"><span>15m structure</span><span id="structure15m">—</span></div>
           <div class="row"><span>Zone</span><span id="zone">—</span></div>
+          <div class="row"><span>Zone type</span><span id="zonekind">—</span></div>
           <div class="row"><span>Sweep</span><span id="sweep">—</span></div>
+          <div class="row"><span>Sweep depth</span><span id="sweepdepth">—</span></div>
           <div class="row"><span>Footprint</span><span id="flow">—</span></div>
+          <div class="row"><span>Flow reason</span><span id="flowreason">—</span></div>
           <div class="row">
             <span>Reward / risk</span><span id="rr">—</span>
           </div>
@@ -168,11 +174,17 @@
         $("stop").textContent = fmt(x.stop);
         $("target").textContent = fmt(x.target);
         $("setup").textContent = x.setup_type || "—";
+        $("regime4h").textContent = (x.regime_4h || "—").toUpperCase();
+        $("regime1h").textContent = (x.regime_1h || "—").toUpperCase();
+        $("structure15m").textContent = (x.setup_15m || "—").toUpperCase();
         $("zone").textContent = x.zone || "—";
+        $("zonekind").textContent = x.zone_kind || "—";
         $("sweep").textContent = x.sweep_status || "—";
+        $("sweepdepth").textContent = x.sweep_depth_atr == null ? "—" : x.sweep_depth_atr.toFixed(2) + " ATR";
         $("flow").textContent = x.orderflow_confirmation
           ? "CONFIRMED"
           : "UNCONFIRMED";
+        $("flowreason").textContent = x.orderflow_reason || "—";
         $("rr").textContent = x.reward_risk
           ? x.reward_risk.toFixed(2) + "R"
           : "—";

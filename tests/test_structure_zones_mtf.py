@@ -34,6 +34,14 @@ def test_zone_lifecycle_is_causal_and_ids_do_not_merge():
             assert (z.low,z.high,z.created_at,z.available_at)==(later[z.zone_id].low,later[z.zone_id].high,later[z.zone_id].created_at,later[z.zone_id].available_at)
 
 
+def test_zone_book_includes_equal_session_profile_vwap_and_period_sources():
+    idx=pd.date_range("2025-01-01 00:15",periods=10*24*4,freq="15min",tz="UTC")
+    wave=pd.Series([100+(i%16) for i in range(len(idx))],index=idx)
+    x=pd.DataFrame({"open":wave,"high":wave+1,"low":wave-1,"close":wave,"volume":100.},index=idx)
+    kinds={z.kind for z in build_projected_zones(x,lookback=1000)}
+    assert {"previous_day_high","previous_week_low","asia_high","volume_hvn","anchored_vwap"} <= kinds
+
+
 def test_close_indexing_and_completed_mtf_boundaries():
     opens=pd.date_range("2025-01-01",periods=61,freq="min",tz="UTC")
     x=pd.DataFrame({"open":1.,"high":2.,"low":0.,"close":1.,"volume":1.},index=opens)
