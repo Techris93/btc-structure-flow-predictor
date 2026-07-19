@@ -1,254 +1,229 @@
 from __future__ import annotations
 
+import base64
+import fcntl
+import hashlib
+import hmac
+import json
 import os
 import threading
 import time
+
 import pandas as pd
 import requests
-import base64
-import json
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-try:
-    from pywebpush import webpush, WebPushException
-except ImportError:
-    webpush = None
-    WebPushException = Exception
 from flask import Flask, jsonify, render_template, request
 
+try:
+    from pywebpush import webpush
+except ImportError:
+    webpush = None
+
+from btc_predictor.persistence import JsonStore, runtime_dir
 from btc_predictor.strategy import Predictor
-from btc_predictor.synthetic import make_synthetic
-from btc_predictor.backtest import run_event_backtest
 
 app = Flask(__name__)
 predictor = Predictor()
+data_dir = runtime_dir()
 live_lock = threading.Lock()
-live_state = {"status": "starting", "source": None, "prediction": None, "updated_at": None, "error": None}
+push_lock = threading.Lock()
+live_state = {"status":"starting","source":None,"prediction":None,"updated_at":None,"error":None}
 live_thread_started = False
 live_thread = None
-push_lock = threading.Lock()
-push_subscriptions = []
-push_last_error = None
-_vapid_key = ec.generate_private_key(ec.SECP256R1())
+_live_lock_handle = None
+
+subscription_store = JsonStore(data_dir / "push_subscriptions.json")
+push_state_store = JsonStore(data_dir / "push_state.json")
+live_state_store = JsonStore(data_dir / "live_state.json")
+research_status_store = JsonStore(os.getenv("BTC_RESEARCH_STATUS", str(data_dir / "research/status.json")))
+push_subscriptions = subscription_store.read([])
+
+vapid_path = data_dir / "vapid_private.pem"
+if vapid_path.exists():
+    _vapid_key = serialization.load_pem_private_key(vapid_path.read_bytes(), password=None)
+else:
+    _vapid_key = ec.generate_private_key(ec.SECP256R1())
+    vapid_path.write_bytes(_vapid_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    os.chmod(vapid_path, 0o600)
 _vapid_private_pem = _vapid_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
 _vapid_public_key = base64.urlsafe_b64encode(_vapid_key.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)).rstrip(b"=").decode()
 _vapid_subject = os.getenv("VAPID_SUBJECT", "mailto:onyedikachristopher.agada@st.uskudar.edu.tr")
-backtest_lock = threading.Lock()
-backtest_state = {"status": "idle", "result": None, "error": None}
-
-
-def _one_year_replay():
-    global backtest_state
-    try:
-        now = int(time.time() * 1000)
-        start = now - 365 * 24 * 3600 * 1000
-        rows = []
-        while start < now:
-            payload = requests.get("https://fapi.binance.com/fapi/v1/klines", params={"symbol":"BTCUSDT","interval":"4h","startTime":start,"endTime":now,"limit":1000}, timeout=20).json()
-            if not payload: break
-            rows.extend(payload)
-            next_start = int(payload[-1][0]) + 1
-            if next_start <= start: break
-            start = next_start
-            if len(payload) < 1000: break
-        o = pd.DataFrame(rows).drop_duplicates(subset=[0]).sort_values(0)
-        ohlc = pd.DataFrame({"open":pd.to_numeric(o[1]),"high":pd.to_numeric(o[2]),"low":pd.to_numeric(o[3]),"close":pd.to_numeric(o[4]),"volume":pd.to_numeric(o[5])}, index=pd.to_datetime(pd.to_numeric(o[0]),unit="ms",utc=True))
-        buy = pd.to_numeric(o[9]); total = pd.to_numeric(o[5]); close = pd.to_numeric(o[4]); ts = pd.to_datetime(pd.to_numeric(o[0])+int(4*3600*1000-1),unit="ms",utc=True)
-        trades = pd.concat([pd.DataFrame({"time":ts,"price":close,"qty":buy,"side":"buy"}),pd.DataFrame({"time":ts,"price":close,"qty":(total-buy).clip(lower=0),"side":"sell"})],ignore_index=True)
-        trades = trades[trades.qty > 0]
-        ledger, stats = run_event_backtest(ohlc, trades, predictor=Predictor(flow_freq="4h"), initial_equity=100000, decision_stride=1, analysis_lookback_bars=400)
-        wins = int((ledger.pnl > 0).sum()) if not ledger.empty else 0; losses = int((ledger.pnl <= 0).sum()) if not ledger.empty else 0
-        gross_win = float(ledger.loc[ledger.pnl > 0, "pnl"].sum()) if not ledger.empty else 0.0; gross_loss = float(-ledger.loc[ledger.pnl < 0, "pnl"].sum()) if not ledger.empty else 0.0
-        equity = ledger.equity if not ledger.empty else pd.Series([100000]); dd = float((equity.cummax()-equity).max())
-        result = {**stats,"bars":len(ohlc),"wins":wins,"losses":losses,"profit_factor":(gross_win/gross_loss if gross_loss else None),"gross_profit":gross_win,"gross_loss":gross_loss,"max_drawdown":dd,"data_source":"Binance 4h klines + taker-buy volume proxy","flow_note":"Historical tick-level footprint was unavailable; buy/sell volume is bar-level."}
-        with backtest_lock: backtest_state = {"status":"complete","result":result,"error":None}
-    except Exception as exc:
-        with backtest_lock: backtest_state = {"status":"failed","result":None,"error":str(exc)}
-
-
-@app.post("/api/backtest/one-year")
-def start_one_year_backtest():
-    with backtest_lock:
-        if backtest_state["status"] == "running": return jsonify(backtest_state), 202
-        backtest_state.update({"status":"running","result":None,"error":None})
-    threading.Thread(target=_one_year_replay, name="one-year-backtest", daemon=True).start()
-    return jsonify({"status":"running","poll":"/api/backtest/one-year"}), 202
-
-
-@app.get("/api/backtest/one-year")
-def one_year_backtest_status():
-    with backtest_lock: return jsonify(dict(backtest_state))
+secret_path = data_dir / "push_test_secret"
+if not secret_path.exists():
+    secret_path.write_bytes(os.urandom(32)); os.chmod(secret_path, 0o600)
+_push_secret = secret_path.read_bytes()
 
 
 def _bybit_data():
     base = "https://api.bybit.com/v5/market"
     def candles(interval, limit="300"):
-        k = requests.get(f"{base}/kline", params={"category":"linear","symbol":"BTCUSDT","interval":interval,"limit":limit}, timeout=10).json()
-        rows = list(reversed(k["result"]["list"]))
+        response = requests.get(f"{base}/kline", params={"category":"linear","symbol":"BTCUSDT","interval":interval,"limit":limit}, timeout=10)
+        response.raise_for_status(); rows = list(reversed(response.json()["result"]["list"]))
         frame = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume","turnover"])
-        frame["timestamp"] = pd.to_datetime(pd.to_numeric(frame.timestamp), unit="ms", utc=True)
-        for c in ["open","high","low","close","volume"]: frame[c] = pd.to_numeric(frame[c])
-        # The final exchange candle is still forming; exclude it so structure
-        # and regime features only use completed bars.
-        return frame.set_index("timestamp").iloc[:-1]
-    ohlc, frames = candles("1"), {"15m":candles("15"), "1h":candles("60"), "4h":candles("240")}
-    tr = requests.get(f"{base}/recent-trade", params={"category":"linear","symbol":"BTCUSDT","limit":"1000"}, timeout=10).json()["result"]["list"]
-    trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in tr],unit="ms",utc=True),"price":[float(x["price"]) for x in tr],"qty":[float(x["size"]) for x in tr],"side":[x["side"].lower() for x in tr],"exchange":"bybit"})
+        duration = {"1":"1min","15":"15min","60":"1h","240":"4h"}[interval]
+        frame["timestamp"] = pd.to_datetime(pd.to_numeric(frame.timestamp), unit="ms", utc=True) + pd.Timedelta(duration)
+        for column in ["open","high","low","close","volume"]: frame[column] = pd.to_numeric(frame[column])
+        frame = frame.set_index("timestamp")
+        return frame.loc[frame.index <= pd.Timestamp.now(tz="UTC")]
+    ohlc, frames = candles("1"), {"15m":candles("15"),"1h":candles("60"),"4h":candles("240")}
+    response = requests.get(f"{base}/recent-trade", params={"category":"linear","symbol":"BTCUSDT","limit":"1000"}, timeout=10)
+    response.raise_for_status(); raw = response.json()["result"]["list"]
+    trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in raw],unit="ms",utc=True),"price":[float(x["price"]) for x in raw],"qty":[float(x["size"]) for x in raw],"side":[x["side"].lower() for x in raw],"exchange":"bybit"})
     return ohlc, trades, frames
 
 
 def _binance_trades():
-    tr = requests.get("https://fapi.binance.com/fapi/v1/aggTrades", params={"symbol":"BTCUSDT","limit":1000}, timeout=10).json()
-    return pd.DataFrame({"time":pd.to_datetime([x["T"] for x in tr],unit="ms",utc=True),"price":[float(x["p"]) for x in tr],"qty":[float(x["q"]) for x in tr],"side":["sell" if x["m"] else "buy" for x in tr],"exchange":"binance"})
+    response = requests.get("https://fapi.binance.com/fapi/v1/aggTrades", params={"symbol":"BTCUSDT","limit":1000}, timeout=10)
+    response.raise_for_status(); raw = response.json()
+    return pd.DataFrame({"time":pd.to_datetime([x["T"] for x in raw],unit="ms",utc=True),"price":[float(x["p"]) for x in raw],"qty":[float(x["q"]) for x in raw],"side":["sell" if x["m"] else "buy" for x in raw],"exchange":"binance"})
 
 
-def _live_loop():
-    global live_state
-    previous_push_key = None
-    while True:
+def _persist_subscriptions():
+    subscription_store.write(push_subscriptions)
+
+
+def _send_push(payload, subscriptions=None):
+    if webpush is None: return 0, 0
+    with push_lock: targets = list(subscriptions if subscriptions is not None else push_subscriptions)
+    sent, failed, stale = 0, 0, []
+    for sub in targets:
         try:
-            ohlc, trades, frames = _bybit_data()
-            sources = "bybit"
-            try:
-                trades = pd.concat([trades, _binance_trades()], ignore_index=True)
-                sources = "bybit+binance"
-            except Exception:
-                pass
-            result = predictor.predict(ohlc, trades, 100000, frames=frames)
-            push_key = "|".join(str(getattr(result, k, None)) for k in ("bias", "setup_type", "zone", "sweep_status", "entry", "stop", "target"))
-            if previous_push_key is not None and push_key != previous_push_key:
-                _send_prediction_push(result)
-            previous_push_key = push_key
-            with live_lock:
-                live_state = {"status":"live", "source":sources, "prediction":dict(result.__dict__), "updated_at":pd.Timestamp.utcnow().isoformat(), "error":None}
+            webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=_vapid_private_pem, vapid_claims={"sub":_vapid_subject})
+            sent += 1
         except Exception as exc:
-            with live_lock:
-                live_state.update({"status":"degraded", "error":str(exc), "updated_at":pd.Timestamp.utcnow().isoformat()})
-        time.sleep(max(15, int(os.getenv("LIVE_POLL_SECONDS", "30"))))
-
-
-def _send_prediction_push(result):
-    if webpush is None:
-        return
-    payload = {"title": "BTC Predictor update", "body": f"{result.bias.upper()} · {result.setup_type or result.no_trade_reason or result.sweep_status}"}
-    with push_lock:
-        subscriptions = list(push_subscriptions)
-    stale = []
-    for sub in subscriptions:
-        try:
-            webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=_vapid_private_pem, vapid_claims={"sub": _vapid_subject})
-        except Exception as exc:
+            failed += 1
             if "404" in str(exc) or "410" in str(exc): stale.append(sub.get("endpoint"))
     if stale:
         with push_lock:
             push_subscriptions[:] = [s for s in push_subscriptions if s.get("endpoint") not in stale]
+            _persist_subscriptions()
+    return sent, failed
+
+
+def _live_loop():
+    global live_state
+    persisted = push_state_store.read({})
+    previous_key = persisted.get("key")
+    last_sent = pd.Timestamp(persisted["sent_at"]) if persisted.get("sent_at") else None
+    while True:
+        try:
+            ohlc, trades, frames = _bybit_data(); sources = "bybit"
+            try:
+                trades = pd.concat([trades, _binance_trades()], ignore_index=True); sources = "bybit+binance"
+            except Exception: pass
+            result = predictor.predict(ohlc, trades, 100_000, frames=frames)
+            key = "|".join(str(getattr(result, k, None)) for k in ("bias","setup_type","zone","sweep_status","entry","stop","target"))
+            now = pd.Timestamp.now(tz="UTC"); cooldown = pd.Timedelta(seconds=int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
+            if previous_key is not None and key != previous_key and (last_sent is None or now-last_sent >= cooldown):
+                _send_push({"title":"BTC Predictor update","body":f"{result.bias.upper()} · {result.setup_type or result.no_trade_reason or result.sweep_status}"})
+                last_sent = now
+            previous_key = key
+            push_state_store.write({"key":key,"sent_at":last_sent.isoformat() if last_sent is not None else None})
+            next_state = {"status":"live","source":sources,"prediction":dict(result.__dict__),"updated_at":now.isoformat(),"error":None}
+            live_state_store.write(next_state)
+            with live_lock: live_state = next_state
+        except Exception as exc:
+            with live_lock: live_state.update({"status":"degraded","error":str(exc),"updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
+        time.sleep(max(15, int(os.getenv("LIVE_POLL_SECONDS", "30"))))
 
 
 def start_live_loop():
-    global live_thread_started, live_thread
-    if not live_thread_started or live_thread is None or not live_thread.is_alive():
-        live_thread_started = True
-        live_thread = threading.Thread(target=_live_loop, name="live-predictor", daemon=True)
-        live_thread.start()
+    global live_thread_started, live_thread, _live_lock_handle
+    if live_thread_started and live_thread is not None and live_thread.is_alive(): return True
+    try:
+        _live_lock_handle = open(data_dir / "live-loop.lock", "w")
+        fcntl.flock(_live_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError): return False
+    live_thread_started = True
+    live_thread = threading.Thread(target=_live_loop, name="live-predictor", daemon=True); live_thread.start()
+    return True
 
 
 start_live_loop()
 
 
-@app.get("/dashboard")
 @app.get("/")
-def index():
-    return render_template("dashboard.html")
+@app.get("/dashboard")
+def index(): return render_template("dashboard.html")
 
 
 @app.get("/health")
 def health():
     with live_lock: state = dict(live_state)
-    return jsonify({"status": "ok", "service": "btc-structure-flow-predictor", "paper_only": True, "market_feed": state["status"]})
+    return jsonify({"status":"ok","service":"btc-structure-flow-predictor","paper_only":True,"market_feed":state["status"],"live_loop_owner":live_thread_started})
 
 
 @app.get("/api/live")
 def api_live():
     start_live_loop()
     with live_lock: state = dict(live_state)
+    if not live_thread_started: state = live_state_store.read(state)
     if state.get("prediction"):
-        state["prediction"] = dict(state["prediction"])
-        state["prediction"]["timestamp"] = str(state["prediction"]["timestamp"])
-    return jsonify({"paper_only": True, **state})
+        state["prediction"] = dict(state["prediction"]); state["prediction"]["timestamp"] = str(state["prediction"]["timestamp"])
+    return jsonify({"paper_only":True,**state})
+
+
+@app.get("/api/backtest/one-year")
+def backtest_status(): return jsonify(research_status_store.read({"status":"idle","note":"Run the separate research worker."}))
+
+
+@app.post("/api/backtest/one-year")
+def no_web_backtest(): return jsonify({"error":"Research is disabled in the web process; use the authenticated worker job."}), 409
 
 
 @app.get("/sw.js")
 def service_worker():
-    return """self.addEventListener('push',e=>{let d=e.data?e.data.json():{};e.waitUntil(self.registration.showNotification(d.title||'BTC Predictor',{body:d.body||'Prediction update',icon:'/favicon.ico',tag:'btc-predictor'}));});self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(clients.openWindow('/'));});""", 200, {"Content-Type":"application/javascript","Service-Worker-Allowed":"/","Cache-Control":"no-store"}
+    script = "self.addEventListener('push',e=>{let d=e.data?e.data.json():{};e.waitUntil(self.registration.showNotification(d.title||'BTC Predictor',{body:d.body||'Prediction update',icon:'/favicon.ico',tag:'btc-predictor'}));});self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(clients.openWindow('/'));});"
+    return script, 200, {"Content-Type":"application/javascript","Service-Worker-Allowed":"/","Cache-Control":"no-store"}
 
 
 @app.get("/push/config")
-def push_config():
-    return jsonify({"supported": webpush is not None, "vapid_public_key": _vapid_public_key})
+def push_config(): return jsonify({"supported":webpush is not None,"vapid_public_key":_vapid_public_key})
 
 
 @app.post("/push/subscribe")
 def push_subscribe():
-    global push_last_error
     data = request.get_json(silent=True) or {}
-    if not data.get("endpoint"):
-        return jsonify({"error":"invalid subscription"}), 400
+    if not data.get("endpoint") or not data.get("keys"): return jsonify({"error":"invalid subscription"}), 400
     with push_lock:
         if not any(x.get("endpoint") == data["endpoint"] for x in push_subscriptions): push_subscriptions.append(data)
-        push_last_error = None
-    return jsonify({"ok": True, "subscriptions": len(push_subscriptions)})
+        _persist_subscriptions()
+    token = hmac.new(_push_secret, data["endpoint"].encode(), hashlib.sha256).hexdigest()
+    return jsonify({"ok":True,"subscriptions":len(push_subscriptions),"test_token":token})
 
 
 @app.post("/push/test")
 def push_test():
-    global push_last_error
+    data = request.get_json(silent=True) or {}; endpoint, token = data.get("endpoint", ""), data.get("test_token", "")
+    expected = hmac.new(_push_secret, endpoint.encode(), hashlib.sha256).hexdigest()
+    if not endpoint or not hmac.compare_digest(token, expected): return jsonify({"error":"unauthorized"}), 401
     if webpush is None: return jsonify({"error":"pywebpush unavailable"}), 503
-    payload = {"title":"BTC Predictor test", "body":"Web Push is connected and delivering notifications."}
-    sent, failed, errors = 0, 0, []
-    with push_lock: subscriptions = list(push_subscriptions)
-    for sub in subscriptions:
-        try:
-            webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=_vapid_private_pem, vapid_claims={"sub": _vapid_subject})
-            sent += 1
-        except Exception as exc:
-            failed += 1
-            errors.append(str(exc)[:300])
-    push_last_error = errors[-1] if errors else None
-    return jsonify({"ok": sent > 0, "sent": sent, "failed": failed, "error": push_last_error})
-
-
-@app.after_request
-def no_cache_app_shell(response):
-    if request.path in ("/", "/dashboard", "/sw.js"):
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    return response
-
-
+    with push_lock: target = [s for s in push_subscriptions if s.get("endpoint") == endpoint]
+    sent, failed = _send_push({"title":"BTC Predictor test","body":"Web Push is connected and delivering notifications."}, target)
+    return jsonify({"ok":sent > 0,"sent":sent,"failed":failed})
 
 
 @app.post("/predict")
 def predict():
+    admin_token = os.getenv("ADMIN_API_TOKEN")
+    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    if not admin_token or not hmac.compare_digest(supplied, admin_token): return jsonify({"error":"unauthorized"}), 401
     payload = request.get_json(silent=True) or {}
     try:
-        ohlc = pd.DataFrame(payload["ohlc"])
-        trades = pd.DataFrame(payload["trades"])
-        if "timestamp" in ohlc:
-            ohlc.index = pd.to_datetime(ohlc.pop("timestamp"), utc=True)
-        elif "time" in ohlc:
-            ohlc.index = pd.to_datetime(ohlc.pop("time"), utc=True)
-        else:
-            raise ValueError("ohlc requires timestamp or time")
-        required_ohlc = {"open", "high", "low", "close", "volume"}
-        required_trades = {"time", "price", "qty", "side"}
-        if not required_ohlc.issubset(ohlc) or not required_trades.issubset(trades):
-            raise ValueError("missing required OHLC or trade columns")
-        result = predictor.predict(ohlc, trades, float(payload.get("equity", 100000)))
-        output = dict(result.__dict__)
-        output["timestamp"] = str(output["timestamp"])
-        return jsonify({"paper_only": True, **output})
-    except (KeyError, TypeError, ValueError, IndexError) as exc:
-        return jsonify({"error": str(exc)}), 400
+        ohlc, trades = pd.DataFrame(payload["ohlc"]), pd.DataFrame(payload["trades"])
+        timestamp = "timestamp" if "timestamp" in ohlc else "time"
+        ohlc.index = pd.to_datetime(ohlc.pop(timestamp), utc=True)
+        result = predictor.predict(ohlc, trades, float(payload.get("equity", 100_000)))
+        output = dict(result.__dict__); output["timestamp"] = str(output["timestamp"])
+        return jsonify({"paper_only":True,**output})
+    except (KeyError, TypeError, ValueError, IndexError) as exc: return jsonify({"error":str(exc)}), 400
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+@app.after_request
+def no_cache(response):
+    if request.path in ("/","/dashboard","/sw.js"): response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
+
+
+if __name__ == "__main__": app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

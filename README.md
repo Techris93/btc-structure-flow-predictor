@@ -1,4 +1,4 @@
-# BTC Predictor (no liquidation feed)
+# BTC Structure Flow Predictor (no liquidation feed)
 
 This repository implements a causal MVP for a Bitcoin trade-setup predictor:
 
@@ -34,6 +34,30 @@ print(stats)
 - Walk-forward splits keep test bars after the training window.
 - The live connectors are adapters only; raw events should be persisted append-only and replayed deterministically.
 
-## Production hardening still required
+This remains research-only: it does not place orders, and `probability_tp_before_sl` remains null until out-of-sample calibration exists.
 
-The current package is an MVP research engine. Before execution, add exchange-specific historical loaders, robust order-book/reference-price handling, venue outage tests, partial-fill simulation, calibrated probability training, and paper-trading monitoring. Do not interpret synthetic replay results as evidence of profitability.
+## Live feature contract
+
+- 4h and 1h completed candles establish regime; disagreement is neutral.
+- A reversal of the held regime requires an opposing confirmed CHoCH.
+- 15m completed candles produce setup structure, zones, and ATR risk.
+- 1m completed candles and trades strictly before the decision time provide footprint confirmation.
+- Every projected zone has immutable identity plus creation, availability, expiry, touch, sweep, and invalidation state.
+
+## Causal research
+
+The Flask app does not execute backtests. Run the durable worker separately:
+
+```bash
+python research_worker.py --start 2025-07-19 --end 2026-07-19 --data-dir work/runtime/research
+```
+
+It downloads Binance Futures 1m candles (including taker-buy volume), derives completed 15m/1h/4h candles, and compares `reactive` and `mtf` variants over identical dates. Dataset pages, replay state, ledgers, and final results are persisted. Resume identity includes Git revision, configuration, date range, and dataset hash.
+
+Execution is decision-after-close and next-open with explicit fees/slippage. Same-1m-bar stop/target ambiguity defaults to the documented conservative stop-first policy and is counted. Results include trades, wins, losses, win rate, profit factor, net P&L, maximum drawdown, average R, average holding time, forced end-of-data closes, and rejection counts.
+
+## Operations
+
+`BTC_DATA_DIR` must point to persistent storage in production. VAPID private keys, subscriptions, notification deduplication state, and live state are persisted there. An OS file lock permits only one live polling loop. Push tests require a subscription-scoped HMAC token; `/predict` requires `ADMIN_API_TOKEN`; the web backtest POST is disabled.
+
+Run verification with `pytest -q`.

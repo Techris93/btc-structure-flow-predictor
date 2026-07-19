@@ -10,6 +10,35 @@ services:
     buildCommand: pip install .
     startCommand: gunicorn --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT app:app
     healthCheckPath: /health
+    disk:
+      name: btc-predictor-state
+      mountPath: /var/data
+      sizeGB: 10
     envVars:
       - key: PYTHON_VERSION
         value: "3.12"
+      - key: BTC_DATA_DIR
+        value: /var/data
+      - key: BTC_RESEARCH_STATUS
+        value: /var/data/research/status.json
+      - key: PUSH_COOLDOWN_SECONDS
+        value: "60"
+  - type: worker
+    name: btc-structure-flow-research
+    repo: https://github.com/Techris93/btc-structure-flow-predictor
+    runtime: python
+    plan: starter
+    region: singapore
+    branch: main
+    autoDeploy: false
+    buildCommand: pip install .
+    startCommand: python research_worker.py --data-dir /var/data/research
+    disk:
+      name: btc-research-checkpoints
+      mountPath: /var/data
+      sizeGB: 25
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: BTC_RESEARCH_DIR
+        value: /var/data/research

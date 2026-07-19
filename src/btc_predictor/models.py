@@ -35,8 +35,18 @@ class Zone:
     available_at: pd.Timestamp | datetime
     expires_at: pd.Timestamp | datetime | None = None
     swept_at: pd.Timestamp | datetime | None = None
+    invalidated_at: pd.Timestamp | datetime | None = None
     touches: int = 0
     sources: tuple[str, ...] = ()
+
+    def is_active(self, at: pd.Timestamp | datetime) -> bool:
+        at = pd.Timestamp(at)
+        return (
+            pd.Timestamp(self.available_at) <= at
+            and (self.expires_at is None or at < pd.Timestamp(self.expires_at))
+            and (self.swept_at is None or at < pd.Timestamp(self.swept_at))
+            and (self.invalidated_at is None or at < pd.Timestamp(self.invalidated_at))
+        )
 
     @property
     def midpoint(self) -> float:
