@@ -78,13 +78,13 @@ def _bybit_data():
 
 
 def _binance_trades():
-    response = requests.get("https://fapi.binance.com/fapi/v1/aggTrades", params={"symbol":"BTCUSDT","limit":1000}, timeout=10)
+    response = requests.get("https://data-api.binance.vision/api/v3/aggTrades", params={"symbol":"BTCUSDT","limit":1000}, timeout=10)
     response.raise_for_status(); raw = response.json()
-    return pd.DataFrame({"time":pd.to_datetime([x["T"] for x in raw],unit="ms",utc=True),"price":[float(x["p"]) for x in raw],"qty":[float(x["q"]) for x in raw],"side":["sell" if x["m"] else "buy" for x in raw],"exchange":"binance","trade_id":[str(x["a"]) for x in raw]})
+    return pd.DataFrame({"time":pd.to_datetime([x["T"] for x in raw],unit="ms",utc=True),"price":[float(x["p"]) for x in raw],"qty":[float(x["q"]) for x in raw],"side":["sell" if x["m"] else "buy" for x in raw],"exchange":"binance","trade_id":[f"spot:{x['a']}" for x in raw]})
 
 
 def _binance_flow_bars(limit=180):
-    response=requests.get("https://fapi.binance.com/fapi/v1/klines",params={"symbol":"BTCUSDT","interval":"1m","limit":limit},timeout=10)
+    response=requests.get("https://data-api.binance.vision/api/v3/klines",params={"symbol":"BTCUSDT","interval":"1m","limit":limit},timeout=10)
     response.raise_for_status(); raw=pd.DataFrame(response.json())
     frame=pd.DataFrame({"close_time":pd.to_datetime(pd.to_numeric(raw[6]),unit="ms",utc=True),"open":pd.to_numeric(raw[1]),"high":pd.to_numeric(raw[2]),"low":pd.to_numeric(raw[3]),"close":pd.to_numeric(raw[4]),"volume":pd.to_numeric(raw[5]),"trades":pd.to_numeric(raw[8]),"taker_buy_volume":pd.to_numeric(raw[9])}).set_index("close_time")
     return frame.loc[frame.index<=pd.Timestamp.now(tz="UTC")]
@@ -138,7 +138,7 @@ def _live_loop():
             if poll_started >= binance_rest_retry_at:
                 try:
                     trade_store.append(_binance_trades())
-                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=5)
+                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=1)
                 except Exception as exc:
                     binance_rest_retry_at = poll_started + pd.Timedelta(minutes=10)
                     logger.warning("Binance REST trades unavailable; WebSocket collector remains active: %s", exc)
@@ -195,7 +195,7 @@ def index(): return render_template("dashboard.html")
 def health():
     start_live_loop()
     with live_lock: state = dict(live_state)
-    return jsonify({"status":"ok","service":"btc-structure-flow-predictor","paper_only":True,"market_feed":state["status"],"live_loop_owner":live_thread_started,"live_thread_alive":bool(live_thread and live_thread.is_alive()),"trade_store":trade_store.stats()})
+    return jsonify({"status":"ok","service":"btc-structure-flow-predictor","paper_only":True,"market_feed":state["status"],"live_loop_owner":live_thread_started,"live_thread_alive":bool(live_thread and live_thread.is_alive()),"trade_store":trade_store.stats(),"collectors":trade_store.collector_status()})
 
 
 @app.get("/api/live")

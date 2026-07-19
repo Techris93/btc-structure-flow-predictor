@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import threading
@@ -10,10 +11,13 @@ import threading
 import pandas as pd
 
 
+logger=logging.getLogger("btc_predictor.trade_store")
+
+
 class TradeStore:
     """Small durable rolling store shared by REST bootstrap and WebSocket collectors."""
     def __init__(self,path):
-        self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True); self.lock=threading.RLock()
+        self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True); self.lock=threading.RLock(); self._collector_status={}
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("CREATE TABLE IF NOT EXISTS trades (event_key TEXT PRIMARY KEY,time_us INTEGER NOT NULL,price REAL NOT NULL,qty REAL NOT NULL,side TEXT NOT NULL,exchange TEXT NOT NULL)")
@@ -47,17 +51,31 @@ class TradeStore:
             rows=db.execute("SELECT exchange,COUNT(*),MIN(time_us),MAX(time_us) FROM trades GROUP BY exchange").fetchall()
         return {exchange:{"trades":count,"oldest":pd.to_datetime(oldest,unit="us",utc=True).isoformat(),"latest":pd.to_datetime(latest,unit="us",utc=True).isoformat()} for exchange,count,oldest,latest in rows}
 
+    def set_collector_status(self,name,**values):
+        with self.lock:self._collector_status[name]={**self._collector_status.get(name,{}),**values}
+
+    def collector_status(self):
+        with self.lock:return {name:dict(values) for name,values in self._collector_status.items()}
+
 
 async def _binance(store):
     import websockets
-    url="wss://fstream.binance.com/ws/btcusdt@aggTrade"
+    endpoints=[("futures","wss://fstream.binance.com/ws/btcusdt@aggTrade"),("spot_market_data","wss://data-stream.binance.vision/ws/btcusdt@aggTrade")]
+    endpoint_index=0
     while True:
+        mode,url=endpoints[endpoint_index]
         try:
-            async with websockets.connect(url,ping_interval=20,ping_timeout=30) as ws:
-                async for message in ws:
+            async with websockets.connect(url,ping_interval=20,ping_timeout=30,open_timeout=10) as ws:
+                store.set_collector_status("binance",connected=True,mode=mode,error=None)
+                while True:
+                    message=await asyncio.wait_for(ws.recv(),timeout=15)
                     x=json.loads(message)
-                    store.append(pd.DataFrame([{"time":pd.to_datetime(x["T"],unit="ms",utc=True),"price":float(x["p"]),"qty":float(x["q"]),"side":"sell" if x["m"] else "buy","exchange":"binance","trade_id":str(x["a"])}]))
-        except Exception: await asyncio.sleep(2)
+                    store.append(pd.DataFrame([{"time":pd.to_datetime(x["T"],unit="ms",utc=True),"price":float(x["p"]),"qty":float(x["q"]),"side":"sell" if x["m"] else "buy","exchange":"binance","trade_id":f"{mode}:{x['a']}"}]))
+                    store.set_collector_status("binance",connected=True,mode=mode,error=None,latest=pd.to_datetime(x["T"],unit="ms",utc=True).isoformat())
+        except Exception as exc:
+            logger.warning("Binance %s WebSocket failed; rotating endpoint: %s",mode,exc)
+            store.set_collector_status("binance",connected=False,mode=mode,error=f"{type(exc).__name__}: {str(exc)[:200]}")
+            endpoint_index=(endpoint_index+1)%len(endpoints); await asyncio.sleep(2)
 
 
 async def _bybit(store):
@@ -66,12 +84,16 @@ async def _bybit(store):
     while True:
         try:
             async with websockets.connect(url,ping_interval=20,ping_timeout=30) as ws:
+                store.set_collector_status("bybit",connected=True,mode="linear",error=None)
                 await ws.send(json.dumps({"op":"subscribe","args":["publicTrade.BTCUSDT"]}))
                 async for message in ws:
                     payload=json.loads(message); data=payload.get("data",[])
                     if data:
                         store.append(pd.DataFrame([{"time":pd.to_datetime(int(x["T"]),unit="ms",utc=True),"price":float(x["p"]),"qty":float(x["v"]),"side":x["S"].lower(),"exchange":"bybit","trade_id":str(x.get("i",""))} for x in data]))
-        except Exception: await asyncio.sleep(2)
+                        store.set_collector_status("bybit",connected=True,mode="linear",error=None,latest=pd.to_datetime(max(int(x["T"]) for x in data),unit="ms",utc=True).isoformat())
+        except Exception as exc:
+            logger.warning("Bybit WebSocket failed; reconnecting: %s",exc)
+            store.set_collector_status("bybit",connected=False,mode="linear",error=f"{type(exc).__name__}: {str(exc)[:200]}"); await asyncio.sleep(2)
 
 
 def start_collectors(store):
