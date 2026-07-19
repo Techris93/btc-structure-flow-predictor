@@ -118,20 +118,34 @@ def _live_loop():
     persisted = push_state_store.read({})
     previous_key = persisted.get("key")
     last_sent = pd.Timestamp(persisted["sent_at"]) if persisted.get("sent_at") else None
+    binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
+    flow_retry_at = pd.Timestamp(0, tz="UTC")
+    flow_bars_cache = None
     while True:
         try:
-            with live_lock: live_state.update({"status":"polling","updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
+            poll_started = pd.Timestamp.now(tz="UTC")
+            with live_lock: live_state.update({"status":"polling","updated_at":poll_started.isoformat()})
             ohlc, recent, frames = _bybit_data(); sources = "bybit"; trade_store.append(recent)
-            try:
-                trade_store.append(_binance_trades()); sources = "bybit+binance"
-            except Exception: pass
+            if poll_started >= binance_rest_retry_at:
+                try:
+                    trade_store.append(_binance_trades())
+                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=5)
+                except Exception as exc:
+                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=10)
+                    logger.warning("Binance REST trades unavailable; WebSocket collector remains active: %s", exc)
             now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(hours=3),now); flow_bars=None
-            available_exchanges=set(trades.exchange.astype(str)) if "exchange" in trades else set()
+            recent_trades=trades.loc[trades.time>=now-pd.Timedelta(minutes=2)] if "time" in trades else trades
+            available_exchanges=set(recent_trades.exchange.astype(str)) if "exchange" in recent_trades else set()
             sources="+".join(exchange for exchange in ("bybit","binance") if exchange in available_exchanges) or sources
-            try:
-                flow_bars=_binance_flow_bars().loc[lambda x:x.index<=now]
-            except Exception as exc:
-                logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
+            if poll_started >= flow_retry_at:
+                try:
+                    flow_bars_cache=_binance_flow_bars()
+                    flow_retry_at = poll_started + pd.Timedelta(minutes=1)
+                except Exception as exc:
+                    flow_retry_at = poll_started + pd.Timedelta(minutes=10)
+                    logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
+            if flow_bars_cache is not None and not flow_bars_cache.empty and flow_bars_cache.index[-1]>=now-pd.Timedelta(minutes=2):
+                flow_bars=flow_bars_cache.loc[flow_bars_cache.index<=now]
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
             trade_store.prune(now-pd.Timedelta(hours=6))
             key = "|".join(str(getattr(result,k,None)) for k in ("bias","regime_4h","regime_1h","setup_type","zone","sweep_status","orderflow_confirmation","orderflow_reason","entry","stop","target"))
