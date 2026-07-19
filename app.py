@@ -56,7 +56,7 @@ def _one_year_replay():
         buy = pd.to_numeric(o[9]); total = pd.to_numeric(o[5]); close = pd.to_numeric(o[4]); ts = pd.to_datetime(pd.to_numeric(o[0])+int(4*3600*1000-1),unit="ms",utc=True)
         trades = pd.concat([pd.DataFrame({"time":ts,"price":close,"qty":buy,"side":"buy"}),pd.DataFrame({"time":ts,"price":close,"qty":(total-buy).clip(lower=0),"side":"sell"})],ignore_index=True)
         trades = trades[trades.qty > 0]
-        ledger, stats = run_event_backtest(ohlc, trades, predictor=Predictor(flow_freq="4h"), initial_equity=100000, decision_stride=12)
+        ledger, stats = run_event_backtest(ohlc, trades, predictor=Predictor(flow_freq="4h"), initial_equity=100000, decision_stride=1, analysis_lookback_bars=400)
         wins = int((ledger.pnl > 0).sum()) if not ledger.empty else 0; losses = int((ledger.pnl <= 0).sum()) if not ledger.empty else 0
         gross_win = float(ledger.loc[ledger.pnl > 0, "pnl"].sum()) if not ledger.empty else 0.0; gross_loss = float(-ledger.loc[ledger.pnl < 0, "pnl"].sum()) if not ledger.empty else 0.0
         equity = ledger.equity if not ledger.empty else pd.Series([100000]); dd = float((equity.cummax()-equity).max())

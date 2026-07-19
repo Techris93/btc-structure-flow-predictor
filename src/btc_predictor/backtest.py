@@ -1,12 +1,13 @@
 from __future__ import annotations
 import pandas as pd
+from collections import Counter
 from .strategy import Predictor
 
-def run_event_backtest(ohlc: pd.DataFrame, trades: pd.DataFrame, predictor=None, initial_equity=100_000, fee_bps=5, slippage_bps=2, decision_stride: int = 5) -> tuple[pd.DataFrame, dict]:
-    predictor=predictor or Predictor(); equity=initial_equity; records=[]; open_trade=None
+def run_event_backtest(ohlc: pd.DataFrame, trades: pd.DataFrame, predictor=None, initial_equity=100_000, fee_bps=5, slippage_bps=2, decision_stride: int = 1, analysis_lookback_bars: int = 400) -> tuple[pd.DataFrame, dict]:
+    predictor=predictor or Predictor(); equity=initial_equity; records=[]; open_trade=None; rejections=Counter()
     bars=ohlc.sort_index()
     for i in range(80,len(bars)):
-        now=bars.index[i]; history=bars.iloc[:i+1]; tt=trades[pd.to_datetime(trades.time,utc=True)<=now]
+        now=bars.index[i]; history=bars.iloc[max(0,i-analysis_lookback_bars+1):i+1]; tt=trades[pd.to_datetime(trades.time,utc=True)<=now].tail(1200)
         if open_trade:
             b=bars.iloc[i]; side=open_trade["side"]; hit_stop=(b.low<=open_trade["stop"] if side=="long" else b.high>=open_trade["stop"]); hit_target=(b.high>=open_trade["target"] if side=="long" else b.low<=open_trade["target"])
             if hit_stop or hit_target:
@@ -15,7 +16,10 @@ def run_event_backtest(ohlc: pd.DataFrame, trades: pd.DataFrame, predictor=None,
             out=predictor.predict(history,tt,equity)
             if out.entry and out.position_size:
                 open_trade={"entry_time":now,"side":"long" if out.bias=="bullish" else "short","entry":out.entry,"stop":out.stop,"target":out.target,"size":out.position_size,"zone":out.zone}
+            else:
+                rejections[out.no_trade_reason or "unknown"] += 1
     result=pd.DataFrame(records); stats={"initial_equity":initial_equity,"final_equity":equity,"trades":len(result),"net_pnl":equity-initial_equity,"win_rate":float((result.pnl>0).mean()) if len(result) else 0.0}
+    stats["rejection_counts"] = dict(rejections)
     return result,stats
 
 def walk_forward_splits(index, train_bars=500, test_bars=100, step=None):
