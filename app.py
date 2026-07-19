@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import logging
 import threading
 import time
 
@@ -24,6 +25,7 @@ from btc_predictor.persistence import JsonStore, runtime_dir
 from btc_predictor.strategy import Predictor
 
 app = Flask(__name__)
+logger = logging.getLogger("btc_predictor")
 predictor = Predictor()
 data_dir = runtime_dir()
 live_lock = threading.Lock()
@@ -108,6 +110,7 @@ def _live_loop():
     last_sent = pd.Timestamp(persisted["sent_at"]) if persisted.get("sent_at") else None
     while True:
         try:
+            with live_lock: live_state.update({"status":"polling","updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
             ohlc, trades, frames = _bybit_data(); sources = "bybit"
             try:
                 trades = pd.concat([trades, _binance_trades()], ignore_index=True); sources = "bybit+binance"
@@ -124,6 +127,7 @@ def _live_loop():
             live_state_store.write(next_state)
             with live_lock: live_state = next_state
         except Exception as exc:
+            logger.exception("Live market poll failed")
             with live_lock: live_state.update({"status":"degraded","error":str(exc),"updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
         time.sleep(max(15, int(os.getenv("LIVE_POLL_SECONDS", "30"))))
 
@@ -151,7 +155,7 @@ def index(): return render_template("dashboard.html")
 @app.get("/health")
 def health():
     with live_lock: state = dict(live_state)
-    return jsonify({"status":"ok","service":"btc-structure-flow-predictor","paper_only":True,"market_feed":state["status"],"live_loop_owner":live_thread_started})
+    return jsonify({"status":"ok","service":"btc-structure-flow-predictor","paper_only":True,"market_feed":state["status"],"live_loop_owner":live_thread_started,"live_thread_alive":bool(live_thread and live_thread.is_alive())})
 
 
 @app.get("/api/live")
