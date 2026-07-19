@@ -126,6 +126,8 @@ def _live_loop():
                 trade_store.append(_binance_trades()); sources = "bybit+binance"
             except Exception: pass
             now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(hours=3),now); flow_bars=None
+            available_exchanges=set(trades.exchange.astype(str)) if "exchange" in trades else set()
+            sources="+".join(exchange for exchange in ("bybit","binance") if exchange in available_exchanges) or sources
             try:
                 flow_bars=_binance_flow_bars().loc[lambda x:x.index<=now]
             except Exception as exc:
