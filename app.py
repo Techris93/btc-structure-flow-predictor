@@ -27,6 +27,7 @@ live_thread_started = False
 live_thread = None
 push_lock = threading.Lock()
 push_subscriptions = []
+push_last_error = None
 _vapid_key = ec.generate_private_key(ec.SECP256R1())
 _vapid_private_pem = _vapid_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
 _vapid_public_key = base64.urlsafe_b64encode(_vapid_key.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)).rstrip(b"=").decode()
@@ -106,7 +107,7 @@ def api_live():
 
 @app.get("/sw.js")
 def service_worker():
-    return """self.addEventListener('push',e=>{let d=e.data?e.data.json():{};e.waitUntil(self.registration.showNotification(d.title||'BTC Predictor',{body:d.body||'Prediction update',icon:'/favicon.ico',tag:'btc-predictor'}));});self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(clients.openWindow('/'));});""", 200, {"Content-Type":"application/javascript","Service-Worker-Allowed":"/"}
+    return """self.addEventListener('push',e=>{let d=e.data?e.data.json():{};e.waitUntil(self.registration.showNotification(d.title||'BTC Predictor',{body:d.body||'Prediction update',icon:'/favicon.ico',tag:'btc-predictor'}));});self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(clients.openWindow('/'));});""", 200, {"Content-Type":"application/javascript","Service-Worker-Allowed":"/","Cache-Control":"no-store"}
 
 
 @app.get("/push/config")
@@ -116,27 +117,39 @@ def push_config():
 
 @app.post("/push/subscribe")
 def push_subscribe():
+    global push_last_error
     data = request.get_json(silent=True) or {}
     if not data.get("endpoint"):
         return jsonify({"error":"invalid subscription"}), 400
     with push_lock:
         if not any(x.get("endpoint") == data["endpoint"] for x in push_subscriptions): push_subscriptions.append(data)
+        push_last_error = None
     return jsonify({"ok": True, "subscriptions": len(push_subscriptions)})
 
 
 @app.post("/push/test")
 def push_test():
+    global push_last_error
     if webpush is None: return jsonify({"error":"pywebpush unavailable"}), 503
     payload = {"title":"BTC Predictor test", "body":"Web Push is connected and delivering notifications."}
-    sent, failed = 0, 0
+    sent, failed, errors = 0, 0, []
     with push_lock: subscriptions = list(push_subscriptions)
     for sub in subscriptions:
         try:
             webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=_vapid_private_pem, vapid_claims={"sub": _vapid_subject})
             sent += 1
-        except Exception:
+        except Exception as exc:
             failed += 1
-    return jsonify({"ok": sent > 0, "sent": sent, "failed": failed})
+            errors.append(str(exc)[:300])
+    push_last_error = errors[-1] if errors else None
+    return jsonify({"ok": sent > 0, "sent": sent, "failed": failed, "error": push_last_error})
+
+
+@app.after_request
+def no_cache_app_shell(response):
+    if request.path in ("/", "/dashboard", "/sw.js"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
 
 
 
