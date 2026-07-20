@@ -56,7 +56,7 @@ secret_path = data_dir / "push_test_secret"
 if not secret_path.exists():
     secret_path.write_bytes(os.urandom(32)); os.chmod(secret_path, 0o600)
 _push_secret = secret_path.read_bytes()
-trade_store = TradeStore(data_dir / "live_trades.sqlite3")
+trade_store = TradeStore(data_dir / "live_trades.sqlite3", max_rows=int(os.getenv("TRADE_STORE_MAX_ROWS", "80000")))
 
 
 def _bybit_data():
@@ -70,7 +70,7 @@ def _bybit_data():
         for column in ["open","high","low","close","volume"]: frame[column] = pd.to_numeric(frame[column])
         frame = frame.set_index("timestamp")
         return frame.loc[frame.index <= pd.Timestamp.now(tz="UTC")]
-    ohlc, frames = candles("1","300"), {"15m":candles("15","1000"),"1h":candles("60","1000"),"4h":candles("240","1000")}
+    ohlc, frames = candles("1","180"), {"15m":candles("15","400"),"1h":candles("60","300"),"4h":candles("240","250")}
     response = requests.get(f"{base}/recent-trade", params={"category":"linear","symbol":"BTCUSDT","limit":"1000"}, timeout=10)
     response.raise_for_status(); raw = response.json()["result"]["list"]
     trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in raw],unit="ms",utc=True),"price":[float(x["price"]) for x in raw],"qty":[float(x["size"]) for x in raw],"side":[x["side"].lower() for x in raw],"exchange":"bybit","trade_id":[str(x.get("execId",x.get("i",""))) for x in raw]})
@@ -142,7 +142,7 @@ def _live_loop():
                 except Exception as exc:
                     binance_rest_retry_at = poll_started + pd.Timedelta(minutes=10)
                     logger.warning("Binance REST trades unavailable; WebSocket collector remains active: %s", exc)
-            now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(hours=3),now); flow_bars=None
+            now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(minutes=int(os.getenv("TRADE_LOOKBACK_MINUTES","90"))), now, limit=int(os.getenv("TRADE_QUERY_LIMIT","60000"))); flow_bars=None
             recent_trades=trades.loc[trades.time>=now-pd.Timedelta(minutes=2)] if "time" in trades else trades
             available_exchanges=set(recent_trades.exchange.astype(str)) if "exchange" in recent_trades else set()
             sources="+".join(exchange for exchange in ("bybit","binance") if exchange in available_exchanges) or sources
@@ -156,7 +156,7 @@ def _live_loop():
             if flow_bars_cache is not None and not flow_bars_cache.empty and flow_bars_cache.index[-1]>=now-pd.Timedelta(minutes=2):
                 flow_bars=flow_bars_cache.loc[flow_bars_cache.index<=now]
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
-            trade_store.prune(now-pd.Timedelta(hours=6))
+            trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
             key = "|".join(str(getattr(result,k,None)) for k in ("bias","regime_4h","regime_1h","setup_type","zone","sweep_status","orderflow_confirmation","orderflow_reason","entry","stop","target"))
             now = pd.Timestamp.now(tz="UTC"); cooldown = pd.Timedelta(seconds=int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
             if previous_key is not None and key != previous_key and (last_sent is None or now-last_sent >= cooldown):
@@ -170,7 +170,7 @@ def _live_loop():
         except Exception as exc:
             logger.exception("Live market poll failed")
             with live_lock: live_state.update({"status":"degraded","error":str(exc),"updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
-        time.sleep(max(15, int(os.getenv("LIVE_POLL_SECONDS", "30"))))
+        time.sleep(max(20, int(os.getenv("LIVE_POLL_SECONDS", "45"))))
 
 
 def start_live_loop():

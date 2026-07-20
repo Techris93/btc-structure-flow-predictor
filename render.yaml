@@ -8,7 +8,7 @@ services:
     branch: main
     autoDeploy: true
     buildCommand: pip install .
-    startCommand: gunicorn --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT app:app
+    startCommand: gunicorn --workers 1 --threads 2 --timeout 120 --max-requests 200 --max-requests-jitter 40 --bind 0.0.0.0:$PORT app:app
     healthCheckPath: /health
     disk:
       name: btc-predictor-state
@@ -23,6 +23,16 @@ services:
         value: /var/data/research/status.json
       - key: PUSH_COOLDOWN_SECONDS
         value: "60"
+      - key: LIVE_POLL_SECONDS
+        value: "45"
+      - key: TRADE_LOOKBACK_MINUTES
+        value: "90"
+      - key: TRADE_RETENTION_MINUTES
+        value: "120"
+      - key: TRADE_QUERY_LIMIT
+        value: "60000"
+      - key: TRADE_STORE_MAX_ROWS
+        value: "80000"
   - type: worker
     name: btc-structure-flow-research
     repo: https://github.com/Techris93/btc-structure-flow-predictor

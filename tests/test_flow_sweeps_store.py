@@ -37,3 +37,13 @@ def test_trade_store_deduplicates_and_persists(tmp_path):
     assert reopened.stats()["binance"]["trades"]==1
     reopened.set_collector_status("binance",connected=True,mode="spot_market_data")
     assert reopened.collector_status()["binance"]=={"connected":True,"mode":"spot_market_data"}
+
+
+def test_trade_store_enforces_max_rows(tmp_path):
+    path=tmp_path/"cap.sqlite3"; store=TradeStore(path, max_rows=5); now=pd.Timestamp("2025-01-01",tz="UTC")
+    rows=[{"time":now+pd.Timedelta(seconds=i),"price":100+i,"qty":1,"side":"buy","exchange":"binance","trade_id":str(i)} for i in range(12)]
+    assert store.append_rows(rows)==12
+    store.prune()
+    assert store.stats()["binance"]["trades"]==5
+    out=store.query(now, now+pd.Timedelta(minutes=1), limit=3)
+    assert len(out)==3
