@@ -142,9 +142,40 @@ class TradeStore:
         with self.lock:
             self._collector_status[name] = {**self._collector_status.get(name, {}), **values}
 
-    def collector_status(self):
+    def collector_status(self, now=None, stale_after_seconds: int | None = None):
+        """Return collector status, optionally marking stale feeds.
+
+        A collector can report connected=True while no trades arrive. Callers
+        should treat freshness as part of health, not just the socket flag.
+        """
+        now = pd.Timestamp(now or pd.Timestamp.now(tz="UTC"))
+        if now.tzinfo is None:
+            now = now.tz_localize("UTC")
         with self.lock:
-            return {name: dict(values) for name, values in self._collector_status.items()}
+            out = {name: dict(values) for name, values in self._collector_status.items()}
+        if stale_after_seconds is None:
+            return out
+        for name, values in out.items():
+            latest = values.get("latest")
+            lag_seconds = None
+            if latest:
+                latest_ts = pd.Timestamp(latest)
+                if latest_ts.tzinfo is None:
+                    latest_ts = latest_ts.tz_localize("UTC")
+                lag_seconds = float((now - latest_ts).total_seconds())
+            values["lag_seconds"] = None if lag_seconds is None else round(lag_seconds, 1)
+            values["stale"] = lag_seconds is None or lag_seconds > float(stale_after_seconds)
+            if values.get("connected") and values["stale"]:
+                values["fresh"] = False
+            else:
+                values["fresh"] = bool(values.get("connected")) and not values["stale"]
+        return out
+
+    def exchange_latest(self, exchange: str):
+        """Latest trade timestamp for an exchange from durable store stats."""
+        stats = self.stats().get(exchange) or {}
+        latest = stats.get("latest")
+        return pd.Timestamp(latest) if latest else None
 
 
 class _BufferedAppender:

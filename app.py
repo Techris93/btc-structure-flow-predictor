@@ -68,6 +68,11 @@ BINANCE_REST_MINUTES = max(5, int(os.getenv("BINANCE_REST_MINUTES", "15")))
 BINANCE_TRADE_LIMIT = max(50, min(200, int(os.getenv("BINANCE_TRADE_LIMIT", "100"))))
 BINANCE_FLOW_LIMIT = max(30, min(180, int(os.getenv("BINANCE_FLOW_LIMIT", "60"))))
 BINANCE_USER_AGENT = os.getenv("BINANCE_USER_AGENT", "btc-structure-flow-predictor/0.1 (+local-research)")
+COLLECTOR_STALE_SECONDS = max(30, int(os.getenv("COLLECTOR_STALE_SECONDS", "90")))
+# Rare REST backfill only when the WebSocket trade stream is stale. Still off by default
+# for normal operation; set BINANCE_REST_ON_STALE=1 to enable emergency recovery.
+BINANCE_REST_ON_STALE = os.getenv("BINANCE_REST_ON_STALE", "1").lower() in ("1", "true", "yes", "on")
+BINANCE_STALE_REST_MINUTES = max(5, int(os.getenv("BINANCE_STALE_REST_MINUTES", "10")))
 
 
 def _http_get(url, params=None, timeout=10):
@@ -181,19 +186,40 @@ def _live_loop():
             poll_started = pd.Timestamp.now(tz="UTC")
             with live_lock: live_state.update({"status":"polling","updated_at":poll_started.isoformat()})
             ohlc, recent, frames = _bybit_data(); sources = "bybit"; trade_store.append(recent)
-            # Prefer WebSocket collectors. REST is disabled by default in linear/futures mode,
-            # and when enabled it runs infrequently with small limits to avoid IP bans.
-            if BINANCE_REST_ENABLED and poll_started >= binance_rest_retry_at:
+            binance_latest = trade_store.exchange_latest("binance")
+            binance_lag = None
+            if binance_latest is not None:
+                if binance_latest.tzinfo is None:
+                    binance_latest = binance_latest.tz_localize("UTC")
+                binance_lag = float((poll_started - binance_latest).total_seconds())
+            binance_stale = binance_lag is None or binance_lag > COLLECTOR_STALE_SECONDS
+            # Prefer WebSocket collectors. REST is rare:
+            # - always-on only when BINANCE_REST_ENABLED=1
+            # - or emergency stale recovery when BINANCE_REST_ON_STALE=1 and WS is stale
+            rest_due = poll_started >= binance_rest_retry_at
+            rest_allowed = BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_stale)
+            if rest_allowed and rest_due:
                 try:
-                    trade_store.append(_binance_trades())
-                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=BINANCE_REST_MINUTES)
+                    inserted = trade_store.append(_binance_trades())
+                    cooldown_min = BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else BINANCE_STALE_REST_MINUTES
+                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
+                    if inserted:
+                        logger.info("Binance REST backfill inserted %s trades (stale=%s)", inserted, binance_stale)
                 except Exception as exc:
-                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=max(BINANCE_REST_MINUTES * 2, 30))
+                    cooldown_min = max((BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else BINANCE_STALE_REST_MINUTES) * 2, 30)
+                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
                     logger.warning("Binance REST trades unavailable; WebSocket collector remains active: %s", exc)
             now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(minutes=int(os.getenv("TRADE_LOOKBACK_MINUTES","90"))), now, limit=int(os.getenv("TRADE_QUERY_LIMIT","60000"))); flow_bars=None
             recent_trades=trades.loc[trades.time>=now-pd.Timedelta(minutes=2)] if "time" in trades else trades
             available_exchanges=set(recent_trades.exchange.astype(str)) if "exchange" in recent_trades else set()
             sources="+".join(exchange for exchange in ("bybit","binance") if exchange in available_exchanges) or sources
+            # Prefer durable store timestamps when collector latest is empty/stale.
+            store_stats = trade_store.stats()
+            for exchange, values in trade_store.collector_status().items():
+                store_latest = (store_stats.get(exchange) or {}).get("latest")
+                if store_latest and (not values.get("latest") or str(store_latest) > str(values.get("latest"))):
+                    trade_store.set_collector_status(exchange, latest=store_latest)
+            collectors = trade_store.collector_status(poll_started, COLLECTOR_STALE_SECONDS)
             if poll_started >= flow_retry_at:
                 # Only use REST flow bars when REST is explicitly enabled. Linear mode should
                 # derive footprint features from the WebSocket trade buffer instead.
@@ -218,15 +244,19 @@ def _live_loop():
                 last_sent = now
             previous_key = key
             push_state_store.write({"key":key,"sent_at":last_sent.isoformat() if last_sent is not None else None})
+            stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
+            feed_status = "degraded" if stale_exchanges else "live"
             next_state = {
-                "status":"live",
-                "source":sources,
-                "market_type":MARKET_TYPE,
-                "prediction":dict(result.__dict__),
-                "paper":paper_status,
-                "binance_feed_mode":trade_store.collector_status().get("binance",{}).get("mode","unknown"),
-                "updated_at":now.isoformat(),
-                "error":None,
+                "status": feed_status,
+                "source": sources,
+                "market_type": MARKET_TYPE,
+                "prediction": dict(result.__dict__),
+                "paper": paper_status,
+                "binance_feed_mode": collectors.get("binance", {}).get("mode", "unknown"),
+                "collectors": collectors,
+                "stale_exchanges": stale_exchanges,
+                "updated_at": now.isoformat(),
+                "error": (f"stale feeds: {', '.join(stale_exchanges)}" if stale_exchanges else None),
             }
             live_state_store.write(next_state)
             with live_lock: live_state = next_state
@@ -258,17 +288,30 @@ def index(): return render_template("dashboard.html")
 def health():
     start_live_loop()
     with live_lock: state = dict(live_state)
+    collectors = trade_store.collector_status(pd.Timestamp.now(tz="UTC"), COLLECTOR_STALE_SECONDS)
+    # Prefer durable store timestamps when collector latest is empty.
+    store_stats = trade_store.stats()
+    for exchange, values in collectors.items():
+        if not values.get("latest"):
+            store_latest = (store_stats.get(exchange) or {}).get("latest")
+            if store_latest:
+                trade_store.set_collector_status(exchange, latest=store_latest)
+    collectors = trade_store.collector_status(pd.Timestamp.now(tz="UTC"), COLLECTOR_STALE_SECONDS)
+    stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
     return jsonify({
-        "status":"ok",
+        "status": "degraded" if stale_exchanges else "ok",
         "service":"btc-structure-flow-predictor",
         "paper_only":True,
         "market_type":MARKET_TYPE,
         "binance_rest_enabled":BINANCE_REST_ENABLED,
+        "binance_rest_on_stale":BINANCE_REST_ON_STALE,
+        "collector_stale_seconds":COLLECTOR_STALE_SECONDS,
         "market_feed":state["status"],
         "live_loop_owner":live_thread_started,
         "live_thread_alive":bool(live_thread and live_thread.is_alive()),
-        "trade_store":trade_store.stats(),
-        "collectors":trade_store.collector_status(),
+        "trade_store":store_stats,
+        "collectors":collectors,
+        "stale_exchanges":stale_exchanges,
     })
 
 

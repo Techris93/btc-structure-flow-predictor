@@ -39,6 +39,12 @@ services:
         value: "linear"
       - key: BINANCE_REST_ENABLED
         value: "0"
+      - key: BINANCE_REST_ON_STALE
+        value: "1"
+      - key: BINANCE_STALE_REST_MINUTES
+        value: "10"
+      - key: COLLECTOR_STALE_SECONDS
+        value: "90"
       - key: BINANCE_REST_MINUTES
         value: "15"
       - key: BINANCE_TRADE_LIMIT

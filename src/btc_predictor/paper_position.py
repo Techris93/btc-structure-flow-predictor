@@ -65,7 +65,11 @@ class PaperLedger:
         side = self._open["side"]
         stop = self._open["stop"]
         target = self._open["target"]
-        for ts, bar in ohlc.iterrows():
+        # Only evaluate bars at/after entry. Passing the full history would let
+        # pre-entry lows/highs immediately stop out a brand-new paper position.
+        entry_time = pd.Timestamp(self._open["entry_time"])
+        future = ohlc.loc[pd.to_datetime(ohlc.index, utc=True) >= entry_time]
+        for ts, bar in future.iterrows():
             if side == "long":
                 if float(bar.low) <= stop:
                     self._close(ts, stop, "stop")

@@ -60,3 +60,44 @@ def test_paper_ledger_keeps_position_when_bias_remains_on_same_side():
     assert ledger._open is None
     assert len(ledger._closed) == 1
     assert ledger._closed[0]["exit_reason"] == "signal_flipped"
+
+
+def test_paper_ledger_ignores_bars_before_entry():
+    idx = pd.date_range("2025-01-01", periods=5, freq="min", tz="UTC")
+    ohlc = pd.DataFrame(
+        {
+            "open": [100.0] * 5,
+            "high": [101.0] * 5,
+            "low": [90.0, 99.0, 99.0, 99.0, 99.0],  # historical low before entry
+            "close": [100.0] * 5,
+            "volume": [1.0] * 5,
+        },
+        index=idx,
+    )
+    ledger = PaperLedger()
+    pred = PredictorOutput(
+        timestamp=idx[-1],
+        bias="bullish",
+        entry=100.0,
+        stop=95.0,
+        target=110.0,
+        position_size=1.0,
+    )
+    status = ledger.update(pred, ohlc)
+    assert ledger._open is not None
+    assert status["closed_trades"] == 0
+    # After entry, a real stop should close the position.
+    later = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [100.5],
+            "low": [94.0],
+            "close": [95.0],
+            "volume": [1.0],
+        },
+        index=pd.DatetimeIndex([idx[-1] + pd.Timedelta(minutes=1)]),
+    )
+    status = ledger.update(PredictorOutput(timestamp=later.index[0], bias="bullish"), later)
+    assert ledger._open is None
+    assert status["closed_trades"] == 1
+    assert status["last_closed"]["exit_reason"] == "stop"

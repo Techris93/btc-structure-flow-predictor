@@ -47,3 +47,34 @@ def test_trade_store_enforces_max_rows(tmp_path):
     assert store.stats()["binance"]["trades"]==5
     out=store.query(now, now+pd.Timedelta(minutes=1), limit=3)
     assert len(out)==3
+
+
+
+def test_detect_sweep_default_reclaim_window_is_fifteen_bars():
+    idx = pd.date_range("2025-01-01", periods=20, freq="min", tz="UTC")
+    lows = [99.0] * 20
+    closes = [100.0] * 20
+    highs = [101.0] * 20
+    # Breach inside the default 15-bar lookback; keep closes unreclaimed until bar 17.
+    lows[8] = 94.0
+    for i in range(8, 17):
+        closes[i] = 95.0
+    closes[17] = 101.0
+    x = pd.DataFrame({"open": 100.0, "high": highs, "low": lows, "close": closes, "volume": 1.0}, index=idx)
+    z = Zone("z", "swing", "below", 96, 97, 1, idx[0], idx[0])
+    result = detect_sweep(x, z, "bullish", 10)
+    assert result["confirmed"] and result["reclaim_time"] == idx[17]
+    # Explicit 3-bar window should miss this delayed reclaim.
+    assert not detect_sweep(x, z, "bullish", 10, .05, 2, 3)["confirmed"]
+
+
+def test_collector_status_marks_stale_feeds(tmp_path):
+    store = TradeStore(tmp_path / "fresh.sqlite3")
+    now = pd.Timestamp("2025-01-01T00:10:00Z")
+    store.set_collector_status("binance", connected=True, mode="linear", latest="2025-01-01T00:00:00+00:00")
+    store.set_collector_status("bybit", connected=True, mode="linear", latest="2025-01-01T00:09:50+00:00")
+    status = store.collector_status(now=now, stale_after_seconds=90)
+    assert status["binance"]["stale"] is True
+    assert status["binance"]["fresh"] is False
+    assert status["bybit"]["stale"] is False
+    assert status["bybit"]["fresh"] is True

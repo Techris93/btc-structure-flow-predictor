@@ -10,7 +10,7 @@ from .structure import structure_events
 from .zones import build_projected_zones
 
 
-def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,reclaim_bars=3):
+def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,reclaim_bars=15):
     """Find a recent ATR-bounded breach followed by a causal reclaim within N closed 1m bars."""
     recent=ohlc.tail(reclaim_bars+1); breaches=[]
     for ts,bar in recent.iterrows():
