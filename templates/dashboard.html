@@ -140,16 +140,23 @@
           <div class="row"><span>15m structure</span><span id="structure15m">—</span></div>
           <div class="row"><span>Zone</span><span id="zone">—</span></div>
           <div class="row"><span>Zone type</span><span id="zonekind">—</span></div>
-          <div class="row"><span>Sweep</span><span id="sweep">—</span></div>
-          <div class="row"><span>Sweep depth</span><span id="sweepdepth">—</span></div>
-          <div class="row"><span>Footprint</span><span id="flow">—</span></div>
-          <div class="row"><span>Flow reason</span><span id="flowreason">—</span></div>
-          <div class="row">
-            <span>Reward / risk</span><span id="rr">—</span>
-          </div>
-          <div class="row">
-            <span>Position size</span><span id="size">—</span>
-          </div>
+         <div class="row"><span>Sweep</span><span id="sweep">—</span></div>
+         <div class="row"><span>Sweep depth</span><span id="sweepdepth">—</span></div>
+         <div class="row"><span>Footprint</span><span id="flow">—</span></div>
+         <div class="row"><span>Flow reason</span><span id="flowreason">—</span></div>
+         <div class="row">
+           <span>Reward / risk</span><span id="rr">—</span>
+         </div>
+         <div class="row">
+           <span>Position size</span><span id="size">—</span>
+         </div>
+          <div class="row"><span>Prob TP before SL</span><span id="prob">—</span></div>
+          <div class="row"><span>Binance feed</span><span id="binancefeed">—</span></div>
+          <div class="row"><span>Paper equity</span><span id="paperequity">—</span></div>
+          <div class="row"><span>Paper P&L</span><span id="paperpnl">—</span></div>
+          <div class="row"><span>Closed trades</span><span id="papertrades">—</span></div>
+          <div class="row"><span>Win rate</span><span id="winrate">—</span></div>
+          <div class="row"><span>Profit factor</span><span id="pf">—</span></div>
           <p id="updated" class="muted">Waiting for first live update…</p>
         </aside>
       </section>
@@ -207,6 +214,14 @@
         $("size").textContent = x.position_size
           ? x.position_size.toFixed(4) + " BTC"
           : "—";
+        $("prob").textContent = x.probability_tp_before_sl == null ? "—" : (x.probability_tp_before_sl * 100).toFixed(1) + "%";
+        $("binancefeed").textContent = (s.binance_feed_mode || "—").toUpperCase();
+        const p = s.paper || {};
+        $("paperequity").textContent = p.equity != null ? "$" + p.equity.toLocaleString() : "—";
+        $("paperpnl").textContent = p.net_pnl != null ? "$" + p.net_pnl.toLocaleString() : "—";
+        $("papertrades").textContent = p.closed_trades != null ? p.closed_trades + (p.open_position ? " (open)" : "") : "—";
+        $("winrate").textContent = p.win_rate != null ? (p.win_rate * 100).toFixed(1) + "%" : "—";
+        $("pf").textContent = p.profit_factor != null ? p.profit_factor.toFixed(2) : "—";
         $("updated").textContent =
           "Updated " + (s.updated_at || "—") + (s.error ? " · " + s.error : "");
         let key = [

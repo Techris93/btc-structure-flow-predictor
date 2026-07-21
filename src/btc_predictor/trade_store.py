@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -170,15 +171,17 @@ class _BufferedAppender:
 
 async def _binance(store):
     import websockets
+    import os
 
-    endpoints = [
-        ("futures", "wss://fstream.binance.com/ws/btcusdt@aggTrade"),
-        ("spot_market_data", "wss://data-stream.binance.vision/ws/btcusdt@aggTrade"),
-    ]
-    endpoint_index = 0
+    market_type = os.getenv("MARKET_TYPE", "spot").lower()
+    if market_type == "linear":
+        url = "wss://fstream.binance.com/ws/btcusdt@aggTrade"
+        mode = "linear"
+    else:
+        url = "wss://data-stream.binance.vision/ws/btcusdt@aggTrade"
+        mode = "spot"
     buffer = _BufferedAppender(store, flush_every=40, flush_seconds=1.0)
     while True:
-        mode, url = endpoints[endpoint_index]
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
                 store.set_collector_status("binance", connected=True, mode=mode, error=None)
@@ -209,26 +212,32 @@ async def _binance(store):
                     )
         except Exception as exc:
             buffer.flush()
-            logger.warning("Binance %s WebSocket failed; rotating endpoint: %s", mode, exc)
+            logger.warning("Binance %s WebSocket failed; reconnecting: %s", mode, exc)
             store.set_collector_status(
                 "binance",
                 connected=False,
                 mode=mode,
                 error=f"{type(exc).__name__}: {str(exc)[:200]}",
             )
-            endpoint_index = (endpoint_index + 1) % len(endpoints)
             await asyncio.sleep(2)
 
 
 async def _bybit(store):
     import websockets
+    import os
 
-    url = "wss://stream.bybit.com/v5/public/linear"
+    market_type = os.getenv("MARKET_TYPE", "spot").lower()
+    url = (
+        "wss://stream.bybit.com/v5/public/spot"
+        if market_type == "spot"
+        else "wss://stream.bybit.com/v5/public/linear"
+    )
+    mode = market_type if market_type in ("spot", "linear") else "spot"
     buffer = _BufferedAppender(store, flush_every=40, flush_seconds=1.0)
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:
-                store.set_collector_status("bybit", connected=True, mode="linear", error=None)
+                store.set_collector_status("bybit", connected=True, mode=mode, error=None)
                 await ws.send(json.dumps({"op": "subscribe", "args": ["publicTrade.BTCUSDT"]}))
                 async for message in ws:
                     payload = json.loads(message)
@@ -253,7 +262,7 @@ async def _bybit(store):
                         store.set_collector_status(
                             "bybit",
                             connected=True,
-                            mode="linear",
+                            mode=mode,
                             error=None,
                             latest=latest.isoformat(),
                         )
@@ -263,7 +272,7 @@ async def _bybit(store):
             store.set_collector_status(
                 "bybit",
                 connected=False,
-                mode="linear",
+                mode=mode,
                 error=f"{type(exc).__name__}: {str(exc)[:200]}",
             )
             await asyncio.sleep(2)

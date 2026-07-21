@@ -48,39 +48,68 @@ def flow_features_from_bars(flow_bars: pd.DataFrame, window=100) -> pd.DataFrame
     return _finish_features(x[["price","buy","sell","volume","trades"]],window)
 
 
-def cross_exchange_agreement(trades: pd.DataFrame, start, end, direction: str):
-    if trades.empty or "exchange" not in trades: return False, {}
+
+def cross_exchange_agreement(trades: pd.DataFrame, start, end, direction: str, min_notional: float = 1.0):
+    """Weighted agreement. Returns a score in [0,1] and a veto flag."""
+    if trades.empty or "exchange" not in trades: return 0.0, {}
     x=trades.copy(); x["time"]=pd.to_datetime(x.time,utc=True); x=x[(x.time>=pd.Timestamp(start))&(x.time<pd.Timestamp(end))]
-    if x.empty: return False, {}
+    if x.empty: return 0.0, {}
     x["signed"]=np.where(x.side.str.lower().eq("buy"),x.price*x.qty,-x.price*x.qty)
-    deltas=x.groupby("exchange").signed.sum().to_dict(); actual={k:v for k,v in deltas.items() if not str(k).endswith("_proxy")}
+    deltas=x.groupby("exchange").signed.sum().to_dict()
+    actual={k:float(v) for k,v in deltas.items() if not str(k).endswith("_proxy") and abs(v)>=min_notional}
+    if not actual: return 0.0, {}
     desired=1 if direction=="bullish" else -1
-    agrees={k:(np.sign(v)==desired) for k,v in actual.items() if v!=0}
-    return len(agrees)>=2 and all(agrees.values()), {k:float(v) for k,v in actual.items()}
+    total=sum(abs(v) for v in actual.values())
+    agree_notional=sum(abs(v) for v in actual.values() if np.sign(v)==desired)
+    score=agree_notional/total if total else 0.0
+    return score, actual
 
 
-def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_time, window=100):
+def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_time, window=100, min_score: float = 0.50):
     features=flow_features_from_bars(flow_bars,window) if flow_bars is not None and not flow_bars.empty else orderflow_features(trades,window=window)
     features=features.loc[features.index<=pd.Timestamp(decision_time)]
-    if len(features)<20: return False,{"reason":"flow_warmup","bars":len(features)}
-    recent=features.loc[features.index>=pd.Timestamp(sweep_time)-pd.Timedelta(minutes=1)]
+    if len(features)<20: return False,{"reason":"flow_warmup","bars":len(features),"score":0.0}
+    recent=features.loc[features.index>=pd.Timestamp(sweep_time)-pd.Timedelta(minutes=2)]
     current=features.iloc[-1]
     if direction=="bullish":
-        extreme=bool((recent.delta_z<-1).any() or recent.sell_absorption.any())
-        reversal=bool(current.bullish_delta_reversal or current.delta>0)
+        extreme=float(((recent.delta_z<-1).sum() + recent.sell_absorption.sum()) / max(len(recent),1))
+        reversal=float((current.bullish_delta_reversal or current.delta>0))
     else:
-        extreme=bool((recent.delta_z>1).any() or recent.buy_absorption.any())
-        reversal=bool(current.bearish_delta_reversal or current.delta<0)
+        extreme=float(((recent.delta_z>1).sum() + recent.buy_absorption.sum()) / max(len(recent),1))
+        reversal=float((current.bearish_delta_reversal or current.delta<0))
     response_baseline=features.price_response.abs().rolling(20,min_periods=5).median().iloc[-1]
-    stalled=bool(np.isfinite(response_baseline) and (recent.price_response.abs()<=response_baseline).any())
-    agreement,deltas=cross_exchange_agreement(trades,pd.Timestamp(decision_time)-pd.Timedelta(minutes=1),decision_time,direction)
+    stalled=float(min(1.0, (recent.price_response.abs()<=response_baseline).sum() / max(len(recent),1))) if np.isfinite(response_baseline) else 0.0
+    agreement,deltas=cross_exchange_agreement(trades,pd.Timestamp(decision_time)-pd.Timedelta(minutes=2),decision_time,direction)
     raw=trades.copy(); raw["time"]=pd.to_datetime(raw.time,utc=True)
     raw=raw[(raw.time>=pd.Timestamp(sweep_time))&(raw.time<pd.Timestamp(decision_time))]
-    imbalance=False
+    imbalance=0.0
     if not raw.empty:
         footprint=build_footprint(raw)
-        ratio=float(footprint.imbalance_ratio.median()) if len(footprint) else 1
-        imbalance=ratio>1.2 if direction=="bullish" else ratio<1/1.2
-    confirmed=extreme and reversal and stalled and agreement and imbalance
-    reason="confirmed" if confirmed else ",".join(name for name,ok in (("extreme_delta",extreme),("delta_reversal",reversal),("price_response",stalled),("cross_exchange",agreement),("footprint_imbalance",imbalance)) if not ok)
-    return confirmed,{"reason":reason,"extreme":extreme,"reversal":reversal,"stalled_response":stalled,"agreement":agreement,"imbalance":imbalance,"exchange_deltas":deltas,"delta_z":float(current.delta_z) if np.isfinite(current.delta_z) else None,"intensity_z":float(current.intensity_z) if np.isfinite(current.intensity_z) else None}
+        ratio=float(footprint.imbalance_ratio.median()) if len(footprint) else 1.0
+        if direction=="bullish":
+            imbalance=min(1.0, max(0.0, (ratio-1.0)/0.5))
+        else:
+            imbalance=min(1.0, max(0.0, (1.0/ratio-1.0)/0.5))
+    # Weighted score. Weights sum to 1.0.
+    weights = {
+        "extreme_delta": 0.25,
+        "delta_reversal": 0.25,
+        "price_response": 0.15,
+        "cross_exchange": 0.20,
+        "footprint_imbalance": 0.15,
+    }
+    score = (
+        weights["extreme_delta"] * extreme
+        + weights["delta_reversal"] * reversal
+        + weights["price_response"] * stalled
+        + weights["cross_exchange"] * agreement
+        + weights["footprint_imbalance"] * imbalance
+    )
+    confirmed = score >= min_score
+    reason = "confirmed" if confirmed else "score_below_threshold"
+    return confirmed, {"reason": reason, "score": round(score, 3), "threshold": min_score,
+                       "extreme": round(extreme,3), "reversal": round(reversal,3),
+                       "stalled_response": round(stalled,3), "agreement": round(agreement,3),
+                       "imbalance": round(imbalance,3), "exchange_deltas": deltas,
+                       "delta_z": float(current.delta_z) if np.isfinite(current.delta_z) else None,
+                       "intensity_z": float(current.intensity_z) if np.isfinite(current.intensity_z) else None}

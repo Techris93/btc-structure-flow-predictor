@@ -33,6 +33,14 @@ services:
         value: "60000"
       - key: TRADE_STORE_MAX_ROWS
         value: "80000"
+      - key: MAX_PROJECTED_ZONES
+        value: "200"
+      - key: MARKET_TYPE
+        value: "spot"
+      - key: MAX_SWING_EQUAL_ZONES
+        value: "80"
+      - key: PAPER_LEDGER_PATH
+        value: "/var/data/paper_ledger.json"
   - type: worker
     name: btc-structure-flow-research
     repo: https://github.com/Techris93/btc-structure-flow-predictor

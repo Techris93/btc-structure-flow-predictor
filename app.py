@@ -24,6 +24,7 @@ except ImportError:
 from btc_predictor.persistence import JsonStore, runtime_dir
 from btc_predictor.strategy import Predictor
 from btc_predictor.trade_store import TradeStore, start_collectors
+from btc_predictor.paper_position import PaperLedger
 
 app = Flask(__name__)
 logger = logging.getLogger("btc_predictor")
@@ -57,12 +58,14 @@ if not secret_path.exists():
     secret_path.write_bytes(os.urandom(32)); os.chmod(secret_path, 0o600)
 _push_secret = secret_path.read_bytes()
 trade_store = TradeStore(data_dir / "live_trades.sqlite3", max_rows=int(os.getenv("TRADE_STORE_MAX_ROWS", "80000")))
+paper_ledger = PaperLedger(os.getenv("PAPER_LEDGER_PATH", str(data_dir / "paper_ledger.json")))
 
 
 def _bybit_data():
     base = "https://api.bybit.com/v5/market"
+    market_type = os.getenv("MARKET_TYPE", "spot").lower()
     def candles(interval, limit="300"):
-        response = requests.get(f"{base}/kline", params={"category":"linear","symbol":"BTCUSDT","interval":interval,"limit":limit}, timeout=10)
+        response = requests.get(f"{base}/kline", params={"category":market_type,"symbol":"BTCUSDT","interval":interval,"limit":limit}, timeout=10)
         response.raise_for_status(); rows = list(reversed(response.json()["result"]["list"]))
         frame = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume","turnover"])
         duration = {"1":"1min","15":"15min","60":"1h","240":"4h"}[interval]
@@ -70,8 +73,8 @@ def _bybit_data():
         for column in ["open","high","low","close","volume"]: frame[column] = pd.to_numeric(frame[column])
         frame = frame.set_index("timestamp")
         return frame.loc[frame.index <= pd.Timestamp.now(tz="UTC")]
-    ohlc, frames = candles("1","180"), {"15m":candles("15","400"),"1h":candles("60","300"),"4h":candles("240","250")}
-    response = requests.get(f"{base}/recent-trade", params={"category":"linear","symbol":"BTCUSDT","limit":"1000"}, timeout=10)
+    ohlc, frames = candles("1","180"), {"15m":candles("15","400"),"1h":candles("60","150"),"4h":candles("240","120")}
+    response = requests.get(f"{base}/recent-trade", params={"category":market_type,"symbol":"BTCUSDT","limit":"1000"}, timeout=10)
     response.raise_for_status(); raw = response.json()["result"]["list"]
     trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in raw],unit="ms",utc=True),"price":[float(x["price"]) for x in raw],"qty":[float(x["size"]) for x in raw],"side":[x["side"].lower() for x in raw],"exchange":"bybit","trade_id":[str(x.get("execId",x.get("i",""))) for x in raw]})
     return ohlc, trades, frames
@@ -130,6 +133,7 @@ def _live_loop():
     binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
     flow_retry_at = pd.Timestamp(0, tz="UTC")
     flow_bars_cache = None
+    market_type = os.getenv("MARKET_TYPE", "spot").lower()
     while True:
         try:
             poll_started = pd.Timestamp.now(tz="UTC")
@@ -147,15 +151,19 @@ def _live_loop():
             available_exchanges=set(recent_trades.exchange.astype(str)) if "exchange" in recent_trades else set()
             sources="+".join(exchange for exchange in ("bybit","binance") if exchange in available_exchanges) or sources
             if poll_started >= flow_retry_at:
-                try:
-                    flow_bars_cache=_binance_flow_bars()
-                    flow_retry_at = poll_started + pd.Timedelta(minutes=1)
-                except Exception as exc:
-                    flow_retry_at = poll_started + pd.Timedelta(minutes=10)
-                    logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
+                if market_type == "spot":
+                    try:
+                        flow_bars_cache=_binance_flow_bars()
+                        flow_retry_at = poll_started + pd.Timedelta(minutes=1)
+                    except Exception as exc:
+                        flow_retry_at = poll_started + pd.Timedelta(minutes=10)
+                        logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
+                else:
+                    flow_bars_cache = None
             if flow_bars_cache is not None and not flow_bars_cache.empty and flow_bars_cache.index[-1]>=now-pd.Timedelta(minutes=2):
                 flow_bars=flow_bars_cache.loc[flow_bars_cache.index<=now]
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
+            paper_status = paper_ledger.update(result, ohlc)
             trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
             key = "|".join(str(getattr(result,k,None)) for k in ("bias","regime_4h","regime_1h","setup_type","zone","sweep_status","orderflow_confirmation","orderflow_reason","entry","stop","target"))
             now = pd.Timestamp.now(tz="UTC"); cooldown = pd.Timedelta(seconds=int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
@@ -164,7 +172,7 @@ def _live_loop():
                 last_sent = now
             previous_key = key
             push_state_store.write({"key":key,"sent_at":last_sent.isoformat() if last_sent is not None else None})
-            next_state = {"status":"live","source":sources,"prediction":dict(result.__dict__),"updated_at":now.isoformat(),"error":None}
+            next_state = {"status":"live","source":sources,"prediction":dict(result.__dict__),"paper":paper_status,"binance_feed_mode":trade_store.collector_status().get("binance",{}).get("mode","unknown"),"updated_at":now.isoformat(),"error":None}
             live_state_store.write(next_state)
             with live_lock: live_state = next_state
         except Exception as exc:
@@ -209,7 +217,15 @@ def api_live():
 
 
 @app.get("/api/backtest/one-year")
-def backtest_status(): return jsonify(research_status_store.read({"status":"idle","note":"Run the separate research worker."}))
+def backtest_status():
+    result = research_status_store.read({"status":"idle","note":"Run the separate research worker."})
+    result_path = Path(os.getenv("BTC_RESEARCH_DIR", str(data_dir / "research"))) / "result.json"
+    if result_path.exists():
+        try:
+            result = {**result, **JsonStore(result_path).read({})}
+        except Exception:
+            pass
+    return jsonify(result)
 
 
 @app.post("/api/backtest/one-year")

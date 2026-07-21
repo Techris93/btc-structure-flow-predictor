@@ -31,9 +31,9 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=3):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=15,require_15m_align=True):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
-        self.reclaim_bars=reclaim_bars; self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
+        self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
 
     @staticmethod
     def _last(frame):
@@ -50,11 +50,26 @@ class Predictor:
         if setup is not None:self.last_regimes["15m"]=self._last(setup)[0]
         candidate=signals[0] if signals[0]==signals[1] else "neutral"
         if candidate=="neutral":return "neutral"
+        if self.require_15m_align and setup is not None:
+            setup_bias=self._last(setup)[0]
+            self.last_regimes["15m"]=setup_bias
+            if setup_bias not in ("neutral",candidate): return "neutral"
         if self._held_bias in ("bullish","bearish") and candidate!=self._held_bias:
             opposing=any(not e.empty and e.iloc[-1].event=="CHoCH" and e.iloc[-1].bias==candidate for e in event_sets)
             if not opposing:return "neutral"
         self._held_bias=candidate; return candidate
 
+    def _probability_estimate(self, score: float, rr: float, bias: str) -> float:
+        """Simple placeholder probability; replace with empirical model from research ledger."""
+        if not (np.isfinite(score) and np.isfinite(rr)):
+            return None
+        base = 0.50
+        score_add = 0.20 * (score - 0.50)
+        rr_add = 0.10 * (rr - 1.5)
+        align = 0.05 if self.last_regimes.get("15m") == bias else 0.0
+        prob = base + score_add + rr_add + align
+        return float(np.clip(prob, 0.05, 0.95))
+    
     def _output(self,now,bias,**kwargs):
         return PredictorOutput(now,bias,regime_4h=self.last_regimes["4h"],regime_1h=self.last_regimes["1h"],setup_15m=self.last_regimes["15m"],**kwargs)
 
@@ -76,7 +91,7 @@ class Predictor:
         z,sweep=max(confirmed,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
         usable=t.loc[t.time<now]
         confirm,flow=footprint_confirmation(usable,flow_bars,bias,sweep["time"],now)
-        if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),no_trade_reason="orderflow_not_confirmed")
+        if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement",0.0)>0.5,no_trade_reason="orderflow_not_confirmed")
         active_targets=[q for q in zones if q.is_active(now) and q.zone_id!=z.zone_id]
         if bias=="bullish":
             stop=min(sweep["extreme"]-.1*a,price-self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price]; target=min(options or [price+2*a]); rr=(target-price)/(price-stop)
@@ -84,4 +99,5 @@ class Predictor:
             stop=max(sweep["extreme"]+.1*a,price+self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price]; target=max(options or [price-2*a]); rr=(price-target)/(stop-price)
         base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr)
         if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
-        return self._output(now,bias,**base,probability_tp_before_sl=None,position_size=equity*self.risk_fraction/abs(price-stop))
+        prob = self._probability_estimate(flow.get("score",0.0), rr, bias)
+        return self._output(now,bias,**base,probability_tp_before_sl=prob,position_size=equity*self.risk_fraction/abs(price-stop))
