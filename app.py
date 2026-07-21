@@ -32,14 +32,17 @@ predictor = Predictor()
 data_dir = runtime_dir()
 live_lock = threading.Lock()
 push_lock = threading.Lock()
+live_start_lock = threading.Lock()
 live_state = {"status":"starting","source":None,"prediction":None,"updated_at":None,"error":None}
 live_thread_started = False
 live_thread = None
 collector_thread = None
 _live_lock_handle = None
+live_boot_thread = None
 
 subscription_store = JsonStore(data_dir / "push_subscriptions.json")
 push_state_store = JsonStore(data_dir / "push_state.json")
+push_delivery_store = JsonStore(data_dir / "push_delivery.json")
 live_state_store = JsonStore(data_dir / "live_state.json")
 research_status_store = JsonStore(os.getenv("BTC_RESEARCH_STATUS", str(data_dir / "research/status.json")))
 push_subscriptions = subscription_store.read([])
@@ -156,22 +159,59 @@ def _upsert_subscription(subscriptions, subscription):
     return True
 
 
-def _send_push(payload, subscriptions=None):
-    if webpush is None: return 0, 0
+def _send_push(payload, subscriptions=None, delivery_type="automatic"):
+    attempted_at = pd.Timestamp.now(tz="UTC")
+    if webpush is None:
+        push_delivery_store.write({
+            "delivery_type": delivery_type,
+            "attempted_at": attempted_at.isoformat(),
+            "attempted": 0,
+            "sent": 0,
+            "failed": 0,
+            "error": "pywebpush unavailable",
+        })
+        return 0, 0
     with push_lock: targets = list(subscriptions if subscriptions is not None else push_subscriptions)
     sent, failed, stale = 0, 0, []
+    last_error = None
+    topic = "btc-structure-flow" if delivery_type == "automatic" else "btc-structure-test"
     for sub in targets:
         try:
-            webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=str(vapid_path), vapid_claims={"sub":_vapid_subject})
+            webpush(
+                subscription_info=sub,
+                data=json.dumps(payload),
+                vapid_private_key=str(vapid_path),
+                vapid_claims={"sub":_vapid_subject},
+                timeout=10,
+                ttl=86_400,
+                headers={"Urgency":"high", "Topic":topic},
+            )
             sent += 1
         except Exception as exc:
             logger.warning("Web Push delivery failed: %s", exc)
             failed += 1
+            last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
             if "404" in str(exc) or "410" in str(exc): stale.append(sub.get("endpoint"))
     if stale:
         with push_lock:
             push_subscriptions[:] = [s for s in push_subscriptions if s.get("endpoint") not in stale]
             _persist_subscriptions()
+    push_delivery_store.write({
+        "delivery_type": delivery_type,
+        "attempted_at": attempted_at.isoformat(),
+        "attempted": len(targets),
+        "sent": sent,
+        "failed": failed,
+        "error": last_error,
+        "subscriptions": len(push_subscriptions),
+    })
+    logger.info(
+        "Web Push %s delivery: attempted=%s sent=%s failed=%s",
+        delivery_type,
+        len(targets),
+        sent,
+        failed,
+    )
     return sent, failed
 
 
@@ -274,7 +314,15 @@ def _live_loop():
             key = "|".join(str(getattr(result,k,None)) for k in ("bias","regime_4h","regime_1h","setup_type","zone","sweep_status","orderflow_confirmation","orderflow_reason","entry","stop","target"))
             now = pd.Timestamp.now(tz="UTC"); cooldown = pd.Timedelta(seconds=int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
             if previous_key is not None and key != previous_key and (last_sent is None or now-last_sent >= cooldown):
-                _send_push({"title":"BTC Predictor update","body":f"{result.bias.upper()} · {result.setup_type or result.no_trade_reason or result.sweep_status}"})
+                event_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+                detail = str(result.setup_type or result.no_trade_reason or result.sweep_status or "State changed")
+                detail = detail.replace("_", " ").strip().capitalize()
+                _send_push({
+                    "title":"BTC Predictor update",
+                    "body":f"{str(result.bias).capitalize()} · {detail}",
+                    "url":"/",
+                    "event_id":event_id,
+                })
                 last_sent = now
             previous_key = key
             push_state_store.write({"key":key,"sent_at":last_sent.isoformat() if last_sent is not None else None})
@@ -306,15 +354,52 @@ def _live_loop():
 
 def start_live_loop():
     global live_thread_started, live_thread, collector_thread, _live_lock_handle
-    if live_thread_started and live_thread is not None and live_thread.is_alive(): return True
-    try:
-        _live_lock_handle = open(data_dir / "live-loop.lock", "w")
-        fcntl.flock(_live_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (BlockingIOError, OSError): return False
-    live_thread_started = True
-    collector_thread=start_collectors(trade_store)
-    live_thread = threading.Thread(target=_live_loop, name="live-predictor", daemon=True); live_thread.start()
-    return True
+    with live_start_lock:
+        if live_thread_started and live_thread is not None and live_thread.is_alive(): return True
+        lock_handle = None
+        try:
+            lock_handle = open(data_dir / "live-loop.lock", "w")
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            if lock_handle is not None:
+                lock_handle.close()
+            return False
+        try:
+            _live_lock_handle = lock_handle
+            collector_thread = start_collectors(trade_store)
+            live_thread = threading.Thread(target=_live_loop, name="live-predictor", daemon=True)
+            live_thread.start()
+            live_thread_started = True
+            logger.info("Live predictor loop started independently of dashboard traffic")
+            return True
+        except Exception:
+            logger.exception("Unable to start live predictor loop")
+            live_thread_started = False
+            if lock_handle is not None:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
+                lock_handle.close()
+            _live_lock_handle = None
+            return False
+
+
+def _supervise_live_loop():
+    retry_seconds = max(1, int(os.getenv("LIVE_BOOT_RETRY_SECONDS", "5")))
+    while not start_live_loop():
+        logger.info("Live predictor lock is held by a retiring worker; retrying in %ss", retry_seconds)
+        time.sleep(retry_seconds)
+
+
+def start_live_boot_supervisor():
+    global live_boot_thread
+    if live_boot_thread is not None and live_boot_thread.is_alive():
+        return live_boot_thread
+    live_boot_thread = threading.Thread(target=_supervise_live_loop, name="live-boot-supervisor", daemon=True)
+    live_boot_thread.start()
+    return live_boot_thread
+
+
+if os.getenv("START_LIVE_LOOP_ON_BOOT", "0").lower() in ("1", "true", "yes", "on"):
+    start_live_boot_supervisor()
 
 
 @app.get("/")
@@ -336,6 +421,7 @@ def health():
                 trade_store.set_collector_status(exchange, latest=store_latest)
     collectors = trade_store.collector_status(pd.Timestamp.now(tz="UTC"), COLLECTOR_STALE_SECONDS)
     stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
+    push_delivery = push_delivery_store.read({})
     return jsonify({
         "status": "degraded" if stale_exchanges else "ok",
         "service":"btc-structure-flow-predictor",
@@ -347,6 +433,11 @@ def health():
         "market_feed":state["status"],
         "live_loop_owner":live_thread_started,
         "live_thread_alive":bool(live_thread and live_thread.is_alive()),
+        "push":{
+            "supported":webpush is not None,
+            "subscriptions":len(push_subscriptions),
+            "last_delivery":push_delivery,
+        },
         "trade_store":store_stats,
         "collectors":collectors,
         "stale_exchanges":stale_exchanges,
@@ -381,7 +472,45 @@ def no_web_backtest(): return jsonify({"error":"Research is disabled in the web 
 
 @app.get("/sw.js")
 def service_worker():
-    script = "self.addEventListener('push',e=>{let d=e.data?e.data.json():{};e.waitUntil(self.registration.showNotification(d.title||'BTC Predictor',{body:d.body||'Prediction update',icon:'/favicon.ico',tag:'btc-predictor'}));});self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(clients.openWindow('/'));});"
+    public_key = json.dumps(_vapid_public_key)
+    script = f"""
+const VAPID_PUBLIC_KEY = {public_key};
+const decodeKey = value => {{
+  const padding = '='.repeat((4 - value.length % 4) % 4);
+  const raw = atob((value + padding).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from([...raw].map(char => char.charCodeAt(0)));
+}};
+self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
+self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
+self.addEventListener('push', event => {{
+  const data = event.data ? event.data.json() : {{}};
+  event.waitUntil(self.registration.showNotification(data.title || 'BTC Predictor', {{
+    body: data.body || 'Prediction update',
+    icon: '/favicon.ico',
+    tag: data.event_id ? `btc-predictor-${{data.event_id}}` : 'btc-predictor',
+    renotify: true,
+    data: {{url: data.url || '/'}},
+  }}));
+}});
+self.addEventListener('notificationclick', event => {{
+  event.notification.close();
+  const target = new URL((event.notification.data || {{}}).url || '/', self.location.origin).href;
+  event.waitUntil(self.clients.matchAll({{type: 'window', includeUncontrolled: true}}).then(windows => {{
+    const existing = windows.find(client => client.url.startsWith(self.location.origin));
+    return existing ? existing.focus().then(() => existing.navigate(target)) : self.clients.openWindow(target);
+  }}));
+}});
+self.addEventListener('pushsubscriptionchange', event => {{
+  event.waitUntil(self.registration.pushManager.subscribe({{
+    userVisibleOnly: true,
+    applicationServerKey: decodeKey(VAPID_PUBLIC_KEY),
+  }}).then(subscription => fetch('/push/subscribe', {{
+    method: 'POST',
+    headers: {{'content-type': 'application/json'}},
+    body: JSON.stringify(subscription),
+  }})));
+}});
+"""
     return script, 200, {"Content-Type":"application/javascript","Service-Worker-Allowed":"/","Cache-Control":"no-store"}
 
 
@@ -407,7 +536,11 @@ def push_test():
     if not endpoint or not hmac.compare_digest(token, expected): return jsonify({"error":"unauthorized"}), 401
     if webpush is None: return jsonify({"error":"pywebpush unavailable"}), 503
     with push_lock: target = [s for s in push_subscriptions if s.get("endpoint") == endpoint]
-    sent, failed = _send_push({"title":"BTC Predictor test","body":"Web Push is connected and delivering notifications."}, target)
+    sent, failed = _send_push(
+        {"title":"BTC Predictor test","body":"Web Push is connected and delivering notifications.","url":"/","event_id":"test"},
+        target,
+        delivery_type="test",
+    )
     return jsonify({"ok":sent > 0,"sent":sent,"failed":failed})
 
 

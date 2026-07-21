@@ -23,6 +23,10 @@ services:
         value: /var/data/research/status.json
       - key: PUSH_COOLDOWN_SECONDS
         value: "60"
+      - key: START_LIVE_LOOP_ON_BOOT
+        value: "1"
+      - key: LIVE_BOOT_RETRY_SECONDS
+        value: "5"
       - key: LIVE_POLL_SECONDS
         value: "45"
       - key: TRADE_LOOKBACK_MINUTES

@@ -495,8 +495,6 @@
 
     <script>
       const $ = (id) => document.getElementById(id);
-      let last = "";
-
       const LABELS = {
         bullish: "Bullish",
         bearish: "Bearish",
@@ -765,31 +763,6 @@
         statusChip.className = "chip " + String(feedStatus).toLowerCase();
         $("statusLabel").textContent = humanize(feedStatus);
 
-        const key = [
-          x.bias,
-          x.setup_type,
-          x.entry,
-          x.stop,
-          x.target,
-          x.sweep_status,
-          x.no_trade_reason,
-        ].join("|");
-        if (
-          last &&
-          key !== last &&
-          "Notification" in window &&
-          Notification.permission === "granted"
-        ) {
-          new Notification("BTC Predictor update", {
-            body:
-              humanize(bias) +
-              " · " +
-              (humanize(x.setup_type) !== "—"
-                ? humanize(x.setup_type)
-                : reasonText || "State changed"),
-          });
-        }
-        last = key;
       }
 
       async function syncPushButton() {
@@ -803,7 +776,8 @@
           return;
         }
         try {
-          const reg = await navigator.serviceWorker.getRegistration();
+          const reg = await navigator.serviceWorker.register("/sw.js");
+          await reg.update();
           const sub = reg ? await reg.pushManager.getSubscription() : null;
           b.textContent = sub ? "Notifications enabled" : "Enable push notifications";
           b.title = sub ? "Click to send a test notification" : "";
