@@ -119,3 +119,18 @@ Local futures mode is deliberately gentle:
 
 Do not enable frequent Binance REST polling from a cloud IP.
 
+### Binance futures data path (adaptive, within limits)
+
+Budget check (Render + local): `fapi` weight limit is 2,400/min; WS is free up to
+300 connects/5 min and 1,024 streams/connection.
+
+- Preferred: one WebSocket with `aggTrade + kline_1m + markPrice@1s` (3 streams on 1 connection).
+- When the WS stream is fresh: zero Binance REST calls.
+- When the WS stream is stale (>90s): rare REST backfill only.
+  - `aggTrades limit=100` → weight ~20 per call, every 3 min ≈ 7 weight/min
+  - `klines limit=60` → weight ~2 per call, every 3 min ≈ 0.7 weight/min
+  - total ≈ 8 weight/min (~0.3% of the 2,400/min budget)
+- On REST error (418/429): cooldown doubles to >=30 min, never retries hot.
+
+Health exposes `binance_data_path`: `websocket` | `rest_backfill` | `stale`.
+

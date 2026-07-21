@@ -198,6 +198,7 @@ def _live_loop():
             # - or emergency stale recovery when BINANCE_REST_ON_STALE=1 and WS is stale
             rest_due = poll_started >= binance_rest_retry_at
             rest_allowed = BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_stale)
+            binance_data_path = "websocket" if not binance_stale else ("rest_backfill" if BINANCE_REST_ON_STALE else "stale")
             if rest_allowed and rest_due:
                 try:
                     inserted = trade_store.append(_binance_trades())
@@ -205,6 +206,12 @@ def _live_loop():
                     binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
                     if inserted:
                         logger.info("Binance REST backfill inserted %s trades (stale=%s)", inserted, binance_stale)
+                    # Also refresh the flow baseline while we are paying REST weight anyway
+                    # (klines cost weight ~2 for limit<=500; still a tiny share of 2400/min).
+                    try:
+                        flow_bars_cache = _binance_flow_bars()
+                    except Exception as exc:
+                        logger.warning("Binance REST flow baseline unavailable: %s", exc)
                 except Exception as exc:
                     cooldown_min = max((BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else BINANCE_STALE_REST_MINUTES) * 2, 30)
                     binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
@@ -227,16 +234,10 @@ def _live_loop():
             if len(ws_flow) >= 2 and ws_flow.index[-1] >= now - pd.Timedelta(minutes=3):
                 flow_bars = ws_flow.loc[ws_flow.index <= now]
                 flow_source = "websocket"
-            elif BINANCE_REST_ENABLED and poll_started >= flow_retry_at:
-                try:
-                    flow_bars_cache = _binance_flow_bars()
-                    flow_retry_at = poll_started + pd.Timedelta(minutes=BINANCE_REST_MINUTES)
-                except Exception as exc:
-                    flow_retry_at = poll_started + pd.Timedelta(minutes=max(BINANCE_REST_MINUTES * 2, 30))
-                    logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
+            elif (BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_stale)) and flow_bars_cache is not None and not flow_bars_cache.empty:
                 if flow_bars_cache is not None and not flow_bars_cache.empty and flow_bars_cache.index[-1] >= now - pd.Timedelta(minutes=2):
                     flow_bars = flow_bars_cache.loc[flow_bars_cache.index <= now]
-                    flow_source = "rest"
+                    flow_source = "rest_backfill"
                 else:
                     flow_source = None
             else:
@@ -261,6 +262,7 @@ def _live_loop():
                 "paper": paper_status,
                 "binance_feed_mode": collectors.get("binance", {}).get("mode", "unknown"),
                 "flow_source": flow_source,
+                "binance_data_path": binance_data_path,
                 "collectors": collectors,
                 "stale_exchanges": stale_exchanges,
                 "updated_at": now.isoformat(),
