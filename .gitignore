@@ -2,3 +2,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 work/runtime/
+.venv/
+.env
+work/runtime-local/
+.venv.*/
+*.egg-info/
+src/*.egg-info/

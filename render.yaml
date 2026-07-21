@@ -37,6 +37,8 @@ services:
         value: "200"
       - key: MARKET_TYPE
         value: "spot"
+      - key: BINANCE_REST_ENABLED
+        value: "0"
       - key: MAX_SWING_EQUAL_ZONES
         value: "80"
       - key: PAPER_LEDGER_PATH

@@ -60,12 +60,27 @@ _push_secret = secret_path.read_bytes()
 trade_store = TradeStore(data_dir / "live_trades.sqlite3", max_rows=int(os.getenv("TRADE_STORE_MAX_ROWS", "80000")))
 paper_ledger = PaperLedger(os.getenv("PAPER_LEDGER_PATH", str(data_dir / "paper_ledger.json")))
 
+MARKET_TYPE = os.getenv("MARKET_TYPE", "linear").lower()
+if MARKET_TYPE not in ("spot", "linear"):
+    MARKET_TYPE = "linear"
+BINANCE_REST_ENABLED = os.getenv("BINANCE_REST_ENABLED", "0" if MARKET_TYPE == "linear" else "1").lower() in ("1", "true", "yes", "on")
+BINANCE_REST_MINUTES = max(5, int(os.getenv("BINANCE_REST_MINUTES", "15")))
+BINANCE_TRADE_LIMIT = max(50, min(200, int(os.getenv("BINANCE_TRADE_LIMIT", "100"))))
+BINANCE_FLOW_LIMIT = max(30, min(180, int(os.getenv("BINANCE_FLOW_LIMIT", "60"))))
+BINANCE_USER_AGENT = os.getenv("BINANCE_USER_AGENT", "btc-structure-flow-predictor/0.1 (+local-research)")
+
+
+def _http_get(url, params=None, timeout=10):
+    headers = {"User-Agent": BINANCE_USER_AGENT, "Accept": "application/json"}
+    response = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response
+
 
 def _bybit_data():
     base = "https://api.bybit.com/v5/market"
-    market_type = os.getenv("MARKET_TYPE", "spot").lower()
     def candles(interval, limit="300"):
-        response = requests.get(f"{base}/kline", params={"category":market_type,"symbol":"BTCUSDT","interval":interval,"limit":limit}, timeout=10)
+        response = _http_get(f"{base}/kline", params={"category":MARKET_TYPE,"symbol":"BTCUSDT","interval":interval,"limit":limit}, timeout=10)
         response.raise_for_status(); rows = list(reversed(response.json()["result"]["list"]))
         frame = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume","turnover"])
         duration = {"1":"1min","15":"15min","60":"1h","240":"4h"}[interval]
@@ -74,22 +89,50 @@ def _bybit_data():
         frame = frame.set_index("timestamp")
         return frame.loc[frame.index <= pd.Timestamp.now(tz="UTC")]
     ohlc, frames = candles("1","180"), {"15m":candles("15","400"),"1h":candles("60","150"),"4h":candles("240","120")}
-    response = requests.get(f"{base}/recent-trade", params={"category":market_type,"symbol":"BTCUSDT","limit":"1000"}, timeout=10)
+    response = _http_get(f"{base}/recent-trade", params={"category":MARKET_TYPE,"symbol":"BTCUSDT","limit":"1000"}, timeout=10)
     response.raise_for_status(); raw = response.json()["result"]["list"]
     trades = pd.DataFrame({"time":pd.to_datetime([int(x["time"]) for x in raw],unit="ms",utc=True),"price":[float(x["price"]) for x in raw],"qty":[float(x["size"]) for x in raw],"side":[x["side"].lower() for x in raw],"exchange":"bybit","trade_id":[str(x.get("execId",x.get("i",""))) for x in raw]})
     return ohlc, trades, frames
 
 
 def _binance_trades():
-    response = requests.get("https://data-api.binance.vision/api/v3/aggTrades", params={"symbol":"BTCUSDT","limit":1000}, timeout=10)
-    response.raise_for_status(); raw = response.json()
-    return pd.DataFrame({"time":pd.to_datetime([x["T"] for x in raw],unit="ms",utc=True),"price":[float(x["p"]) for x in raw],"qty":[float(x["q"]) for x in raw],"side":["sell" if x["m"] else "buy" for x in raw],"exchange":"binance","trade_id":[f"spot:{x['a']}" for x in raw]})
+    """Sparse REST backfill only. Prefer WebSocket collectors for live flow."""
+    if MARKET_TYPE == "linear":
+        url = "https://fapi.binance.com/fapi/v1/aggTrades"
+        mode = "linear"
+    else:
+        url = "https://data-api.binance.vision/api/v3/aggTrades"
+        mode = "spot"
+    response = _http_get(url, params={"symbol":"BTCUSDT","limit":BINANCE_TRADE_LIMIT}, timeout=10)
+    raw = response.json()
+    return pd.DataFrame({
+        "time":pd.to_datetime([x["T"] for x in raw],unit="ms",utc=True),
+        "price":[float(x["p"]) for x in raw],
+        "qty":[float(x["q"]) for x in raw],
+        "side":["sell" if x["m"] else "buy" for x in raw],
+        "exchange":"binance",
+        "trade_id":[f"{mode}:{x['a']}" for x in raw],
+    })
 
 
-def _binance_flow_bars(limit=180):
-    response=requests.get("https://data-api.binance.vision/api/v3/klines",params={"symbol":"BTCUSDT","interval":"1m","limit":limit},timeout=10)
-    response.raise_for_status(); raw=pd.DataFrame(response.json())
-    frame=pd.DataFrame({"close_time":pd.to_datetime(pd.to_numeric(raw[6]),unit="ms",utc=True),"open":pd.to_numeric(raw[1]),"high":pd.to_numeric(raw[2]),"low":pd.to_numeric(raw[3]),"close":pd.to_numeric(raw[4]),"volume":pd.to_numeric(raw[5]),"trades":pd.to_numeric(raw[8]),"taker_buy_volume":pd.to_numeric(raw[9])}).set_index("close_time")
+def _binance_flow_bars(limit=None):
+    limit = BINANCE_FLOW_LIMIT if limit is None else limit
+    if MARKET_TYPE == "linear":
+        url = "https://fapi.binance.com/fapi/v1/klines"
+    else:
+        url = "https://data-api.binance.vision/api/v3/klines"
+    response = _http_get(url, params={"symbol":"BTCUSDT","interval":"1m","limit":limit}, timeout=10)
+    raw = pd.DataFrame(response.json())
+    frame = pd.DataFrame({
+        "close_time":pd.to_datetime(pd.to_numeric(raw[6]),unit="ms",utc=True),
+        "open":pd.to_numeric(raw[1]),
+        "high":pd.to_numeric(raw[2]),
+        "low":pd.to_numeric(raw[3]),
+        "close":pd.to_numeric(raw[4]),
+        "volume":pd.to_numeric(raw[5]),
+        "trades":pd.to_numeric(raw[8]),
+        "taker_buy_volume":pd.to_numeric(raw[9]),
+    }).set_index("close_time")
     return frame.loc[frame.index<=pd.Timestamp.now(tz="UTC")]
 
 
@@ -133,30 +176,33 @@ def _live_loop():
     binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
     flow_retry_at = pd.Timestamp(0, tz="UTC")
     flow_bars_cache = None
-    market_type = os.getenv("MARKET_TYPE", "spot").lower()
     while True:
         try:
             poll_started = pd.Timestamp.now(tz="UTC")
             with live_lock: live_state.update({"status":"polling","updated_at":poll_started.isoformat()})
             ohlc, recent, frames = _bybit_data(); sources = "bybit"; trade_store.append(recent)
-            if poll_started >= binance_rest_retry_at:
+            # Prefer WebSocket collectors. REST is disabled by default in linear/futures mode,
+            # and when enabled it runs infrequently with small limits to avoid IP bans.
+            if BINANCE_REST_ENABLED and poll_started >= binance_rest_retry_at:
                 try:
                     trade_store.append(_binance_trades())
-                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=1)
+                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=BINANCE_REST_MINUTES)
                 except Exception as exc:
-                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=10)
+                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=max(BINANCE_REST_MINUTES * 2, 30))
                     logger.warning("Binance REST trades unavailable; WebSocket collector remains active: %s", exc)
             now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(minutes=int(os.getenv("TRADE_LOOKBACK_MINUTES","90"))), now, limit=int(os.getenv("TRADE_QUERY_LIMIT","60000"))); flow_bars=None
             recent_trades=trades.loc[trades.time>=now-pd.Timedelta(minutes=2)] if "time" in trades else trades
             available_exchanges=set(recent_trades.exchange.astype(str)) if "exchange" in recent_trades else set()
             sources="+".join(exchange for exchange in ("bybit","binance") if exchange in available_exchanges) or sources
             if poll_started >= flow_retry_at:
-                if market_type == "spot":
+                # Only use REST flow bars when REST is explicitly enabled. Linear mode should
+                # derive footprint features from the WebSocket trade buffer instead.
+                if BINANCE_REST_ENABLED:
                     try:
                         flow_bars_cache=_binance_flow_bars()
-                        flow_retry_at = poll_started + pd.Timedelta(minutes=1)
+                        flow_retry_at = poll_started + pd.Timedelta(minutes=BINANCE_REST_MINUTES)
                     except Exception as exc:
-                        flow_retry_at = poll_started + pd.Timedelta(minutes=10)
+                        flow_retry_at = poll_started + pd.Timedelta(minutes=max(BINANCE_REST_MINUTES * 2, 30))
                         logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
                 else:
                     flow_bars_cache = None
@@ -172,7 +218,16 @@ def _live_loop():
                 last_sent = now
             previous_key = key
             push_state_store.write({"key":key,"sent_at":last_sent.isoformat() if last_sent is not None else None})
-            next_state = {"status":"live","source":sources,"prediction":dict(result.__dict__),"paper":paper_status,"binance_feed_mode":trade_store.collector_status().get("binance",{}).get("mode","unknown"),"updated_at":now.isoformat(),"error":None}
+            next_state = {
+                "status":"live",
+                "source":sources,
+                "market_type":MARKET_TYPE,
+                "prediction":dict(result.__dict__),
+                "paper":paper_status,
+                "binance_feed_mode":trade_store.collector_status().get("binance",{}).get("mode","unknown"),
+                "updated_at":now.isoformat(),
+                "error":None,
+            }
             live_state_store.write(next_state)
             with live_lock: live_state = next_state
         except Exception as exc:
@@ -203,7 +258,18 @@ def index(): return render_template("dashboard.html")
 def health():
     start_live_loop()
     with live_lock: state = dict(live_state)
-    return jsonify({"status":"ok","service":"btc-structure-flow-predictor","paper_only":True,"market_feed":state["status"],"live_loop_owner":live_thread_started,"live_thread_alive":bool(live_thread and live_thread.is_alive()),"trade_store":trade_store.stats(),"collectors":trade_store.collector_status()})
+    return jsonify({
+        "status":"ok",
+        "service":"btc-structure-flow-predictor",
+        "paper_only":True,
+        "market_type":MARKET_TYPE,
+        "binance_rest_enabled":BINANCE_REST_ENABLED,
+        "market_feed":state["status"],
+        "live_loop_owner":live_thread_started,
+        "live_thread_alive":bool(live_thread and live_thread.is_alive()),
+        "trade_store":trade_store.stats(),
+        "collectors":trade_store.collector_status(),
+    })
 
 
 @app.get("/api/live")

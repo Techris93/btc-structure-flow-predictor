@@ -63,3 +63,53 @@ Execution is decision-after-close and next-open with explicit fees/slippage. Sam
 `BTC_DATA_DIR` must point to persistent storage in production. VAPID private keys, subscriptions, notification deduplication state, and live state are persisted there. An OS file lock permits only one live polling loop. Push tests require a subscription-scoped HMAC token; `/predict` requires `ADMIN_API_TOKEN`; the web backtest POST is disabled.
 
 Run verification with `pytest -q`.
+
+## Local Mac (Binance + Bybit futures)
+
+Render cannot reliably reach Binance Futures (`fapi` / `fstream`), so production stays on `MARKET_TYPE=spot`.
+On your Mac, run futures mode so both exchanges use linear/futures data.
+
+```bash
+cd /path/to/btc-structure-flow-predictor
+cp .env.example .env   # already created if missing
+./scripts/run_local.sh
+```
+
+Then open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+
+Local defaults:
+
+- `MARKET_TYPE=linear` — Binance Futures + Bybit linear
+- `BINANCE_REST_ENABLED=0` — live Binance trades come from WebSocket only
+- Bybit REST is used for OHLCV structure candles only
+- optional Binance REST backfill is rare and small if you enable it:
+  - every `BINANCE_REST_MINUTES` (default 15)
+  - at most `BINANCE_TRADE_LIMIT` trades (default 100)
+  - at most `BINANCE_FLOW_LIMIT` 1m bars (default 60)
+
+Check health:
+
+```bash
+curl -s http://127.0.0.1:8000/health | python3 -m json.tool
+```
+
+You want:
+
+- `market_type: "linear"`
+- collectors.binance.mode: `"linear"`
+- collectors.bybit.mode: `"linear"`
+
+Keep Render on spot. Do not point a cloud IP at Binance Futures repeatedly.
+
+### Binance Futures rate-limit policy (local)
+
+Local futures mode is deliberately gentle:
+
+- one long-lived Binance Futures WebSocket (`fstream...@aggTrade`)
+- no reconnect storm: quiet periods do not force reconnects
+- exponential reconnect backoff (`15s` → max `120s`)
+- `BINANCE_REST_ENABLED=0` by default, so `fapi` is not polled
+- optional REST backfill, if enabled, is rare and small (`15 min`, `100` trades / `60` bars)
+
+Do not enable frequent Binance REST polling from a cloud IP.
+

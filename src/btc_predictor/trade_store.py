@@ -173,7 +173,10 @@ async def _binance(store):
     import websockets
     import os
 
-    market_type = os.getenv("MARKET_TYPE", "spot").lower()
+    # Binance futures WS limits: 300 connection attempts / 5 min / IP, and
+    # 5 inbound messages/sec/connection. Keep one long-lived stream and avoid
+    # reconnect storms (no REST spam; REST is separate and off by default).
+    market_type = os.getenv("MARKET_TYPE", "linear").lower()
     if market_type == "linear":
         url = "wss://fstream.binance.com/ws/btcusdt@aggTrade"
         mode = "linear"
@@ -181,16 +184,29 @@ async def _binance(store):
         url = "wss://data-stream.binance.vision/ws/btcusdt@aggTrade"
         mode = "spot"
     buffer = _BufferedAppender(store, flush_every=40, flush_seconds=1.0)
+    base_delay = max(5, int(os.getenv("BINANCE_WS_RECONNECT_SECONDS", "15")))
+    max_delay = max(base_delay, int(os.getenv("BINANCE_WS_RECONNECT_MAX_SECONDS", "120")))
+    delay = base_delay
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
                 store.set_collector_status("binance", connected=True, mode=mode, error=None)
+                delay = base_delay  # reset after a healthy connect
                 while True:
                     try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=15)
+                        message = await asyncio.wait_for(ws.recv(), timeout=30)
                     except asyncio.TimeoutError:
+                        # Quiet periods should not force a reconnect (that burns the
+                        # 300-connect / 5-min budget). Keep the socket and flush.
                         buffer.flush()
-                        raise
+                        store.set_collector_status(
+                            "binance",
+                            connected=True,
+                            mode=mode,
+                            error=None,
+                            latest=store.collector_status().get("binance", {}).get("latest"),
+                        )
+                        continue
                     x = json.loads(message)
                     ts = pd.to_datetime(x["T"], unit="ms", utc=True)
                     buffer.add(
@@ -212,21 +228,22 @@ async def _binance(store):
                     )
         except Exception as exc:
             buffer.flush()
-            logger.warning("Binance %s WebSocket failed; reconnecting: %s", mode, exc)
+            logger.warning("Binance %s WebSocket failed; reconnecting in %ss: %s", mode, delay, exc)
             store.set_collector_status(
                 "binance",
                 connected=False,
                 mode=mode,
                 error=f"{type(exc).__name__}: {str(exc)[:200]}",
             )
-            await asyncio.sleep(2)
+            await asyncio.sleep(delay)
+            delay = min(max_delay, max(base_delay, delay * 2))
 
 
 async def _bybit(store):
     import websockets
     import os
 
-    market_type = os.getenv("MARKET_TYPE", "spot").lower()
+    market_type = os.getenv("MARKET_TYPE", "linear").lower()
     url = (
         "wss://stream.bybit.com/v5/public/spot"
         if market_type == "spot"
@@ -275,7 +292,7 @@ async def _bybit(store):
                 mode=mode,
                 error=f"{type(exc).__name__}: {str(exc)[:200]}",
             )
-            await asyncio.sleep(2)
+            await asyncio.sleep(max(2, int(os.getenv("BYBIT_WS_RECONNECT_SECONDS", "5"))))
 
 
 def start_collectors(store):
