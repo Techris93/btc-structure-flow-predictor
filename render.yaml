@@ -42,7 +42,7 @@ services:
       - key: BINANCE_REST_ON_STALE
         value: "1"
       - key: BINANCE_STALE_REST_MINUTES
-        value: "3"
+        value: "1"
       - key: COLLECTOR_STALE_SECONDS
         value: "90"
       - key: BINANCE_REST_MINUTES

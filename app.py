@@ -71,8 +71,10 @@ BINANCE_USER_AGENT = os.getenv("BINANCE_USER_AGENT", "btc-structure-flow-predict
 COLLECTOR_STALE_SECONDS = max(30, int(os.getenv("COLLECTOR_STALE_SECONDS", "90")))
 # Rare REST backfill only when the WebSocket trade stream is stale. Still off by default
 # for normal operation; set BINANCE_REST_ON_STALE=1 to enable emergency recovery.
+# With WS silently dropped on some hosts, a ~1 min cadence keeps the feed fresh
+# at roughly 22 weight/min, ~1% of the 2,400 weight/min fapi budget.
 BINANCE_REST_ON_STALE = os.getenv("BINANCE_REST_ON_STALE", "1").lower() in ("1", "true", "yes", "on")
-BINANCE_STALE_REST_MINUTES = max(5, int(os.getenv("BINANCE_STALE_REST_MINUTES", "10")))
+BINANCE_STALE_REST_MINUTES = max(1, int(os.getenv("BINANCE_STALE_REST_MINUTES", "3")))
 
 
 def _http_get(url, params=None, timeout=10):
@@ -192,13 +194,21 @@ def _live_loop():
                 if binance_latest.tzinfo is None:
                     binance_latest = binance_latest.tz_localize("UTC")
                 binance_lag = float((poll_started - binance_latest).total_seconds())
+            collectors = trade_store.collector_status(poll_started, COLLECTOR_STALE_SECONDS)
+            binance_ws_last = (collectors.get("binance", {}) or {}).get("last_message_at")
+            binance_ws_fresh = False
+            if binance_ws_last:
+                binance_ws_ts = pd.Timestamp(binance_ws_last)
+                if binance_ws_ts.tzinfo is None:
+                    binance_ws_ts = binance_ws_ts.tz_localize("UTC")
+                binance_ws_fresh = (poll_started - binance_ws_ts).total_seconds() <= COLLECTOR_STALE_SECONDS
             binance_stale = binance_lag is None or binance_lag > COLLECTOR_STALE_SECONDS
             # Prefer WebSocket collectors. REST is rare:
             # - always-on only when BINANCE_REST_ENABLED=1
             # - or emergency stale recovery when BINANCE_REST_ON_STALE=1 and WS is stale
             rest_due = poll_started >= binance_rest_retry_at
             rest_allowed = BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_stale)
-            binance_data_path = "websocket" if not binance_stale else ("rest_backfill" if BINANCE_REST_ON_STALE else "stale")
+            binance_data_path = "websocket" if binance_ws_fresh else ("rest_backfill" if BINANCE_REST_ON_STALE else "stale")
             if rest_allowed and rest_due:
                 try:
                     inserted = trade_store.append(_binance_trades())
@@ -213,9 +223,11 @@ def _live_loop():
                     except Exception as exc:
                         logger.warning("Binance REST flow baseline unavailable: %s", exc)
                 except Exception as exc:
-                    cooldown_min = max((BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else BINANCE_STALE_REST_MINUTES) * 2, 30)
+                    base_min = BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else BINANCE_STALE_REST_MINUTES
+                    # Hard back off on explicit rate-limit/ban signals; short retry otherwise.
+                    cooldown_min = 30 if ("418" in str(exc) or "429" in str(exc)) else max(base_min * 4, 5)
                     binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
-                    logger.warning("Binance REST trades unavailable; WebSocket collector remains active: %s", exc)
+                    logger.warning("Binance REST trades unavailable (cooldown %sm): %s", cooldown_min, exc)
             now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(minutes=int(os.getenv("TRADE_LOOKBACK_MINUTES","90"))), now, limit=int(os.getenv("TRADE_QUERY_LIMIT","60000"))); flow_bars=None
             recent_trades=trades.loc[trades.time>=now-pd.Timedelta(minutes=2)] if "time" in trades else trades
             available_exchanges=set(recent_trades.exchange.astype(str)) if "exchange" in recent_trades else set()
