@@ -97,7 +97,7 @@ class Predictor:
             stop=min(sweep["extreme"]-.1*a,price-self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price]; target=min(options or [price+2*a]); rr=(target-price)/(price-stop)
         else:
             stop=max(sweep["extreme"]+.1*a,price+self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price]; target=max(options or [price-2*a]); rr=(price-target)/(stop-price)
-        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr)
-        if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias)
-        return self._output(now,bias,**base,probability_tp_before_sl=prob,position_size=equity*self.risk_fraction/abs(price-stop))
+        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
+        if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
+        return self._output(now,bias,**base,position_size=equity*self.risk_fraction/abs(price-stop))
