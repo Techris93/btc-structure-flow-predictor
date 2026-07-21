@@ -44,7 +44,7 @@ services:
       - key: BINANCE_STALE_REST_MINUTES
         value: "1"
       - key: COLLECTOR_STALE_SECONDS
-        value: "90"
+        value: "150"
       - key: BINANCE_REST_MINUTES
         value: "15"
       - key: BINANCE_TRADE_LIMIT
