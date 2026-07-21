@@ -206,8 +206,14 @@ def _live_loop():
             # Prefer WebSocket collectors. REST is rare:
             # - always-on only when BINANCE_REST_ENABLED=1
             # - or emergency stale recovery when BINANCE_REST_ON_STALE=1 and WS is stale
+            # Backfill whenever Binance data is older than one poll interval while the
+            # WS stream is dead, so lag never reaches the stale threshold. Each cycle
+            # costs ~22 weight (aggTrades 20 + klines 2) ~= 32 weight/min, ~1.3% of the
+            # 2,400/min fapi budget.
+            poll_seconds = max(20, int(os.getenv("LIVE_POLL_SECONDS", "45")))
+            binance_backfill_due = binance_lag is None or binance_lag > poll_seconds
             rest_due = poll_started >= binance_rest_retry_at
-            rest_allowed = BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_stale)
+            rest_allowed = BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_backfill_due and not binance_ws_fresh)
             binance_data_path = "websocket" if binance_ws_fresh else ("rest_backfill" if BINANCE_REST_ON_STALE else "stale")
             if rest_allowed and rest_due:
                 try:
