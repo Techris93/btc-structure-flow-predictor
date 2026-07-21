@@ -78,3 +78,49 @@ def test_collector_status_marks_stale_feeds(tmp_path):
     assert status["binance"]["fresh"] is False
     assert status["bybit"]["stale"] is False
     assert status["bybit"]["fresh"] is True
+
+
+def test_collector_liveness_uses_last_message_at_not_only_trades(tmp_path):
+    """Heartbeat streams (markPrice/kline) keep the feed fresh in quiet markets."""
+    store = TradeStore(tmp_path / "heartbeat.sqlite3")
+    now = pd.Timestamp("2025-01-01T00:10:00Z")
+    # Trade event-time is old, but a message arrived 2s ago.
+    store.set_collector_status(
+        "binance",
+        connected=True,
+        mode="linear",
+        latest="2025-01-01T00:05:00+00:00",
+        last_message_at="2025-01-01T00:09:58+00:00",
+    )
+    status = store.collector_status(now=now, stale_after_seconds=90)
+    assert status["binance"]["stale"] is False
+    assert status["binance"]["fresh"] is True
+    assert status["binance"]["lag_seconds"] <= 5
+
+
+def test_flow_kline_buffer_returns_rest_shaped_frame(tmp_path):
+    store = TradeStore(tmp_path / "klines.sqlite3")
+    base = pd.Timestamp("2025-01-01T00:00:00Z")
+    for i in range(3):
+        open_ms = int((base + pd.Timedelta(minutes=i)).timestamp() * 1000)
+        close_ms = int((base + pd.Timedelta(minutes=i + 1)).timestamp() * 1000)
+        candle = {
+            "open_time": open_ms,
+            "close_time": close_ms,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.5 + i,
+            "volume": 10.0 + i,
+            "trades": 5 + i,
+            "taker_buy_volume": 6.0 + i,
+        }
+        store.add_flow_kline("binance", candle, closed=i < 2)
+    closed = store.flow_bars_df("binance", limit=10)
+    assert len(closed) == 2  # current candle excluded by default
+    assert list(closed.columns) == ["open", "high", "low", "close", "volume", "trades", "taker_buy_volume"]
+    assert closed.index.name == "close_time" and closed.index.tz is not None
+    assert closed["taker_buy_volume"].iloc[-1] == 7.0
+    with_current = store.flow_bars_df("binance", limit=10, include_current=True)
+    assert len(with_current) == 3
+    assert with_current["taker_buy_volume"].iloc[-1] == 8.0

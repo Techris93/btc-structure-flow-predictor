@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import hashlib
 import json
 import logging
@@ -25,6 +26,9 @@ class TradeStore:
         self.lock = threading.RLock()
         self.max_rows = int(max_rows)
         self._collector_status = {}
+        # Recent 1m klines collected from the Binance WebSocket, so footprint
+        # baselines never need REST. Keyed by exchange.
+        self._flow_bars = {}
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=NORMAL")
@@ -156,7 +160,10 @@ class TradeStore:
         if stale_after_seconds is None:
             return out
         for name, values in out.items():
-            latest = values.get("latest")
+            # Liveness comes from the most recent message of ANY stream, not
+            # only trades: markPrice/kline heartbeats keep the feed "fresh"
+            # even in quiet markets. Event-time `latest` stays for data views.
+            latest = values.get("last_message_at") or values.get("latest")
             lag_seconds = None
             if latest:
                 latest_ts = pd.Timestamp(latest)
@@ -176,6 +183,44 @@ class TradeStore:
         stats = self.stats().get(exchange) or {}
         latest = stats.get("latest")
         return pd.Timestamp(latest) if latest else None
+
+    # --- 1m kline buffer (WebSocket-derived flow baseline) -------------------
+
+    def add_flow_kline(self, exchange: str, candle: dict, closed: bool):
+        """Store a 1m kline update from the WebSocket.
+
+        candle keys: open_time (ms), close_time (ms), open, high, low, close,
+        volume, trades, taker_buy_volume (all floats except ms ints).
+        When `closed` is True the candle is finalized into the recent deque.
+        """
+        exchange = str(exchange)
+        with self.lock:
+            slot = self._flow_bars.setdefault(exchange, {"current": None, "closed": deque(maxlen=240)})
+            if closed:
+                slot["closed"].append(candle)
+                slot["current"] = None
+            else:
+                slot["current"] = candle
+
+    def flow_bars_df(self, exchange: str = "binance", limit: int = 180, include_current: bool = False):
+        """Recent 1m klines in the same shape as the REST klines frame.
+
+        Index: close_time (UTC). Columns: open, high, low, close, volume,
+        trades, taker_buy_volume. Closed candles only by default.
+        """
+        with self.lock:
+            slot = self._flow_bars.get(exchange) or {"current": None, "closed": deque()}
+            candles = list(slot["closed"])
+            if include_current and slot["current"] is not None:
+                candles.append(slot["current"])
+        if not candles:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "trades", "taker_buy_volume"],
+                                index=pd.DatetimeIndex([], name="close_time", tz="UTC"))
+        frame = pd.DataFrame(candles)
+        frame.index = pd.to_datetime(pd.to_numeric(frame.pop("close_time")), unit="ms", utc=True)
+        frame.index.name = "close_time"
+        frame = frame[["open", "high", "low", "close", "volume", "trades", "taker_buy_volume"]].astype(float)
+        return frame.sort_index().tail(limit)
 
 
 class _BufferedAppender:
@@ -209,10 +254,20 @@ async def _binance(store):
     # reconnect storms (no REST spam; REST is separate and off by default).
     market_type = os.getenv("MARKET_TYPE", "linear").lower()
     if market_type == "linear":
-        url = "wss://fstream.binance.com/ws/btcusdt@aggTrade"
+        # One connection, three streams (limit: 1024 streams / connection):
+        # - aggTrade: all trades, for order-flow deltas
+        # - kline_1m: 1m OHLCV + taker-buy volume, for footprint baselines (no REST needed)
+        # - markPrice@1s: heartbeat so liveness never depends on trade frequency
+        url = (
+            "wss://fstream.binance.com/stream?streams="
+            "btcusdt@aggTrade/btcusdt@kline_1m/btcusdt@markPrice@1s"
+        )
         mode = "linear"
     else:
-        url = "wss://data-stream.binance.vision/ws/btcusdt@aggTrade"
+        url = (
+            "wss://data-stream.binance.vision/stream?streams="
+            "btcusdt@aggTrade/btcusdt@kline_1m"
+        )
         mode = "spot"
     buffer = _BufferedAppender(store, flush_every=40, flush_seconds=1.0)
     base_delay = max(5, int(os.getenv("BINANCE_WS_RECONNECT_SECONDS", "15")))
@@ -230,33 +285,70 @@ async def _binance(store):
                         # Quiet periods should not force a reconnect (that burns the
                         # 300-connect / 5-min budget). Keep the socket and flush.
                         buffer.flush()
-                        store.set_collector_status(
-                            "binance",
-                            connected=True,
-                            mode=mode,
-                            error=None,
-                            latest=store.collector_status().get("binance", {}).get("latest"),
-                        )
                         continue
+                    received_at = pd.Timestamp.now(tz="UTC")
                     x = json.loads(message)
-                    ts = pd.to_datetime(x["T"], unit="ms", utc=True)
-                    buffer.add(
-                        {
-                            "time": ts,
-                            "price": float(x["p"]),
-                            "qty": float(x["q"]),
-                            "side": "sell" if x["m"] else "buy",
-                            "exchange": "binance",
-                            "trade_id": f"{mode}:{x['a']}",
-                        }
-                    )
+                    envelope = x.get("data", x) if isinstance(x, dict) else {}
+                    event = envelope.get("e")
                     store.set_collector_status(
                         "binance",
                         connected=True,
                         mode=mode,
                         error=None,
-                        latest=ts.isoformat(),
+                        last_message_at=received_at.isoformat(),
                     )
+                    if event == "aggTrade":
+                        ts = pd.to_datetime(envelope["T"], unit="ms", utc=True)
+                        buffer.add(
+                            {
+                                "time": ts,
+                                "price": float(envelope["p"]),
+                                "qty": float(envelope["q"]),
+                                "side": "sell" if envelope["m"] else "buy",
+                                "exchange": "binance",
+                                "trade_id": f"{mode}:{envelope['a']}",
+                            }
+                        )
+                        store.set_collector_status(
+                            "binance",
+                            connected=True,
+                            mode=mode,
+                            error=None,
+                            latest=ts.isoformat(),
+                        )
+                    elif event == "kline":
+                        k = envelope["k"]
+                        store.add_flow_kline(
+                            "binance",
+                            {
+                                "open_time": int(k["t"]),
+                                "close_time": int(k["T"]),
+                                "open": float(k["o"]),
+                                "high": float(k["h"]),
+                                "low": float(k["l"]),
+                                "close": float(k["c"]),
+                                "volume": float(k["v"]),
+                                "trades": int(k["n"]),
+                                "taker_buy_volume": float(k["V"]),
+                            },
+                            closed=bool(k.get("x")),
+                        )
+                        store.set_collector_status(
+                            "binance",
+                            connected=True,
+                            mode=mode,
+                            error=None,
+                            latest_kline_at=received_at.isoformat(),
+                        )
+                    elif event == "markPriceUpdate":
+                        store.set_collector_status(
+                            "binance",
+                            connected=True,
+                            mode=mode,
+                            error=None,
+                            latest_mark_price=float(envelope["p"]),
+                            latest_mark_price_at=received_at.isoformat(),
+                        )
         except Exception as exc:
             buffer.flush()
             logger.warning("Binance %s WebSocket failed; reconnecting in %ss: %s", mode, delay, exc)
@@ -288,7 +380,15 @@ async def _bybit(store):
                 store.set_collector_status("bybit", connected=True, mode=mode, error=None)
                 await ws.send(json.dumps({"op": "subscribe", "args": ["publicTrade.BTCUSDT"]}))
                 async for message in ws:
+                    received_at = pd.Timestamp.now(tz="UTC")
                     payload = json.loads(message)
+                    store.set_collector_status(
+                        "bybit",
+                        connected=True,
+                        mode=mode,
+                        error=None,
+                        last_message_at=received_at.isoformat(),
+                    )
                     data = payload.get("data", [])
                     if not data:
                         continue

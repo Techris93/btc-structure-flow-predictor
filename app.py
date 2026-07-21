@@ -220,20 +220,27 @@ def _live_loop():
                 if store_latest and (not values.get("latest") or str(store_latest) > str(values.get("latest"))):
                     trade_store.set_collector_status(exchange, latest=store_latest)
             collectors = trade_store.collector_status(poll_started, COLLECTOR_STALE_SECONDS)
-            if poll_started >= flow_retry_at:
-                # Only use REST flow bars when REST is explicitly enabled. Linear mode should
-                # derive footprint features from the WebSocket trade buffer instead.
-                if BINANCE_REST_ENABLED:
-                    try:
-                        flow_bars_cache=_binance_flow_bars()
-                        flow_retry_at = poll_started + pd.Timedelta(minutes=BINANCE_REST_MINUTES)
-                    except Exception as exc:
-                        flow_retry_at = poll_started + pd.Timedelta(minutes=max(BINANCE_REST_MINUTES * 2, 30))
-                        logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
+            # Flow baseline: prefer WebSocket-derived Binance 1m klines (aggTrade
+            # deltas + kline taker-buy volume arrive on the same connection).
+            # REST klines remain an explicit fallback only.
+            ws_flow = trade_store.flow_bars_df("binance", limit=180)
+            if len(ws_flow) >= 2 and ws_flow.index[-1] >= now - pd.Timedelta(minutes=3):
+                flow_bars = ws_flow.loc[ws_flow.index <= now]
+                flow_source = "websocket"
+            elif BINANCE_REST_ENABLED and poll_started >= flow_retry_at:
+                try:
+                    flow_bars_cache = _binance_flow_bars()
+                    flow_retry_at = poll_started + pd.Timedelta(minutes=BINANCE_REST_MINUTES)
+                except Exception as exc:
+                    flow_retry_at = poll_started + pd.Timedelta(minutes=max(BINANCE_REST_MINUTES * 2, 30))
+                    logger.warning("Binance flow baseline unavailable; using stored trades: %s", exc)
+                if flow_bars_cache is not None and not flow_bars_cache.empty and flow_bars_cache.index[-1] >= now - pd.Timedelta(minutes=2):
+                    flow_bars = flow_bars_cache.loc[flow_bars_cache.index <= now]
+                    flow_source = "rest"
                 else:
-                    flow_bars_cache = None
-            if flow_bars_cache is not None and not flow_bars_cache.empty and flow_bars_cache.index[-1]>=now-pd.Timedelta(minutes=2):
-                flow_bars=flow_bars_cache.loc[flow_bars_cache.index<=now]
+                    flow_source = None
+            else:
+                flow_source = None
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
             paper_status = paper_ledger.update(result, ohlc)
             trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
@@ -253,6 +260,7 @@ def _live_loop():
                 "prediction": dict(result.__dict__),
                 "paper": paper_status,
                 "binance_feed_mode": collectors.get("binance", {}).get("mode", "unknown"),
+                "flow_source": flow_source,
                 "collectors": collectors,
                 "stale_exchanges": stale_exchanges,
                 "updated_at": now.isoformat(),
