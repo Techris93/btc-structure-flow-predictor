@@ -65,7 +65,7 @@ def cross_exchange_agreement(trades: pd.DataFrame, start, end, direction: str, m
     return score, actual
 
 
-def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_time, window=100, min_score: float = 0.50):
+def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_time, window=100, min_score: float = 0.45):
     features=flow_features_from_bars(flow_bars,window) if flow_bars is not None and not flow_bars.empty else orderflow_features(trades,window=window)
     features=features.loc[features.index<=pd.Timestamp(decision_time)]
     if len(features)<20: return False,{"reason":"flow_warmup","bars":len(features),"score":0.0}
@@ -92,10 +92,10 @@ def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_ti
             imbalance=min(1.0, max(0.0, (1.0/ratio-1.0)/0.5))
     # Weighted score. Weights sum to 1.0.
     weights = {
-        "extreme_delta": 0.25,
-        "delta_reversal": 0.25,
+        "extreme_delta": 0.30,
+        "delta_reversal": 0.30,
         "price_response": 0.15,
-        "cross_exchange": 0.20,
+        "cross_exchange": 0.10,
         "footprint_imbalance": 0.15,
     }
     score = (
