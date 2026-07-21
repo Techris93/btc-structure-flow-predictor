@@ -66,8 +66,9 @@ Run verification with `pytest -q`.
 
 ## Local Mac (Binance + Bybit futures)
 
-Render cannot reliably reach Binance Futures (`fapi` / `fstream`), so production stays on `MARKET_TYPE=spot`.
-On your Mac, run futures mode so both exchanges use linear/futures data.
+Both local and Render now default to `MARKET_TYPE=linear` so Binance Futures and Bybit linear stay aligned.
+Binance REST remains off by default; live Binance trades come from one long-lived futures WebSocket.
+If a temporary futures IP ban reappears on Render, the service stays healthy in degraded mode and retries with backoff.
 
 ```bash
 cd /path/to/btc-structure-flow-predictor
@@ -99,7 +100,12 @@ You want:
 - collectors.binance.mode: `"linear"`
 - collectors.bybit.mode: `"linear"`
 
-Keep Render on spot. Do not point a cloud IP at Binance Futures repeatedly.
+Render uses the same careful futures posture as local:
+- `MARKET_TYPE=linear`
+- `BINANCE_REST_ENABLED=0`
+- one long-lived Binance futures WebSocket with reconnect backoff
+
+If futures endpoints are temporarily blocked, check `/health` for collector errors and wait for the ban to clear rather than enabling REST spam.
 
 ### Binance Futures rate-limit policy (local)
 

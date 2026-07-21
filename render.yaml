@@ -36,9 +36,21 @@ services:
       - key: MAX_PROJECTED_ZONES
         value: "200"
       - key: MARKET_TYPE
-        value: "spot"
+        value: "linear"
       - key: BINANCE_REST_ENABLED
         value: "0"
+      - key: BINANCE_REST_MINUTES
+        value: "15"
+      - key: BINANCE_TRADE_LIMIT
+        value: "100"
+      - key: BINANCE_FLOW_LIMIT
+        value: "60"
+      - key: BINANCE_WS_RECONNECT_SECONDS
+        value: "15"
+      - key: BINANCE_WS_RECONNECT_MAX_SECONDS
+        value: "120"
+      - key: BYBIT_WS_RECONNECT_SECONDS
+        value: "5"
       - key: MAX_SWING_EQUAL_ZONES
         value: "80"
       - key: PAPER_LEDGER_PATH
