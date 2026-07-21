@@ -183,6 +183,8 @@ def _live_loop():
     binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
     flow_retry_at = pd.Timestamp(0, tz="UTC")
     flow_bars_cache = None
+    binance_rest_last_ok_at = None
+    binance_rest_last_error = None
     while True:
         try:
             poll_started = pd.Timestamp.now(tz="UTC")
@@ -218,7 +220,12 @@ def _live_loop():
             if rest_allowed and rest_due:
                 try:
                     inserted = trade_store.append(_binance_trades())
-                    cooldown_min = BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else BINANCE_STALE_REST_MINUTES
+                    binance_rest_last_ok_at = poll_started
+                    binance_rest_last_error = None
+                    # Success path: the always-on cadence applies only to explicit
+                    # BINANCE_REST_ENABLED. Stale recovery runs every poll while data
+                    # is old (~32 weight/min); error cooldowns below are the guard.
+                    cooldown_min = BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else 0
                     binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
                     if inserted:
                         logger.info("Binance REST backfill inserted %s trades (stale=%s)", inserted, binance_stale)
@@ -233,6 +240,7 @@ def _live_loop():
                     # Hard back off on explicit rate-limit/ban signals; short retry otherwise.
                     cooldown_min = 30 if ("418" in str(exc) or "429" in str(exc)) else max(base_min * 4, 5)
                     binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
+                    binance_rest_last_error = f"{type(exc).__name__}: {str(exc)[:160]} (cooldown {cooldown_min}m)"
                     logger.warning("Binance REST trades unavailable (cooldown %sm): %s", cooldown_min, exc)
             now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(minutes=int(os.getenv("TRADE_LOOKBACK_MINUTES","90"))), now, limit=int(os.getenv("TRADE_QUERY_LIMIT","60000"))); flow_bars=None
             recent_trades=trades.loc[trades.time>=now-pd.Timedelta(minutes=2)] if "time" in trades else trades
@@ -281,6 +289,8 @@ def _live_loop():
                 "binance_feed_mode": collectors.get("binance", {}).get("mode", "unknown"),
                 "flow_source": flow_source,
                 "binance_data_path": binance_data_path,
+                "binance_rest_last_ok_at": binance_rest_last_ok_at.isoformat() if binance_rest_last_ok_at else None,
+                "binance_rest_last_error": binance_rest_last_error,
                 "collectors": collectors,
                 "stale_exchanges": stale_exchanges,
                 "updated_at": now.isoformat(),
