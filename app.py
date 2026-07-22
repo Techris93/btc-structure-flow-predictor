@@ -317,21 +317,49 @@ def _live_loop():
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
             paper_status = paper_ledger.update(result, ohlc)
             trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
-            key = "|".join(str(getattr(result,k,None)) for k in ("bias","regime_4h","regime_1h","setup_type","zone","sweep_status","orderflow_confirmation","orderflow_reason","entry","stop","target"))
+            key = "|".join(
+                str(getattr(result, k, None))
+                for k in (
+                    "bias",
+                    "regime_4h",
+                    "regime_1h",
+                    "setup_15m",
+                    "setup_type",
+                    "zone",
+                    "sweep_status",
+                    "orderflow_confirmation",
+                    "orderflow_reason",
+                    "no_trade_reason",
+                    "entry",
+                    "stop",
+                    "target",
+                )
+            )
             now = pd.Timestamp.now(tz="UTC"); cooldown = pd.Timedelta(seconds=int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
-            if previous_key is not None and key != previous_key and (last_sent is None or now-last_sent >= cooldown):
+            # previous_key is the last successfully handled notification state.
+            # Failed deliveries keep the old key so the next poll can retry.
+            # Cooldown-blocked changes also keep the old key so the later state
+            # is still eligible once the cooldown expires.
+            if previous_key is None:
+                previous_key = key
+            elif key != previous_key and (last_sent is None or now - last_sent >= cooldown):
                 event_id = hashlib.sha256(key.encode()).hexdigest()[:16]
                 detail = str(result.setup_type or result.no_trade_reason or result.sweep_status or "State changed")
                 detail = detail.replace("_", " ").strip().capitalize()
-                _send_push({
+                sent, failed = _send_push({
                     "title":"BTC Predictor update",
                     "body":f"{str(result.bias).capitalize()} · {detail}",
                     "url":"/",
                     "event_id":event_id,
                 })
-                last_sent = now
-            previous_key = key
-            push_state_store.write({"key":key,"sent_at":last_sent.isoformat() if last_sent is not None else None})
+                if sent > 0 or failed == 0:
+                    previous_key = key
+                    if sent > 0:
+                        last_sent = now
+            push_state_store.write({
+                "key": previous_key,
+                "sent_at": last_sent.isoformat() if last_sent is not None else None,
+            })
             stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
             feed_status = "degraded" if stale_exchanges else "live"
             next_state = {
@@ -457,7 +485,16 @@ def api_live():
     if not live_thread_started: state = live_state_store.read(state)
     if state.get("prediction"):
         state["prediction"] = dict(state["prediction"]); state["prediction"]["timestamp"] = str(state["prediction"]["timestamp"])
-    return jsonify({"paper_only":True,**state})
+    push_delivery = push_delivery_store.read({})
+    return jsonify({
+        "paper_only": True,
+        **state,
+        "push": {
+            "supported": webpush is not None,
+            "subscriptions": len(push_subscriptions),
+            "last_delivery": push_delivery,
+        },
+    })
 
 
 @app.get("/api/backtest/one-year")

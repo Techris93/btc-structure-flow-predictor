@@ -477,6 +477,7 @@
               <h2>Feed</h2>
               <div class="row"><span>Market feed</span><span id="feed">—</span></div>
               <div class="row"><span>Binance feed</span><span id="binancefeed">—</span></div>
+              <div class="row"><span>Last push</span><span id="lastpush">—</span></div>
             </section>
 
             <section class="section">
@@ -742,6 +743,22 @@
         const feed = humanize(feedStatus) + (s.source ? " · " + sourceLabel(s.source) : "");
         setText("feed", feed);
         setText("binancefeed", humanize(s.binance_feed_mode));
+        const push = s.push || {};
+        const lastDelivery = push.last_delivery || {};
+        if (lastDelivery.attempted_at) {
+          const deliveryLabel =
+            (lastDelivery.delivery_type === "test" ? "Test" : "Auto") +
+            " · " +
+            fmtDate(lastDelivery.attempted_at) +
+            (lastDelivery.sent > 0
+              ? " · delivered"
+              : lastDelivery.failed > 0
+                ? " · failed"
+                : " · no targets");
+          setText("lastpush", deliveryLabel, "mono tone-muted");
+        } else {
+          setText("lastpush", "No delivery yet");
+        }
 
         setText("paperequity", fmtMoney(paper.equity), "mono");
         setText("paperpnl", fmtMoney(paper.net_pnl), "mono");
@@ -778,9 +795,23 @@
           return;
         }
         try {
+          const c = await (await fetch("/push/config")).json();
           const reg = await navigator.serviceWorker.register("/sw.js");
           await reg.update();
-          const sub = reg ? await reg.pushManager.getSubscription() : null;
+          let sub = reg ? await reg.pushManager.getSubscription() : null;
+          if (sub && !subscriptionUsesKey(sub, c.vapid_public_key)) {
+            await sub.unsubscribe();
+            sub = null;
+          }
+          // Keep the durable server copy in sync whenever the browser already
+          // has an active subscription. This recovers after deploys/toggles.
+          if (sub) {
+            await fetch("/push/subscribe", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(sub),
+            });
+          }
           b.textContent = sub ? "Pause notifications" : "Enable push notifications";
           b.title = sub
             ? "Click to pause push notifications"

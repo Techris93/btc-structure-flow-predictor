@@ -60,6 +60,8 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "async function syncPushButton()" in dashboard
     assert 'await navigator.serviceWorker.register("/sw.js")' in dashboard
     assert "await reg.update()" in dashboard
+    assert 'fetch("/push/subscribe"' in dashboard
+    assert 'id="lastpush"' in dashboard
     assert 'b.textContent = sub ? "Pause notifications" : "Enable push notifications"' in dashboard
     assert "async function togglePush()" in dashboard
     assert 'fetch("/push/unsubscribe"' in dashboard
