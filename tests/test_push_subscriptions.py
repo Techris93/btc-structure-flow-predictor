@@ -1,5 +1,5 @@
 import app as web_app
-from app import _upsert_subscription
+from app import _remove_subscription, _upsert_subscription
 from pathlib import Path
 
 
@@ -22,6 +22,19 @@ def test_new_push_endpoint_is_appended():
 
     assert _upsert_subscription(subscriptions, subscription) is True
     assert subscriptions == [subscription]
+
+
+def test_remove_subscription_deletes_matching_endpoint_only():
+    subscriptions = [
+        {"endpoint": "https://push.example/keep", "keys": {"auth": "a", "p256dh": "p"}},
+        {"endpoint": "https://push.example/drop", "keys": {"auth": "b", "p256dh": "q"}},
+    ]
+
+    assert _remove_subscription(subscriptions, "https://push.example/drop") == 1
+    assert subscriptions == [
+        {"endpoint": "https://push.example/keep", "keys": {"auth": "a", "p256dh": "p"}}
+    ]
+    assert _remove_subscription(subscriptions, "https://push.example/missing") == 0
 
 
 def test_webpush_receives_persistent_pem_file_path(monkeypatch):
@@ -47,8 +60,31 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "async function syncPushButton()" in dashboard
     assert 'await navigator.serviceWorker.register("/sw.js")' in dashboard
     assert "await reg.update()" in dashboard
-    assert 'b.textContent = sub ? "Notifications enabled"' in dashboard
+    assert 'b.textContent = sub ? "Pause notifications" : "Enable push notifications"' in dashboard
+    assert "async function togglePush()" in dashboard
+    assert 'fetch("/push/unsubscribe"' in dashboard
     assert "syncPushButton();" in dashboard
+
+
+def test_push_unsubscribe_endpoint_removes_subscription(monkeypatch):
+    subscription = {
+        "endpoint": "https://push.example/toggle",
+        "keys": {"auth": "a", "p256dh": "p"},
+    }
+    monkeypatch.setattr(web_app, "push_subscriptions", [subscription])
+    client = web_app.app.test_client()
+
+    registered = client.post("/push/subscribe", json=subscription).get_json()
+    assert registered["ok"] is True
+
+    paused = client.post(
+        "/push/unsubscribe",
+        json={"endpoint": subscription["endpoint"], "test_token": registered["test_token"]},
+    ).get_json()
+
+    assert paused["ok"] is True
+    assert paused["removed"] == 1
+    assert web_app.push_subscriptions == []
 
 
 def test_dashboard_does_not_create_foreground_only_notifications():

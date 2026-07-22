@@ -769,36 +769,72 @@
         const b = $("notify");
         if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
           b.textContent = "Push unsupported";
+          b.title = "This browser cannot receive Web Push notifications";
           return;
         }
         if (!("Notification" in window) || Notification.permission !== "granted") {
           b.textContent = "Enable push notifications";
+          b.title = "Click to enable push notifications";
           return;
         }
         try {
           const reg = await navigator.serviceWorker.register("/sw.js");
           await reg.update();
           const sub = reg ? await reg.pushManager.getSubscription() : null;
-          b.textContent = sub ? "Notifications enabled" : "Enable push notifications";
-          b.title = sub ? "Click to send a test notification" : "";
+          b.textContent = sub ? "Pause notifications" : "Enable push notifications";
+          b.title = sub
+            ? "Click to pause push notifications"
+            : "Click to enable push notifications";
         } catch (_) {
           b.textContent = "Enable push notifications";
+          b.title = "Click to enable push notifications";
         }
       }
 
-      async function enablePush() {
+      async function togglePush() {
         const b = $("notify");
         if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
           b.textContent = "Push unsupported";
+          b.title = "This browser cannot receive Web Push notifications";
           return;
         }
         b.disabled = true;
         try {
           const c = await (await fetch("/push/config")).json();
           const reg = await navigator.serviceWorker.register("/sw.js");
+          let sub = await reg.pushManager.getSubscription();
+
+          if (sub) {
+            // Mint a short-lived auth token from the active subscription, then
+            // unsubscribe the browser and remove the durable server copy.
+            const registered = await (
+              await fetch("/push/subscribe", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(sub),
+              })
+            ).json();
+            if (!registered.ok) throw Error(registered.error || "Unable to prepare pause");
+            const endpoint = sub.endpoint;
+            await sub.unsubscribe();
+            const paused = await (
+              await fetch("/push/unsubscribe", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  endpoint,
+                  test_token: registered.test_token,
+                }),
+              })
+            ).json();
+            if (!paused.ok) throw Error(paused.error || "Unable to pause notifications");
+            b.textContent = "Enable push notifications";
+            b.title = "Click to enable push notifications";
+            return;
+          }
+
           const permission = await Notification.requestPermission();
           if (permission !== "granted") throw Error("Browser permission was not granted");
-          let sub = await reg.pushManager.getSubscription();
           if (sub && !subscriptionUsesKey(sub, c.vapid_public_key)) {
             await sub.unsubscribe();
             sub = null;
@@ -826,12 +862,17 @@
               }),
             })
           ).json();
-          b.textContent = test.sent
-            ? "Notifications enabled"
-            : "Push registered · test failed";
-          if (test.sent) b.title = "Click to send a test notification";
+          if (!test.sent) {
+            b.textContent = "Enable push notifications";
+            b.title = "Push registered, but the delivery test failed. Click to retry.";
+            $("reason").textContent = "Push registered, but the delivery test failed";
+            return;
+          }
+          b.textContent = "Pause notifications";
+          b.title = "Click to pause push notifications";
         } catch (e) {
-          b.textContent = "Push setup failed";
+          b.textContent = "Enable push notifications";
+          b.title = "Click to enable push notifications";
           $("reason").textContent = e.message || "Push setup failed";
         } finally {
           b.disabled = false;
@@ -850,7 +891,7 @@
         }
       }
 
-      $("notify").onclick = enablePush;
+      $("notify").onclick = togglePush;
       syncPushButton();
       refresh();
       setInterval(refresh, 15000);

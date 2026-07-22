@@ -159,6 +159,12 @@ def _upsert_subscription(subscriptions, subscription):
     return True
 
 
+def _remove_subscription(subscriptions, endpoint):
+    before = len(subscriptions)
+    subscriptions[:] = [item for item in subscriptions if item.get("endpoint") != endpoint]
+    return before - len(subscriptions)
+
+
 def _send_push(payload, subscriptions=None, delivery_type="automatic"):
     attempted_at = pd.Timestamp.now(tz="UTC")
     if webpush is None:
@@ -527,6 +533,21 @@ def push_subscribe():
         _persist_subscriptions()
     token = hmac.new(_push_secret, data["endpoint"].encode(), hashlib.sha256).hexdigest()
     return jsonify({"ok":True,"subscriptions":len(push_subscriptions),"test_token":token})
+
+
+@app.post("/push/unsubscribe")
+def push_unsubscribe():
+    data = request.get_json(silent=True) or {}
+    endpoint = data.get("endpoint", "")
+    token = data.get("test_token", "")
+    expected = hmac.new(_push_secret, endpoint.encode(), hashlib.sha256).hexdigest()
+    if not endpoint or not hmac.compare_digest(token, expected):
+        return jsonify({"error":"unauthorized"}), 401
+    with push_lock:
+        removed = _remove_subscription(push_subscriptions, endpoint)
+        if removed:
+            _persist_subscriptions()
+    return jsonify({"ok":True,"removed":removed,"subscriptions":len(push_subscriptions)})
 
 
 @app.post("/push/test")
