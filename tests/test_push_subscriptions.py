@@ -51,7 +51,7 @@ def test_webpush_receives_persistent_pem_file_path(monkeypatch):
     assert captured["vapid_private_key"].endswith("vapid_private.pem")
     assert captured["ttl"] == 86_400
     assert captured["timeout"] == 10
-    assert captured["headers"] == {"Urgency": "high", "Topic": "btc-structure-flow"}
+    assert captured["headers"] == {"Urgency": "high"}
 
 
 def test_dashboard_restores_enabled_push_state_after_reload():

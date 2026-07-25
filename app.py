@@ -190,7 +190,7 @@ def _send_push(payload, subscriptions=None, delivery_type="automatic"):
                 vapid_claims={"sub":_vapid_subject},
                 timeout=10,
                 ttl=86_400,
-                headers={"Urgency":"high", "Topic":topic},
+                headers={"Urgency":"high"},
             )
             sent += 1
         except Exception as exc:
@@ -653,17 +653,29 @@ const decodeKey = value => {{
 self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
 self.addEventListener('push', event => {{
-  const data = event.data ? event.data.json() : {{}};
+  let data = {{}};
+  try {{
+    data = event.data ? event.data.json() : {{}};
+  }} catch (_) {{
+    data = {{ title: 'BTC Predictor', body: 'New prediction update' }};
+  }}
   const iconUrl = new URL('/apple-touch-icon.png', self.location.origin).href;
-  const badgeUrl = new URL('/icon-192.png', self.location.origin).href;
-  event.waitUntil(self.registration.showNotification(data.title || 'BTC Predictor', {{
+  const options = {{
     body: data.body || 'Prediction update',
     icon: iconUrl,
-    badge: badgeUrl,
     tag: data.event_id ? `btc-predictor-${{data.event_id}}` : `btc-predictor-${{Date.now()}}`,
     renotify: true,
-    data: {{url: data.url || '/'}},
-  }}));
+    data: {{ url: data.url || '/' }},
+  }};
+  event.waitUntil(
+    self.registration.showNotification(data.title || 'BTC Predictor', options).catch(err => {{
+      // Fallback with minimal options if iOS rejects extended properties
+      return self.registration.showNotification(data.title || 'BTC Predictor', {{
+        body: data.body || 'Prediction update',
+        icon: iconUrl,
+      }});
+    }})
+  );
 }});
 self.addEventListener('notificationclick', event => {{
   event.notification.close();
