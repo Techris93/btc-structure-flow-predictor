@@ -654,10 +654,13 @@ self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
 self.addEventListener('push', event => {{
   const data = event.data ? event.data.json() : {{}};
+  const iconUrl = new URL('/apple-touch-icon.png', self.location.origin).href;
+  const badgeUrl = new URL('/icon-192.png', self.location.origin).href;
   event.waitUntil(self.registration.showNotification(data.title || 'BTC Predictor', {{
     body: data.body || 'Prediction update',
-    icon: '/favicon.ico',
-    tag: data.event_id ? `btc-predictor-${{data.event_id}}` : 'btc-predictor',
+    icon: iconUrl,
+    badge: badgeUrl,
+    tag: data.event_id ? `btc-predictor-${{data.event_id}}` : `btc-predictor-${{Date.now()}}`,
     renotify: true,
     data: {{url: data.url || '/'}},
   }}));
