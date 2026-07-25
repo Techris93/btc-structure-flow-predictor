@@ -744,6 +744,18 @@ def push_test():
     return jsonify({"ok":sent > 0,"sent":sent,"failed":failed})
 
 
+@app.post("/push/broadcast-test")
+def push_broadcast_test():
+    if webpush is None: return jsonify({"error":"pywebpush unavailable"}), 503
+    import time
+    sent, failed = _send_push(
+        {"title":"BTC Predictor test","body":"Live push notification test — verifying background delivery!","url":"/","event_id":f"broadcast-{int(time.time())}"},
+        subscriptions=None,
+        delivery_type="test",
+    )
+    return jsonify({"ok":sent > 0,"sent":sent,"failed":failed})
+
+
 @app.post("/predict")
 def predict():
     admin_token = os.getenv("ADMIN_API_TOKEN")
