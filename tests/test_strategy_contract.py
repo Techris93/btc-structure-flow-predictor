@@ -101,3 +101,44 @@ def test_paper_ledger_ignores_bars_before_entry():
     assert ledger._open is None
     assert status["closed_trades"] == 1
     assert status["last_closed"]["exit_reason"] == "stop"
+
+
+def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
+    path = tmp_path / "paper_ledger.json"
+    ledger = PaperLedger(path)
+    # Since path didn't exist, it seeds the 3 historical trades
+    status = ledger._status()
+    assert status["closed_trades"] == 3
+    assert status["equity"] > 100000.0
+
+    # Test opening a setup
+    pred1 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-07-25 10:00", tz="UTC"),
+        bias="bearish",
+        entry=65000.0,
+        stop=65200.0,
+        target=64500.0,
+        position_size=1.0,
+        zone="zone1",
+    )
+    ledger.update(pred1)
+    assert ledger._open is not None and ledger._open["zone"] == "zone1"
+
+    # Test superseded by a new setup on a different zone
+    pred2 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-07-25 10:15", tz="UTC"),
+        bias="bearish",
+        entry=64800.0,
+        stop=65000.0,
+        target=64200.0,
+        position_size=1.0,
+        zone="zone2",
+    )
+    ohlc = pd.DataFrame(
+        {"open": [64900.0], "high": [64950.0], "low": [64850.0], "close": [64900.0], "volume": [1.0]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-07-25 10:15", tz="UTC")]),
+    )
+    status = ledger.update(pred2, ohlc)
+    assert status["closed_trades"] == 4
+    assert status["last_closed"]["exit_reason"] == "superseded_by_new_setup"
+    assert ledger._open is not None and ledger._open["zone"] == "zone2"

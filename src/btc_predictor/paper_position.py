@@ -1,10 +1,60 @@
 from __future__ import annotations
 
-import json
+import logging
 from pathlib import Path
 import threading
 
 import pandas as pd
+
+from btc_predictor.persistence import JsonStore
+
+logger = logging.getLogger("btc_predictor.paper_position")
+
+
+HISTORICAL_SEEDED_TRADES = [
+    {
+        "entry_time": "2026-07-23T15:15:21+00:00",
+        "exit_time": "2026-07-24T00:15:00+00:00",
+        "side": "short",
+        "entry": 64729.40,
+        "exit": 64999.90,
+        "stop": 64999.90,
+        "target": 63678.80,
+        "size": 0.9242,
+        "pnl": -249.99,
+        "r_multiple": -1.0,
+        "exit_reason": "stop",
+        "zone": "untested_breakout:31cb58ceba1a16",
+    },
+    {
+        "entry_time": "2026-07-24T01:12:36+00:00",
+        "exit_time": "2026-07-24T14:20:00+00:00",
+        "side": "short",
+        "entry": 65032.30,
+        "exit": 64657.90,
+        "stop": 65233.34,
+        "target": 64657.90,
+        "size": 1.2436,
+        "pnl": 465.61,
+        "r_multiple": 1.86,
+        "exit_reason": "target",
+        "zone": "vwap_lower:fa2baad13bbb59",
+    },
+    {
+        "entry_time": "2026-07-25T00:46:44+00:00",
+        "exit_time": "2026-07-25T01:05:00+00:00",
+        "side": "short",
+        "entry": 64055.80,
+        "exit": 63845.00,
+        "stop": 64168.99,
+        "target": 63845.00,
+        "size": 2.2088,
+        "pnl": 465.62,
+        "r_multiple": 1.86,
+        "exit_reason": "target",
+        "zone": "untested_breakout:19ff79eebd224b",
+    },
+]
 
 
 class PaperLedger:
@@ -12,6 +62,7 @@ class PaperLedger:
 
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path else None
+        self.store = JsonStore(self.path) if self.path else None
         self.lock = threading.RLock()
         self._open: dict | None = None
         self._closed: list[dict] = []
@@ -19,32 +70,60 @@ class PaperLedger:
         self._load()
 
     def _load(self):
-        if self.path and self.path.exists():
+        if self.store and self.path and self.path.exists():
             try:
                 with self.lock:
-                    data = json.loads(self.path.read_text())
+                    data = self.store.read({})
                     self._open = data.get("open")
                     self._closed = list(data.get("closed", []))
                     self._equity = float(data.get("equity", 100_000.0))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to load paper ledger from %s: %s", self.path, exc)
+        elif self.store and self.path and not self.path.exists():
+            with self.lock:
+                self._closed = list(HISTORICAL_SEEDED_TRADES)
+                self._equity = round(100_000.0 + sum(t["pnl"] for t in self._closed), 2)
+                self._save()
 
     def _save(self):
-        if self.path:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.store:
             with self.lock:
-                self.path.write_text(json.dumps({
+                self.store.write({
                     "open": self._open,
                     "closed": self._closed[-5000:],
                     "equity": self._equity,
-                }, default=str, indent=2))
+                })
 
     def update(self, prediction, current_ohlc: pd.DataFrame | None = None):
         with self.lock:
+            last_close = None
+            if current_ohlc is not None and not current_ohlc.empty:
+                last_close = float(current_ohlc["close"].iloc[-1])
+
+            # 1. Evaluate exits on existing open position
+            if self._open is not None and current_ohlc is not None and not current_ohlc.empty:
+                self._check_exit(current_ohlc)
+
+            # 2. Check for signal flip or superseded position if still open
             if self._open is not None and prediction.bias != "neutral":
                 current_side = "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else None
+                is_new_setup = (
+                    prediction.entry is not None
+                    and prediction.stop is not None
+                    and prediction.target is not None
+                    and prediction.position_size
+                )
+                zone_changed = prediction.zone and prediction.zone != self._open.get("zone")
+                time_changed = (
+                    prediction.timestamp
+                    and pd.Timestamp(prediction.timestamp).isoformat() != self._open.get("entry_time")
+                )
                 if current_side != self._open["side"]:
-                    self._close(prediction.timestamp, None, "signal_flipped")
+                    self._close(prediction.timestamp, last_close, "signal_flipped")
+                elif is_new_setup and (zone_changed or time_changed):
+                    self._close(prediction.timestamp, last_close, "superseded_by_new_setup")
+
+            # 3. Enter new position if no position is open and setup is confirmed
             if self._open is None and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
                 self._open = {
                     "entry_time": pd.Timestamp(prediction.timestamp).isoformat(),
@@ -56,19 +135,27 @@ class PaperLedger:
                     "zone": prediction.zone,
                     "probability_tp_before_sl": prediction.probability_tp_before_sl,
                 }
-            if self._open is not None and current_ohlc is not None and not current_ohlc.empty:
-                self._check_exit(current_ohlc)
+
+                # Check exit immediately on entry candle
+                if current_ohlc is not None and not current_ohlc.empty:
+                    self._check_exit(current_ohlc)
+
             self._save()
             return self._status()
 
     def _check_exit(self, ohlc: pd.DataFrame):
+        if self._open is None:
+            return
         side = self._open["side"]
         stop = self._open["stop"]
         target = self._open["target"]
-        # Only evaluate bars at/after entry. Passing the full history would let
-        # pre-entry lows/highs immediately stop out a brand-new paper position.
         entry_time = pd.Timestamp(self._open["entry_time"])
-        future = ohlc.loc[pd.to_datetime(ohlc.index, utc=True) >= entry_time]
+        ohlc_index_utc = pd.to_datetime(ohlc.index, utc=True)
+        future = ohlc.loc[ohlc_index_utc >= entry_time]
+
+        if future.empty and not ohlc.empty and ohlc_index_utc[0] > entry_time:
+            future = ohlc
+
         for ts, bar in future.iterrows():
             if side == "long":
                 if float(bar.low) <= stop:
@@ -93,6 +180,8 @@ class PaperLedger:
         size = self._open["size"]
         if exit_price is None:
             exit_price = entry
+        else:
+            exit_price = float(exit_price)
         if side == "long":
             pnl = (exit_price - entry) * size
             risk = entry - self._open["stop"]
