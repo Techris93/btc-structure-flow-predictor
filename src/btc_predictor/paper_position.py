@@ -79,10 +79,12 @@ class PaperLedger:
                     self._equity = float(data.get("equity", 100_000.0))
             except Exception as exc:
                 logger.warning("Failed to load paper ledger from %s: %s", self.path, exc)
-        elif self.store and self.path and not self.path.exists():
-            with self.lock:
+        with self.lock:
+            if not self._closed and self.store and self.path:
                 self._closed = list(HISTORICAL_SEEDED_TRADES)
                 self._equity = round(100_000.0 + sum(t["pnl"] for t in self._closed), 2)
+                if self._open and any(t["entry_time"] == self._open.get("entry_time") for t in HISTORICAL_SEEDED_TRADES):
+                    self._open = None
                 self._save()
 
     def _save(self):
