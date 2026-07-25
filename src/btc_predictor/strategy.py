@@ -31,7 +31,7 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=15,require_15m_align=True):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
 
@@ -94,9 +94,9 @@ class Predictor:
         if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement",0.0)>0.5,no_trade_reason="orderflow_not_confirmed")
         active_targets=[q for q in zones if q.is_active(now) and q.zone_id!=z.zone_id]
         if bias=="bullish":
-            stop=min(sweep["extreme"]-.1*a,price-self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price]; target=min(options or [price+2*a]); rr=(target-price)/(price-stop)
+            stop=min(sweep["extreme"]-.5*a,price-self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price]; target=min(options or [price+2*a]); rr=(target-price)/(price-stop)
         else:
-            stop=max(sweep["extreme"]+.1*a,price+self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price]; target=max(options or [price-2*a]); rr=(price-target)/(stop-price)
+            stop=max(sweep["extreme"]+.5*a,price+self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price]; target=max(options or [price-2*a]); rr=(price-target)/(stop-price)
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias)
         base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
         if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
