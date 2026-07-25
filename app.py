@@ -440,27 +440,65 @@ if os.getenv("START_LIVE_LOOP_ON_BOOT", "0").lower() in ("1", "true", "yes", "on
 @app.get("/dashboard")
 def index(): return render_template("dashboard.html")
 
+
+def _generate_png_icon(width=180, height=180):
+    import struct, zlib
+    pixels = []
+    r1, g1, b1 = (247, 147, 26)  # Bitcoin Orange
+    r2, g2, b2 = (255, 255, 255)  # White B
+    cx, cy = width / 2.0, height / 2.0
+    for y in range(height):
+        row = [0]
+        for x in range(width):
+            dx, dy = x - cx, y - cy
+            is_symbol = False
+            if abs(dx) < width * 0.35 and abs(dy) < height * 0.35:
+                if -width * 0.22 <= dx <= -width * 0.08 and -height * 0.28 <= dy <= height * 0.28:
+                    is_symbol = True
+                elif dx >= -width * 0.08 and (dx*dx + (dy + height*0.13)**2) <= (height*0.16)**2 and dy <= 0:
+                    is_symbol = True
+                elif dx >= -width * 0.08 and (dx*dx + (dy - height*0.13)**2) <= (height*0.18)**2 and dy >= -height*0.02:
+                    is_symbol = True
+                elif abs(dx + width * 0.15) <= width * 0.035 and abs(dy) <= height * 0.32:
+                    is_symbol = True
+                elif abs(dx - width * 0.02) <= width * 0.035 and abs(dy) <= height * 0.32:
+                    is_symbol = True
+
+            if is_symbol:
+                row.extend([r2, g2, b2])
+            else:
+                row.extend([r1, g1, b1])
+        pixels.append(bytes(row))
+    raw_data = b"".join(pixels)
+    compressed = zlib.compress(raw_data, 9)
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    header = b"\x89PNG\r\n\x1a\n"
+    ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    idat = chunk(b"IDAT", compressed)
+    iend = chunk(b"IEND", b"")
+    return header + ihdr + idat + iend
+
+_cached_png_180 = _generate_png_icon(180, 180)
+_cached_png_32 = _generate_png_icon(32, 32)
+
 @app.get("/favicon.ico")
+def favicon_ico():
+    return _cached_png_32, 200, {"Content-Type": "image/png", "Cache-Control": "public, max-age=86400"}
+
 @app.get("/apple-touch-icon.png")
 @app.get("/apple-touch-icon-precomposed.png")
+def apple_touch_icon():
+    return _cached_png_180, 200, {"Content-Type": "image/png", "Cache-Control": "public, max-age=86400"}
+
 @app.get("/icon.svg")
-def favicon():
+def icon_svg():
     svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#F7931A"/>
-      <stop offset="100%" stop-color="#D47407"/>
-    </linearGradient>
-    <linearGradient id="glow" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.3"/>
-      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
-    </linearGradient>
-  </defs>
-  <rect width="512" height="512" rx="120" fill="url(#bg)"/>
-  <rect width="512" height="256" rx="120" fill="url(#glow)"/>
+  <rect width="512" height="512" rx="120" fill="#F7931A"/>
   <path fill="#FFFFFF" d="M361.3 227.1c4.8-32.3-19.8-49.7-53.5-61.3l10.9-43.8-26.6-6.6-10.6 42.6c-7-.1-14.2-.1-21.3.1l10.7-42.9-26.6-6.6-10.9 43.8c-5.8-1.3-11.6-2.6-17.3-3.9l.1-.4-36.7-9.2-7.1 28.4s19.8 4.5 19.3 4.8c10.8 2.7 12.8 9.8 12.4 15.5l-12.5 50c.7.2 1.7.5 2.8.9-1 .3-2 .5-2.9.3l-17.5 70.1c-1.3 3.3-4.7 8.3-12.3 6.4.3.4-19.3-4.8-19.3-4.8l-13.2 30.5 34.6 8.7c6.4 1.6 12.7 3.3 18.9 4.9l-11 44.3 26.6 6.6 10.9-43.8c7.2 2 14.2 3.8 21.2 5.5l-10.8 43.4 26.6 6.6 11-44.1c45.4 8.6 79.5 5.1 93.9-35.9 11.6-33.1-.6-52.2-24.6-64.6 17.5-4 30.6-15.5 34.1-39.2zm-61 85.7c-8.2 33.1-64.1 15.2-82.2 10.7l14.7-58.8c18.1 4.5 76 13.5 67.5 48.1zm8.3-86.2c-7.5 30.1-54 14.8-69.1 11.1l13.3-53.4c15.1 3.8 63.4 10.8 55.8 42.3z"/>
 </svg>"""
     return svg, 200, {"Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400"}
+
 
 
 
