@@ -22,6 +22,13 @@ def _finish_features(g, window):
     g["delta"]=g.buy-g.sell; g["cvd"]=g.delta.cumsum()
     g["delta_z"]=rolling_zscore(g.delta,window,min_periods=min(20,window))
     g["intensity_z"]=rolling_zscore(g.volume,window,min_periods=min(20,window))
+
+    # Kyle's Lambda (Price Impact per unit of aggressive volume)
+    price_diff = g.price.diff().abs()
+    g["kyle_lambda"] = price_diff / (g.volume + 1e-6)
+    lambda_baseline = g.kyle_lambda.rolling(20, min_periods=5).median().replace(0, np.nan)
+    g["kyle_absorption"] = (1.0 / (1.0 + 1e4 * g.kyle_lambda)).clip(0.0, 1.0)
+
     g["price_response"]=g.price.diff()/g.volume.replace(0,np.nan)
     threshold=g.price.rolling(10,min_periods=3).std().fillna(0)*.25
     g["bullish_delta_reversal"]=(g.delta.shift(1)<0)&(g.delta>0)
@@ -73,6 +80,10 @@ def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_ti
         recent=features.tail(5)
     current=features.iloc[-1]
     recent_tail=recent.tail(5)
+
+    # Kyle's Lambda Absorption Score
+    kyle_abs_score = float(recent.kyle_absorption.mean()) if not recent.empty else 0.5
+
     if direction=="bullish":
         extreme=float(((recent.delta_z<-1).sum() + recent.sell_absorption.sum()) / max(len(recent),1))
         has_reversal=recent_tail.bullish_delta_reversal.any() or current.delta>0 or recent_tail.delta.sum()>0
@@ -83,7 +94,7 @@ def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_ti
         reversal=1.0 if has_reversal else 0.0
     response_baseline=features.price_response.abs().rolling(20,min_periods=5).median().iloc[-1]
     stalled=float(min(1.0, (recent.price_response.abs()<=response_baseline).sum() / max(len(recent),1))) if np.isfinite(response_baseline) else 0.0
-    agreement,deltas=cross_exchange_agreement(trades,pd.Timestamp(decision_time)-pd.Timedelta(minutes=5),decision_time,direction)
+    agreement,deltas=cross_exchange_agreement(trades,pd.Timestamp(decision_time)-pd.Timedelta(minutes=5),direction)
     raw=trades.copy(); raw["time"]=pd.to_datetime(raw.time,utc=True)
     raw=raw[(raw.time>=pd.Timestamp(sweep_time))&(raw.time<pd.Timestamp(decision_time))]
     imbalance=0.0
@@ -95,16 +106,18 @@ def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_ti
         else:
             imbalance=min(1.0, max(0.0, (1.0/ratio-1.0)/0.5))
     weights = {
-        "extreme_delta": 0.30,
-        "delta_reversal": 0.30,
+        "extreme_delta": 0.25,
+        "delta_reversal": 0.25,
         "price_response": 0.15,
+        "kyle_absorption": 0.15,
         "cross_exchange": 0.10,
-        "footprint_imbalance": 0.15,
+        "footprint_imbalance": 0.10,
     }
     score = (
         weights["extreme_delta"] * extreme
         + weights["delta_reversal"] * reversal
         + weights["price_response"] * stalled
+        + weights["kyle_absorption"] * kyle_abs_score
         + weights["cross_exchange"] * agreement
         + weights["footprint_imbalance"] * imbalance
     )
@@ -112,7 +125,8 @@ def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_ti
     reason = "confirmed" if confirmed else "score_below_threshold"
     return confirmed, {"reason": reason, "score": round(score, 3), "threshold": min_score,
                        "extreme": round(extreme,3), "reversal": round(reversal,3),
-                       "stalled_response": round(stalled,3), "agreement": round(agreement,3),
-                       "imbalance": round(imbalance,3), "exchange_deltas": deltas,
+                       "stalled_response": round(stalled,3), "kyle_absorption": round(kyle_abs_score, 3),
+                       "agreement": round(agreement,3), "imbalance": round(imbalance,3),
+                       "exchange_deltas": deltas,
                        "delta_z": float(current.delta_z) if np.isfinite(current.delta_z) else None,
                        "intensity_z": float(current.intensity_z) if np.isfinite(current.intensity_z) else None}

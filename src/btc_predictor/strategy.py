@@ -31,9 +31,10 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
-        self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
+        self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
+        self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
 
     @staticmethod
     def _last(frame):
@@ -59,15 +60,15 @@ class Predictor:
             if not opposing:return "neutral"
         self._held_bias=candidate; return candidate
 
-    def _probability_estimate(self, score: float, rr: float, bias: str) -> float:
-        """Simple placeholder probability; replace with empirical model from research ledger."""
+    def _probability_estimate(self, score: float, rr: float, bias: str, decay: float = 1.0) -> float:
+        """Empirical probability estimate with half-life signal decay."""
         if not (np.isfinite(score) and np.isfinite(rr)):
             return None
         base = 0.50
         score_add = 0.20 * (score - 0.50)
         rr_add = 0.10 * (rr - 1.5)
         align = 0.05 if self.last_regimes.get("15m") == bias else 0.0
-        prob = base + score_add + rr_add + align
+        prob = (base + score_add + rr_add + align) * decay
         return float(np.clip(prob, 0.05, 0.95))
     
     def _output(self,now,bias,**kwargs):
@@ -92,12 +93,19 @@ class Predictor:
         usable=t.loc[t.time<now]
         confirm,flow=footprint_confirmation(usable,flow_bars,bias,sweep["time"],now)
         if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement",0.0)>0.5,no_trade_reason="orderflow_not_confirmed")
+        
+        # Exponential state decay calculation
+        reclaim_time = pd.Timestamp(sweep.get("reclaim_time", now))
+        delta_t_minutes = max(0.0, float((now - reclaim_time).total_seconds() / 60.0))
+        tau = self.half_life_minutes / np.log(2)
+        signal_decay = float(np.exp(-delta_t_minutes / tau))
+
         active_targets=[q for q in zones if q.is_active(now) and q.zone_id!=z.zone_id]
         if bias=="bullish":
             stop=min(sweep["extreme"]-.5*a,price-self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price]; target=min(options or [price+2*a]); rr=(target-price)/(price-stop)
         else:
             stop=max(sweep["extreme"]+.5*a,price+self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price]; target=max(options or [price-2*a]); rr=(price-target)/(stop-price)
-        prob = self._probability_estimate(flow.get("score",0.0), rr, bias)
+        prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
         base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
         if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
         return self._output(now,bias,**base,position_size=equity*self.risk_fraction/abs(price-stop))
