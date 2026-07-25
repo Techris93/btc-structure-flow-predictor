@@ -48,7 +48,6 @@ def flow_features_from_bars(flow_bars: pd.DataFrame, window=100) -> pd.DataFrame
     return _finish_features(x[["price","buy","sell","volume","trades"]],window)
 
 
-
 def cross_exchange_agreement(trades: pd.DataFrame, start, end, direction: str, min_notional: float = 1.0):
     """Weighted agreement. Returns a score in [0,1] and a veto flag."""
     if trades.empty or "exchange" not in trades: return 0.0, {}
@@ -65,21 +64,26 @@ def cross_exchange_agreement(trades: pd.DataFrame, start, end, direction: str, m
     return score, actual
 
 
-def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_time, window=100, min_score: float = 0.45):
+def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_time, window=100, min_score: float = 0.40):
     features=flow_features_from_bars(flow_bars,window) if flow_bars is not None and not flow_bars.empty else orderflow_features(trades,window=window)
     features=features.loc[features.index<=pd.Timestamp(decision_time)]
     if len(features)<20: return False,{"reason":"flow_warmup","bars":len(features),"score":0.0}
     recent=features.loc[features.index>=pd.Timestamp(sweep_time)-pd.Timedelta(minutes=2)]
+    if recent.empty:
+        recent=features.tail(5)
     current=features.iloc[-1]
+    recent_tail=recent.tail(5)
     if direction=="bullish":
         extreme=float(((recent.delta_z<-1).sum() + recent.sell_absorption.sum()) / max(len(recent),1))
-        reversal=float((current.bullish_delta_reversal or current.delta>0))
+        has_reversal=recent_tail.bullish_delta_reversal.any() or current.delta>0 or recent_tail.delta.sum()>0
+        reversal=1.0 if has_reversal else 0.0
     else:
         extreme=float(((recent.delta_z>1).sum() + recent.buy_absorption.sum()) / max(len(recent),1))
-        reversal=float((current.bearish_delta_reversal or current.delta<0))
+        has_reversal=recent_tail.bearish_delta_reversal.any() or current.delta<0 or recent_tail.delta.sum()<0
+        reversal=1.0 if has_reversal else 0.0
     response_baseline=features.price_response.abs().rolling(20,min_periods=5).median().iloc[-1]
     stalled=float(min(1.0, (recent.price_response.abs()<=response_baseline).sum() / max(len(recent),1))) if np.isfinite(response_baseline) else 0.0
-    agreement,deltas=cross_exchange_agreement(trades,pd.Timestamp(decision_time)-pd.Timedelta(minutes=2),decision_time,direction)
+    agreement,deltas=cross_exchange_agreement(trades,pd.Timestamp(decision_time)-pd.Timedelta(minutes=5),decision_time,direction)
     raw=trades.copy(); raw["time"]=pd.to_datetime(raw.time,utc=True)
     raw=raw[(raw.time>=pd.Timestamp(sweep_time))&(raw.time<pd.Timestamp(decision_time))]
     imbalance=0.0
@@ -90,7 +94,6 @@ def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_ti
             imbalance=min(1.0, max(0.0, (ratio-1.0)/0.5))
         else:
             imbalance=min(1.0, max(0.0, (1.0/ratio-1.0)/0.5))
-    # Weighted score. Weights sum to 1.0.
     weights = {
         "extreme_delta": 0.30,
         "delta_reversal": 0.30,
