@@ -442,32 +442,50 @@ def index(): return render_template("dashboard.html")
 
 
 def _generate_png_icon(width=180, height=180):
-    import struct, zlib
-    pixels = []
-    r1, g1, b1 = (247, 147, 26)  # Bitcoin Orange
+    import struct, zlib, math
+    r1, g1, b1 = (247, 147, 26)  # Bitcoin Orange #F7931A
     r2, g2, b2 = (255, 255, 255)  # White B
+    pixels = []
+    scale = width / 180.0
     cx, cy = width / 2.0, height / 2.0
+    angle = math.radians(-14)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
     for y in range(height):
         row = [0]
         for x in range(width):
-            dx, dy = x - cx, y - cy
-            is_symbol = False
-            if abs(dx) < width * 0.35 and abs(dy) < height * 0.35:
-                if -width * 0.22 <= dx <= -width * 0.08 and -height * 0.28 <= dy <= height * 0.28:
-                    is_symbol = True
-                elif dx >= -width * 0.08 and (dx*dx + (dy + height*0.13)**2) <= (height*0.16)**2 and dy <= 0:
-                    is_symbol = True
-                elif dx >= -width * 0.08 and (dx*dx + (dy - height*0.13)**2) <= (height*0.18)**2 and dy >= -height*0.02:
-                    is_symbol = True
-                elif abs(dx + width * 0.15) <= width * 0.035 and abs(dy) <= height * 0.32:
-                    is_symbol = True
-                elif abs(dx - width * 0.02) <= width * 0.035 and abs(dy) <= height * 0.32:
-                    is_symbol = True
-
-            if is_symbol:
-                row.extend([r2, g2, b2])
-            else:
-                row.extend([r1, g1, b1])
+            dx = (x - cx) / scale
+            dy = (y - cy) / scale
+            rx = dx * cos_a - dy * sin_a
+            ry = dx * sin_a + dy * cos_a
+            d_spine = max(abs(rx + 14.0) - 8.0, abs(ry) - 34.0)
+            d_bar1 = max(abs(rx + 10.0) - 3.5, abs(ry + 40.0) - 6.0)
+            d_bar2 = max(abs(rx - 2.0) - 3.5, abs(ry + 40.0) - 6.0)
+            d_bar3 = max(abs(rx + 10.0) - 3.5, abs(ry - 40.0) - 6.0)
+            d_bar4 = max(abs(rx - 2.0) - 3.5, abs(ry - 40.0) - 6.0)
+            d_hbar_top = max(abs(rx + 5.0) - 17.0, abs(ry + 28.0) - 6.0)
+            d_hbar_mid = max(abs(rx + 6.0) - 18.0, abs(ry) - 6.0)
+            d_hbar_bot = max(abs(rx + 5.0) - 17.0, abs(ry - 28.0) - 6.0)
+            dist_top_c = math.sqrt((rx + 6.0)**2 + (ry + 17.0)**2)
+            d_top_lobe = dist_top_c - 19.0
+            if rx < -6.0 or ry > -3.0 or ry < -34.0:
+                d_top_lobe = 999.0
+            dist_bot_c = math.sqrt((rx + 6.0)**2 + (ry - 17.0)**2)
+            d_bot_lobe = dist_bot_c - 22.0
+            if rx < -6.0 or ry < 3.0 or ry > 36.0:
+                d_bot_lobe = 999.0
+            d_solid = min(d_spine, d_bar1, d_bar2, d_bar3, d_bar4, d_hbar_top, d_hbar_mid, d_hbar_bot, d_top_lobe, d_bot_lobe)
+            d_top_hole = 8.5 - dist_top_c
+            d_bot_hole = 10.0 - dist_bot_c
+            if d_top_hole > 0 and rx > -6.0 and ry < -3.0:
+                d_solid = max(d_solid, d_top_hole)
+            if d_bot_hole > 0 and rx > -6.0 and ry > 3.0:
+                d_solid = max(d_solid, d_bot_hole)
+            alpha = max(0.0, min(1.0, 0.5 - d_solid / 1.5))
+            r = int(r1 * (1.0 - alpha) + r2 * alpha)
+            g = int(g1 * (1.0 - alpha) + g2 * alpha)
+            b = int(b1 * (1.0 - alpha) + b2 * alpha)
+            row.extend([r, g, b])
         pixels.append(bytes(row))
     raw_data = b"".join(pixels)
     compressed = zlib.compress(raw_data, 9)
@@ -479,8 +497,56 @@ def _generate_png_icon(width=180, height=180):
     iend = chunk(b"IEND", b"")
     return header + ihdr + idat + iend
 
+_cached_png_512 = _generate_png_icon(512, 512)
+_cached_png_192 = _generate_png_icon(192, 192)
 _cached_png_180 = _generate_png_icon(180, 180)
 _cached_png_32 = _generate_png_icon(32, 32)
+
+@app.get("/manifest.json")
+@app.get("/site.webmanifest")
+def web_manifest():
+    return {
+        "name": "BTC Structure Flow",
+        "short_name": "BTC Flow",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0b0e14",
+        "theme_color": "#f7931a",
+        "icons": [
+            {
+                "src": "/apple-touch-icon.png",
+                "sizes": "180x180",
+                "type": "image/png",
+                "purpose": "any maskable"
+            },
+            {
+                "src": "/icon-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any maskable"
+            },
+            {
+                "src": "/icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable"
+            },
+            {
+                "src": "/favicon.ico",
+                "sizes": "32x32",
+                "type": "image/png",
+                "purpose": "any"
+            }
+        ]
+    }, 200, {"Content-Type": "application/manifest+json", "Cache-Control": "public, max-age=86400"}
+
+@app.get("/icon-192.png")
+def icon_192():
+    return _cached_png_192, 200, {"Content-Type": "image/png", "Cache-Control": "public, max-age=86400"}
+
+@app.get("/icon-512.png")
+def icon_512():
+    return _cached_png_512, 200, {"Content-Type": "image/png", "Cache-Control": "public, max-age=86400"}
 
 @app.get("/favicon.ico")
 def favicon_ico():
