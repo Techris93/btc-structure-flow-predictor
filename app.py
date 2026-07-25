@@ -9,6 +9,9 @@ import os
 import logging
 import threading
 import time
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -32,6 +35,7 @@ predictor = Predictor()
 data_dir = runtime_dir()
 live_lock = threading.Lock()
 push_lock = threading.Lock()
+push_delivery_lock = threading.RLock()
 live_start_lock = threading.Lock()
 live_state = {"status":"starting","source":None,"prediction":None,"updated_at":None,"error":None}
 live_thread_started = False
@@ -43,9 +47,23 @@ live_boot_thread = None
 subscription_store = JsonStore(data_dir / "push_subscriptions.json")
 push_state_store = JsonStore(data_dir / "push_state.json")
 push_delivery_store = JsonStore(data_dir / "push_delivery.json")
+push_delivery_events_store = JsonStore(data_dir / "push_delivery_events.json")
 live_state_store = JsonStore(data_dir / "live_state.json")
 research_status_store = JsonStore(os.getenv("BTC_RESEARCH_STATUS", str(data_dir / "research/status.json")))
 push_subscriptions = subscription_store.read([])
+
+PUSH_ALLOWED_HOST_SUFFIXES = tuple(
+    item.strip().lower()
+    for item in os.getenv(
+        "PUSH_ALLOWED_HOST_SUFFIXES",
+        "push.apple.com,fcm.googleapis.com,push.services.mozilla.com,notify.windows.com",
+    ).split(",")
+    if item.strip()
+)
+PUSH_MAX_SUBSCRIPTIONS = max(1, int(os.getenv("PUSH_MAX_SUBSCRIPTIONS", "32")))
+PUSH_ACK_RETRY_SECONDS = max(30, int(os.getenv("PUSH_ACK_RETRY_SECONDS", "90")))
+PUSH_MAX_ACK_RETRIES = max(0, min(3, int(os.getenv("PUSH_MAX_ACK_RETRIES", "2"))))
+PUSH_EVENT_RETENTION = max(100, int(os.getenv("PUSH_EVENT_RETENTION", "500")))
 
 vapid_path = data_dir / "vapid_private.pem"
 if vapid_path.exists():
@@ -150,12 +168,79 @@ def _persist_subscriptions():
     subscription_store.write(push_subscriptions)
 
 
-def _upsert_subscription(subscriptions, subscription):
-    for index, existing in enumerate(subscriptions):
-        if existing.get("endpoint") == subscription.get("endpoint"):
-            subscriptions[index] = subscription
-            return False
-    subscriptions.append(subscription)
+def _utcnow():
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _endpoint_hash(endpoint):
+    return hashlib.sha256(str(endpoint).encode()).hexdigest()[:16]
+
+
+def _subscription_info(subscription):
+    return {
+        "endpoint": subscription.get("endpoint"),
+        "keys": subscription.get("keys") or {},
+    }
+
+
+def _normalize_subscription(subscription, now=None):
+    now = now or _utcnow()
+    normalized = {
+        "endpoint": str(subscription.get("endpoint") or ""),
+        "keys": {
+            "auth": str((subscription.get("keys") or {}).get("auth") or ""),
+            "p256dh": str((subscription.get("keys") or {}).get("p256dh") or ""),
+        },
+        "expirationTime": subscription.get("expirationTime"),
+        "installation_id": str(subscription.get("installation_id") or "")[:128] or None,
+        "created_at": subscription.get("created_at") or now.isoformat(),
+        "last_seen_at": now.isoformat(),
+        "last_ack_at": subscription.get("last_ack_at"),
+        "ack_miss_count": int(subscription.get("ack_miss_count") or 0),
+        "enabled": subscription.get("enabled") is not False,
+        "user_agent": str(subscription.get("user_agent") or "")[:512] or None,
+        "platform": str(subscription.get("platform") or "")[:128] or None,
+        "app_mode": str(subscription.get("app_mode") or "")[:32] or None,
+        "timezone": str(subscription.get("timezone") or "")[:128] or None,
+        "status": subscription.get("status") or "unverified",
+    }
+    return normalized
+
+
+def _upsert_subscription(subscriptions, subscription, now=None):
+    normalized = _normalize_subscription(subscription, now=now)
+    endpoint = normalized["endpoint"]
+    installation_id = normalized.get("installation_id")
+    exact_index = next(
+        (index for index, item in enumerate(subscriptions) if item.get("endpoint") == endpoint),
+        None,
+    )
+    installation_indexes = [
+        index
+        for index, item in enumerate(subscriptions)
+        if installation_id and item.get("installation_id") == installation_id
+    ]
+    if exact_index is not None:
+        existing = subscriptions[exact_index]
+        normalized["created_at"] = existing.get("created_at") or normalized["created_at"]
+        normalized["last_ack_at"] = existing.get("last_ack_at")
+        normalized["ack_miss_count"] = 0
+        normalized["enabled"] = True
+        normalized["status"] = "verified" if normalized["last_ack_at"] else "unverified"
+        subscriptions[exact_index] = normalized
+        for index in reversed(installation_indexes):
+            if index != exact_index:
+                del subscriptions[index]
+        return False
+    if installation_indexes:
+        first = installation_indexes[0]
+        existing = subscriptions[first]
+        normalized["created_at"] = existing.get("created_at") or normalized["created_at"]
+        subscriptions[first] = normalized
+        for index in reversed(installation_indexes[1:]):
+            del subscriptions[index]
+        return False
+    subscriptions.append(normalized)
     return True
 
 
@@ -165,60 +250,383 @@ def _remove_subscription(subscriptions, endpoint):
     return before - len(subscriptions)
 
 
+def _is_allowed_push_endpoint(endpoint):
+    try:
+        parsed = urlparse(endpoint)
+    except (TypeError, ValueError):
+        return False
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in PUSH_ALLOWED_HOST_SUFFIXES)
+
+
+def _valid_base64url(value, expected_length, required_prefix=None):
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return False
+    try:
+        padding = "=" * ((4 - len(value) % 4) % 4)
+        decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    except Exception:
+        return False
+    return len(decoded) == expected_length and (
+        required_prefix is None or decoded.startswith(required_prefix)
+    )
+
+
+def _validate_subscription(subscription):
+    endpoint = subscription.get("endpoint")
+    keys = subscription.get("keys") or {}
+    installation_id = str(subscription.get("installation_id") or "")
+    if not isinstance(endpoint, str) or len(endpoint) > 4096 or not _is_allowed_push_endpoint(endpoint):
+        return "unsupported push endpoint"
+    if not _valid_base64url(keys.get("auth"), 16) or not _valid_base64url(
+        keys.get("p256dh"), 65, b"\x04"
+    ):
+        return "invalid push encryption keys"
+    if installation_id and (
+        len(installation_id) > 128
+        or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in installation_id)
+    ):
+        return "invalid installation id"
+    return None
+
+
+def _issue_endpoint_token(endpoint, lifetime_seconds=900):
+    expires = int(time.time()) + lifetime_seconds
+    message = f"{expires}:{endpoint}".encode()
+    signature = hmac.new(_push_secret, message, hashlib.sha256).hexdigest()
+    return f"{expires}.{signature}"
+
+
+def _verify_endpoint_token(endpoint, token):
+    try:
+        expires_text, supplied = str(token).split(".", 1)
+        expires = int(expires_text)
+    except (TypeError, ValueError):
+        return False
+    if expires < int(time.time()):
+        return False
+    expected = hmac.new(_push_secret, f"{expires}:{endpoint}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(supplied, expected)
+
+
+def _delivery_ack_token(delivery_id, endpoint_fingerprint):
+    message = f"push-ack:{delivery_id}:{endpoint_fingerprint}".encode()
+    return hmac.new(_push_secret, message, hashlib.sha256).hexdigest()
+
+
+def _push_error_status(exc):
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status
+    text = str(exc)
+    for candidate in (404, 410, 429, 500, 502, 503, 504):
+        if str(candidate) in text:
+            return candidate
+    return None
+
+
+def _delivery_counts(events, batch_id):
+    batch = [event for event in events if event.get("batch_id") == batch_id]
+    return {
+        "attempted": len(batch),
+        "accepted": sum(bool(event.get("accepted_at")) for event in batch),
+        "failed": sum(bool(event.get("failed_at")) for event in batch),
+        "received": sum(bool(event.get("received_at")) for event in batch),
+        "notification_created": sum(bool(event.get("notification_created_at")) for event in batch),
+        "retries": sum(int(event.get("retry_count") or 0) for event in batch),
+    }
+
+
+def _update_last_delivery_from_events(events, batch_id):
+    summary = push_delivery_store.read({})
+    if summary.get("batch_id") != batch_id:
+        return
+    counts = _delivery_counts(events, batch_id)
+    summary.update(counts)
+    summary["sent"] = counts["accepted"]  # Backward-compatible API field.
+    push_delivery_store.write(summary)
+
+
 def _send_push(payload, subscriptions=None, delivery_type="automatic"):
-    attempted_at = pd.Timestamp.now(tz="UTC")
+    attempted_at = _utcnow()
+    batch_id = uuid.uuid4().hex
     if webpush is None:
         push_delivery_store.write({
+            "batch_id": batch_id,
             "delivery_type": delivery_type,
             "attempted_at": attempted_at.isoformat(),
             "attempted": 0,
+            "accepted": 0,
             "sent": 0,
             "failed": 0,
             "error": "pywebpush unavailable",
         })
         return 0, 0
-    with push_lock: targets = list(subscriptions if subscriptions is not None else push_subscriptions)
-    sent, failed, stale = 0, 0, []
+    with push_lock:
+        targets = [
+            item
+            for item in (subscriptions if subscriptions is not None else push_subscriptions)
+            if item.get("enabled") is not False
+        ]
+    accepted, failed, stale = 0, 0, []
     last_error = None
-    topic = "btc-structure-flow" if delivery_type == "automatic" else "btc-structure-test"
+    ttl = 900 if delivery_type == "automatic" else 120
+    prepared = []
     for sub in targets:
+        endpoint = str(sub.get("endpoint") or "")
+        endpoint_fingerprint = _endpoint_hash(endpoint)
+        delivery_id = uuid.uuid4().hex
+        ack_token = _delivery_ack_token(delivery_id, endpoint_fingerprint)
+        delivery_payload = {
+            **payload,
+            "delivery_id": delivery_id,
+            "ack_token": ack_token,
+        }
+        event = {
+            "delivery_id": delivery_id,
+            "batch_id": batch_id,
+            "delivery_type": delivery_type,
+            "endpoint_hash": endpoint_fingerprint,
+            "installation_id": sub.get("installation_id"),
+            "payload": payload,
+            "created_at": attempted_at.isoformat(),
+            "accepted_at": None,
+            "failed_at": None,
+            "received_at": None,
+            "notification_created_at": None,
+            "retry_count": 0,
+            "next_retry_at": (
+                attempted_at + pd.Timedelta(seconds=PUSH_ACK_RETRY_SECONDS)
+            ).isoformat(),
+            "expires_at": (attempted_at + pd.Timedelta(seconds=ttl)).isoformat(),
+            "error": None,
+            "http_status": None,
+        }
+        prepared.append((sub, endpoint, delivery_payload, event))
+    # Persist every delivery ID before sending. A fast device can acknowledge
+    # immediately after the push service accepts the request.
+    with push_delivery_lock:
+        delivery_events = push_delivery_events_store.read([])
+        if not isinstance(delivery_events, list):
+            delivery_events = []
+        delivery_events.extend(item[3] for item in prepared)
+        push_delivery_events_store.write(delivery_events[-PUSH_EVENT_RETENTION:])
+    for sub, endpoint, delivery_payload, event in prepared:
         try:
             webpush(
-                subscription_info=sub,
-                data=json.dumps(payload),
+                subscription_info=_subscription_info(sub),
+                data=json.dumps(delivery_payload),
                 vapid_private_key=str(vapid_path),
                 vapid_claims={"sub":_vapid_subject},
                 timeout=10,
-                ttl=86_400,
+                ttl=ttl,
                 headers={"Urgency":"high"},
             )
-            sent += 1
+            accepted += 1
+            event["accepted_at"] = _utcnow().isoformat()
         except Exception as exc:
             logger.warning("Web Push delivery failed: %s", exc)
             failed += 1
             last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
-            if "404" in str(exc) or "410" in str(exc): stale.append(sub.get("endpoint"))
+            status = _push_error_status(exc)
+            event["failed_at"] = _utcnow().isoformat()
+            event["error"] = last_error
+            event["http_status"] = status
+            if status in (404, 410):
+                stale.append(endpoint)
+        with push_delivery_lock:
+            latest_events = push_delivery_events_store.read([])
+            for stored_event in latest_events:
+                if stored_event.get("delivery_id") == event["delivery_id"]:
+                    stored_event.update({
+                        "accepted_at": event.get("accepted_at"),
+                        "failed_at": event.get("failed_at"),
+                        "error": event.get("error"),
+                        "http_status": event.get("http_status"),
+                    })
+                    break
+            push_delivery_events_store.write(latest_events[-PUSH_EVENT_RETENTION:])
     if stale:
         with push_lock:
             push_subscriptions[:] = [s for s in push_subscriptions if s.get("endpoint") not in stale]
             _persist_subscriptions()
+    with push_delivery_lock:
+        delivery_events = push_delivery_events_store.read([])
+    counts = _delivery_counts(delivery_events, batch_id)
     push_delivery_store.write({
+        "batch_id": batch_id,
         "delivery_type": delivery_type,
         "attempted_at": attempted_at.isoformat(),
-        "attempted": len(targets),
-        "sent": sent,
-        "failed": failed,
+        **counts,
+        "sent": counts["accepted"],
         "error": last_error,
         "subscriptions": len(push_subscriptions),
     })
     logger.info(
-        "Web Push %s delivery: attempted=%s sent=%s failed=%s",
+        "Web Push %s submission: attempted=%s accepted=%s failed=%s",
         delivery_type,
         len(targets),
-        sent,
+        accepted,
         failed,
     )
-    return sent, failed
+    return accepted, failed
+
+
+def _retry_unacknowledged_pushes(now=None):
+    if webpush is None or PUSH_MAX_ACK_RETRIES == 0:
+        return 0
+    now = now or _utcnow()
+    retried = 0
+    stale = []
+    subscription_changed = False
+    with push_lock:
+        with push_delivery_lock:
+            events = push_delivery_events_store.read([])
+        if not isinstance(events, list):
+            return 0
+        subscriptions_by_hash = {
+            _endpoint_hash(item.get("endpoint")): item for item in push_subscriptions
+        }
+        changed_batches = set()
+        for event in events:
+            if (
+                event.get("delivery_type") != "automatic"
+                or event.get("received_at")
+            ):
+                continue
+            try:
+                retry_at = pd.Timestamp(event["next_retry_at"])
+                expires_at = pd.Timestamp(event["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            subscription = subscriptions_by_hash.get(event.get("endpoint_hash"))
+            if now >= expires_at:
+                if (
+                    event.get("accepted_at")
+                    and subscription
+                    and not event.get("ack_miss_recorded_at")
+                ):
+                    subscription["ack_miss_count"] = int(subscription.get("ack_miss_count") or 0) + 1
+                    if subscription["ack_miss_count"] >= 3:
+                        subscription["enabled"] = False
+                        subscription["status"] = "unreachable"
+                    event["ack_miss_recorded_at"] = now.isoformat()
+                    subscription_changed = True
+                    changed_batches.add(event.get("batch_id"))
+                continue
+            if (
+                now < retry_at
+                or int(event.get("retry_count") or 0) >= PUSH_MAX_ACK_RETRIES
+            ):
+                continue
+            if not subscription:
+                continue
+            payload = {
+                **(event.get("payload") or {}),
+                "delivery_id": event["delivery_id"],
+                "ack_token": _delivery_ack_token(event["delivery_id"], event["endpoint_hash"]),
+            }
+            remaining_ttl = max(1, int((expires_at - now).total_seconds()))
+            try:
+                webpush(
+                    subscription_info=_subscription_info(subscription),
+                    data=json.dumps(payload),
+                    vapid_private_key=str(vapid_path),
+                    vapid_claims={"sub": _vapid_subject},
+                    timeout=10,
+                    ttl=remaining_ttl,
+                    headers={"Urgency": "high"},
+                )
+                event["retry_count"] = int(event.get("retry_count") or 0) + 1
+                event["last_retry_at"] = now.isoformat()
+                event["accepted_at"] = event.get("accepted_at") or now.isoformat()
+                event["failed_at"] = None
+                event["error"] = None
+                event["http_status"] = None
+                event["next_retry_at"] = (
+                    now
+                    + pd.Timedelta(
+                        seconds=PUSH_ACK_RETRY_SECONDS * (2 ** event["retry_count"])
+                    )
+                ).isoformat()
+                retried += 1
+            except Exception as exc:
+                status = _push_error_status(exc)
+                event["retry_count"] = int(event.get("retry_count") or 0) + 1
+                event["last_retry_at"] = now.isoformat()
+                event["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                event["http_status"] = status
+                if status in (404, 410):
+                    event["failed_at"] = now.isoformat()
+                    stale.append(subscription.get("endpoint"))
+            changed_batches.add(event.get("batch_id"))
+        if stale:
+            push_subscriptions[:] = [
+                item for item in push_subscriptions if item.get("endpoint") not in stale
+            ]
+            subscription_changed = True
+        if subscription_changed:
+            _persist_subscriptions()
+        if retried or stale or subscription_changed:
+            with push_delivery_lock:
+                push_delivery_events_store.write(events[-PUSH_EVENT_RETENTION:])
+                for batch_id in changed_batches:
+                    if batch_id:
+                        _update_last_delivery_from_events(events, batch_id)
+    return retried
+
+
+def _subscription_counts():
+    with push_lock:
+        stored = len(push_subscriptions)
+        enabled = sum(item.get("enabled") is not False for item in push_subscriptions)
+        verified = sum(bool(item.get("last_ack_at")) for item in push_subscriptions)
+    return {"stored": stored, "enabled": enabled, "verified": verified}
+
+
+def _admin_request_authorized():
+    configured = os.getenv("PUSH_ADMIN_TOKEN") or os.getenv("ADMIN_API_TOKEN")
+    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    return bool(configured and supplied and hmac.compare_digest(supplied, configured))
+
+
+def _ack_delivery(delivery_id, token, status):
+    if status not in ("received", "notification_created"):
+        return False, "invalid acknowledgement status"
+    now = _utcnow()
+    with push_lock:
+        with push_delivery_lock:
+            events = push_delivery_events_store.read([])
+        if not isinstance(events, list):
+            return False, "delivery not found"
+        event = next(
+            (item for item in events if item.get("delivery_id") == delivery_id),
+            None,
+        )
+        if not event:
+            return False, "delivery not found"
+        expected = _delivery_ack_token(delivery_id, event.get("endpoint_hash"))
+        if not token or not hmac.compare_digest(str(token), expected):
+            return False, "unauthorized"
+        field = "received_at" if status == "received" else "notification_created_at"
+        event[field] = event.get(field) or now.isoformat()
+        if status == "notification_created":
+            event["received_at"] = event.get("received_at") or now.isoformat()
+        for subscription in push_subscriptions:
+            if _endpoint_hash(subscription.get("endpoint")) == event.get("endpoint_hash"):
+                subscription["last_ack_at"] = now.isoformat()
+                subscription["ack_miss_count"] = 0
+                subscription["enabled"] = True
+                subscription["status"] = "verified"
+                break
+        _persist_subscriptions()
+        with push_delivery_lock:
+            push_delivery_events_store.write(events[-PUSH_EVENT_RETENTION:])
+            _update_last_delivery_from_events(events, event.get("batch_id"))
+    return True, None
 
 
 def _live_loop():
@@ -360,6 +768,10 @@ def _live_loop():
                 "key": previous_key,
                 "sent_at": last_sent.isoformat() if last_sent is not None else None,
             })
+            try:
+                _retry_unacknowledged_pushes(now)
+            except Exception as exc:
+                logger.warning("Web Push acknowledgement retry failed: %s", exc)
             stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
             feed_status = "degraded" if stale_exchanges else "live"
             next_state = {
@@ -506,6 +918,7 @@ _cached_png_32 = _generate_png_icon(32, 32)
 @app.get("/site.webmanifest")
 def web_manifest():
     return {
+        "id": "/",
         "name": "BTC Structure Flow",
         "short_name": "BTC Flow",
         "start_url": "/",
@@ -583,6 +996,7 @@ def health():
     collectors = trade_store.collector_status(pd.Timestamp.now(tz="UTC"), COLLECTOR_STALE_SECONDS)
     stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
     push_delivery = push_delivery_store.read({})
+    push_counts = _subscription_counts()
     return jsonify({
         "status": "degraded" if stale_exchanges else "ok",
         "service":"btc-structure-flow-predictor",
@@ -596,7 +1010,10 @@ def health():
         "live_thread_alive":bool(live_thread and live_thread.is_alive()),
         "push":{
             "supported":webpush is not None,
-            "subscriptions":len(push_subscriptions),
+            "subscriptions":push_counts["stored"],
+            "stored_subscriptions":push_counts["stored"],
+            "enabled_subscriptions":push_counts["enabled"],
+            "verified_subscriptions":push_counts["verified"],
             "last_delivery":push_delivery,
         },
         "trade_store":store_stats,
@@ -613,12 +1030,16 @@ def api_live():
     if state.get("prediction"):
         state["prediction"] = dict(state["prediction"]); state["prediction"]["timestamp"] = str(state["prediction"]["timestamp"])
     push_delivery = push_delivery_store.read({})
+    push_counts = _subscription_counts()
     return jsonify({
         "paper_only": True,
         **state,
         "push": {
             "supported": webpush is not None,
-            "subscriptions": len(push_subscriptions),
+            "subscriptions": push_counts["stored"],
+            "stored_subscriptions": push_counts["stored"],
+            "enabled_subscriptions": push_counts["enabled"],
+            "verified_subscriptions": push_counts["verified"],
             "last_delivery": push_delivery,
         },
     })
@@ -664,18 +1085,35 @@ self.addEventListener('push', event => {{
     body: data.body || 'Prediction update',
     icon: iconUrl,
     tag: data.event_id ? `btc-predictor-${{data.event_id}}` : `btc-predictor-${{Date.now()}}`,
-    renotify: true,
     data: {{ url: data.url || '/' }},
   }};
-  event.waitUntil(
-    self.registration.showNotification(data.title || 'BTC Predictor', options).catch(err => {{
-      // Fallback with minimal options if iOS rejects extended properties
-      return self.registration.showNotification(data.title || 'BTC Predictor', {{
+  const acknowledge = status => {{
+    if (!data.delivery_id || !data.ack_token) return Promise.resolve();
+    return fetch('/push/ack', {{
+      method: 'POST',
+      headers: {{ 'content-type': 'application/json' }},
+      body: JSON.stringify({{
+        delivery_id: data.delivery_id,
+        ack_token: data.ack_token,
+        status,
+      }}),
+    }}).catch(() => undefined);
+  }};
+  event.waitUntil((async () => {{
+    const receivedAcknowledgement = acknowledge('received');
+    try {{
+      await self.registration.showNotification(data.title || 'BTC Predictor', options);
+    }} catch (_) {{
+      await self.registration.showNotification(data.title || 'BTC Predictor', {{
         body: data.body || 'Prediction update',
         icon: iconUrl,
       }});
-    }})
-  );
+    }}
+    await Promise.allSettled([
+      receivedAcknowledgement,
+      acknowledge('notification_created'),
+    ]);
+  }})());
 }});
 self.addEventListener('notificationclick', event => {{
   event.notification.close();
@@ -692,7 +1130,11 @@ self.addEventListener('pushsubscriptionchange', event => {{
   }}).then(subscription => fetch('/push/subscribe', {{
     method: 'POST',
     headers: {{'content-type': 'application/json'}},
-    body: JSON.stringify(subscription),
+    body: JSON.stringify({{
+      ...subscription.toJSON(),
+      previous_endpoint: event.oldSubscription ? event.oldSubscription.endpoint : null,
+      app_mode: 'standalone',
+    }}),
   }})));
 }});
 """
@@ -700,18 +1142,48 @@ self.addEventListener('pushsubscriptionchange', event => {{
 
 
 @app.get("/push/config")
-def push_config(): return jsonify({"supported":webpush is not None,"vapid_public_key":_vapid_public_key})
+def push_config():
+    return jsonify({
+        "supported": webpush is not None,
+        "vapid_public_key": _vapid_public_key,
+    })
 
 
 @app.post("/push/subscribe")
 def push_subscribe():
     data = request.get_json(silent=True) or {}
-    if not data.get("endpoint") or not data.get("keys"): return jsonify({"error":"invalid subscription"}), 400
+    validation_error = _validate_subscription(data)
+    if validation_error:
+        return jsonify({"error": validation_error}), 400
+    previous_endpoint = str(data.get("previous_endpoint") or "")
     with push_lock:
-        _upsert_subscription(push_subscriptions, data)
+        endpoint = data["endpoint"]
+        installation_id = data.get("installation_id")
+        known = any(
+            item.get("endpoint") == endpoint
+            or (installation_id and item.get("installation_id") == installation_id)
+            for item in push_subscriptions
+        )
+        if not known and len(push_subscriptions) >= PUSH_MAX_SUBSCRIPTIONS:
+            return jsonify({"error": "subscription capacity reached"}), 409
+        if (
+            previous_endpoint
+            and previous_endpoint != endpoint
+            and _is_allowed_push_endpoint(previous_endpoint)
+        ):
+            _remove_subscription(push_subscriptions, previous_endpoint)
+        created = _upsert_subscription(push_subscriptions, data)
         _persist_subscriptions()
-    token = hmac.new(_push_secret, data["endpoint"].encode(), hashlib.sha256).hexdigest()
-    return jsonify({"ok":True,"subscriptions":len(push_subscriptions),"test_token":token})
+        stored = len(push_subscriptions)
+    token = _issue_endpoint_token(data["endpoint"])
+    return jsonify({
+        "ok": True,
+        "created": created,
+        "stored_subscriptions": stored,
+        "subscriptions": stored,
+        "test_token": token,
+        "test_token_expires_in": 900,
+    })
 
 
 @app.post("/push/unsubscribe")
@@ -719,8 +1191,7 @@ def push_unsubscribe():
     data = request.get_json(silent=True) or {}
     endpoint = data.get("endpoint", "")
     token = data.get("test_token", "")
-    expected = hmac.new(_push_secret, endpoint.encode(), hashlib.sha256).hexdigest()
-    if not endpoint or not hmac.compare_digest(token, expected):
+    if not endpoint or not _verify_endpoint_token(endpoint, token):
         return jsonify({"error":"unauthorized"}), 401
     with push_lock:
         removed = _remove_subscription(push_subscriptions, endpoint)
@@ -732,28 +1203,69 @@ def push_unsubscribe():
 @app.post("/push/test")
 def push_test():
     data = request.get_json(silent=True) or {}; endpoint, token = data.get("endpoint", ""), data.get("test_token", "")
-    expected = hmac.new(_push_secret, endpoint.encode(), hashlib.sha256).hexdigest()
-    if not endpoint or not hmac.compare_digest(token, expected): return jsonify({"error":"unauthorized"}), 401
+    if not endpoint or not _verify_endpoint_token(endpoint, token): return jsonify({"error":"unauthorized"}), 401
     if webpush is None: return jsonify({"error":"pywebpush unavailable"}), 503
     with push_lock: target = [s for s in push_subscriptions if s.get("endpoint") == endpoint]
-    sent, failed = _send_push(
+    accepted, failed = _send_push(
         {"title":"BTC Predictor test","body":"Web Push is connected and delivering notifications.","url":"/","event_id":"test"},
         target,
         delivery_type="test",
     )
-    return jsonify({"ok":sent > 0,"sent":sent,"failed":failed})
+    return jsonify({"ok":accepted > 0,"accepted":accepted,"sent":accepted,"failed":failed})
+
+
+@app.post("/push/ack")
+def push_ack():
+    data = request.get_json(silent=True) or {}
+    ok, error = _ack_delivery(
+        str(data.get("delivery_id") or ""),
+        str(data.get("ack_token") or ""),
+        str(data.get("status") or ""),
+    )
+    if ok:
+        return jsonify({"ok": True})
+    status = 401 if error == "unauthorized" else 400
+    return jsonify({"ok": False, "error": error}), status
 
 
 @app.post("/push/broadcast-test")
 def push_broadcast_test():
+    if not _admin_request_authorized():
+        return jsonify({"error": "unauthorized"}), 401
     if webpush is None: return jsonify({"error":"pywebpush unavailable"}), 503
-    import time
-    sent, failed = _send_push(
+    accepted, failed = _send_push(
         {"title":"BTC Predictor test","body":"Live push notification test — verifying background delivery!","url":"/","event_id":f"broadcast-{int(time.time())}"},
         subscriptions=None,
         delivery_type="test",
     )
-    return jsonify({"ok":sent > 0,"sent":sent,"failed":failed})
+    return jsonify({"ok":accepted > 0,"accepted":accepted,"sent":accepted,"failed":failed})
+
+
+@app.get("/push/admin/status")
+def push_admin_status():
+    if not _admin_request_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    with push_lock:
+        subscriptions = [
+            {
+                "endpoint_hash": _endpoint_hash(item.get("endpoint")),
+                "host": urlparse(item.get("endpoint") or "").hostname,
+                "installation_id": item.get("installation_id"),
+                "created_at": item.get("created_at"),
+                "last_seen_at": item.get("last_seen_at"),
+                "last_ack_at": item.get("last_ack_at"),
+                "ack_miss_count": int(item.get("ack_miss_count") or 0),
+                "enabled": item.get("enabled") is not False,
+                "status": item.get("status") or "legacy",
+                "app_mode": item.get("app_mode"),
+                "platform": item.get("platform"),
+            }
+            for item in push_subscriptions
+        ]
+    return jsonify({
+        "subscriptions": subscriptions,
+        "last_delivery": push_delivery_store.read({}),
+    })
 
 
 @app.post("/predict")

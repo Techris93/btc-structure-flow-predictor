@@ -693,6 +693,35 @@
         );
       }
 
+      let installationIdFallback = null;
+      function installationId() {
+        try {
+          const existing = localStorage.getItem("btc-flow-installation-id");
+          if (existing) return existing;
+          const created = crypto.randomUUID().replace(/[^a-zA-Z0-9-_]/g, "");
+          localStorage.setItem("btc-flow-installation-id", created);
+          return created;
+        } catch (_) {
+          installationIdFallback ||= crypto.randomUUID().replace(/[^a-zA-Z0-9-_]/g, "");
+          return installationIdFallback;
+        }
+      }
+
+      function subscriptionPayload(subscription, extra = {}) {
+        const standalone =
+          window.matchMedia("(display-mode: standalone)").matches ||
+          window.navigator.standalone === true;
+        return {
+          ...subscription.toJSON(),
+          installation_id: installationId(),
+          user_agent: navigator.userAgent,
+          platform: navigator.platform || null,
+          app_mode: standalone ? "standalone" : "browser",
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+          ...extra,
+        };
+      }
+
       function render(s) {
         const x = s.prediction || {};
         const paper = s.paper || {};
@@ -755,15 +784,26 @@
         const push = s.push || {};
         const lastDelivery = push.last_delivery || {};
         if (lastDelivery.attempted_at) {
+          const attempted = Number(lastDelivery.attempted || 0);
+          const accepted = Number(lastDelivery.accepted ?? lastDelivery.sent ?? 0);
+          const received = Number(lastDelivery.received || 0);
+          const created = Number(lastDelivery.notification_created || 0);
+          let deliveryState = "no targets";
+          if (created > 0) {
+            deliveryState = `${created}/${attempted} notification created`;
+          } else if (received > 0) {
+            deliveryState = `${received}/${attempted} received by device`;
+          } else if (accepted > 0) {
+            deliveryState = `${accepted}/${attempted} accepted · awaiting device`;
+          } else if (lastDelivery.failed > 0) {
+            deliveryState = "failed";
+          }
           const deliveryLabel =
             (lastDelivery.delivery_type === "test" ? "Test" : "Auto") +
             " · " +
             fmtDate(lastDelivery.attempted_at) +
-            (lastDelivery.sent > 0
-              ? " · delivered"
-              : lastDelivery.failed > 0
-                ? " · failed"
-                : " · no targets");
+            " · " +
+            deliveryState;
           setText("lastpush", deliveryLabel, "mono tone-muted");
         } else {
           setText("lastpush", "No delivery yet");
@@ -809,17 +849,35 @@
           await reg.update();
           let sub = reg ? await reg.pushManager.getSubscription() : null;
           if (sub && !subscriptionUsesKey(sub, c.vapid_public_key)) {
+            const retired = await (
+              await fetch("/push/subscribe", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(subscriptionPayload(sub)),
+              })
+            ).json();
+            if (retired.ok) {
+              await fetch("/push/unsubscribe", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  endpoint: sub.endpoint,
+                  test_token: retired.test_token,
+                }),
+              });
+            }
             await sub.unsubscribe();
             sub = null;
           }
           // Keep the durable server copy in sync whenever the browser already
           // has an active subscription. This recovers after deploys/toggles.
           if (sub) {
-            await fetch("/push/subscribe", {
+            const synced = await fetch("/push/subscribe", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify(sub),
+              body: JSON.stringify(subscriptionPayload(sub)),
             });
+            if (!synced.ok) throw Error("Unable to synchronize push subscription");
           }
           b.textContent = sub ? "Pause notifications" : "Enable push notifications";
           b.title = sub
@@ -851,12 +909,11 @@
               await fetch("/push/subscribe", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify(sub),
+                body: JSON.stringify(subscriptionPayload(sub)),
               })
             ).json();
             if (!registered.ok) throw Error(registered.error || "Unable to prepare pause");
             const endpoint = sub.endpoint;
-            await sub.unsubscribe();
             const paused = await (
               await fetch("/push/unsubscribe", {
                 method: "POST",
@@ -868,6 +925,7 @@
               })
             ).json();
             if (!paused.ok) throw Error(paused.error || "Unable to pause notifications");
+            await sub.unsubscribe();
             b.textContent = "Enable push notifications";
             b.title = "Click to enable push notifications";
             return;
@@ -889,7 +947,7 @@
             await fetch("/push/subscribe", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify(sub),
+              body: JSON.stringify(subscriptionPayload(sub)),
             })
           ).json();
           const test = await (
@@ -902,7 +960,7 @@
               }),
             })
           ).json();
-          if (!test.sent) {
+          if (!test.accepted) {
             b.textContent = "Enable push notifications";
             b.title = "Push registered, but the delivery test failed. Click to retry.";
             $("reason").textContent = "Push registered, but the delivery test failed";
