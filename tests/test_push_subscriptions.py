@@ -116,7 +116,7 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "window.pushManager || registration.pushManager" in dashboard
     assert 'localStorage.getItem("btc-flow-installation-id")' in dashboard
     assert "const decision = push.last_notification_decision || {};" in dashboard
-    assert "Last notification event" in dashboard
+    assert "Last push" in dashboard
     assert "display not confirmed" not in dashboard
     assert "Apple accepted" not in dashboard
     assert 'lastDelivery.delivery_type === "test"' not in dashboard
