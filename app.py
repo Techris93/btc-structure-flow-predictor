@@ -61,6 +61,9 @@ PUSH_ALLOWED_HOST_SUFFIXES = tuple(
     if item.strip()
 )
 PUSH_MAX_SUBSCRIPTIONS = max(1, int(os.getenv("PUSH_MAX_SUBSCRIPTIONS", "32")))
+PUSH_SINGLE_INSTALLATION = os.getenv("PUSH_SINGLE_INSTALLATION", "1").lower() in (
+    "1", "true", "yes", "on"
+)
 PUSH_ACK_RETRY_SECONDS = max(30, int(os.getenv("PUSH_ACK_RETRY_SECONDS", "90")))
 PUSH_MAX_ACK_RETRIES = max(0, min(3, int(os.getenv("PUSH_MAX_ACK_RETRIES", "2"))))
 PUSH_EVENT_RETENTION = max(100, int(os.getenv("PUSH_EVENT_RETENTION", "500")))
@@ -224,9 +227,9 @@ def _upsert_subscription(subscriptions, subscription, now=None):
         existing = subscriptions[exact_index]
         normalized["created_at"] = existing.get("created_at") or normalized["created_at"]
         normalized["last_ack_at"] = existing.get("last_ack_at")
-        normalized["ack_miss_count"] = 0
-        normalized["enabled"] = True
-        normalized["status"] = "verified" if normalized["last_ack_at"] else "unverified"
+        normalized["ack_miss_count"] = int(existing.get("ack_miss_count") or 0)
+        normalized["enabled"] = existing.get("enabled") is not False
+        normalized["status"] = existing.get("status") or normalized["status"]
         subscriptions[exact_index] = normalized
         for index in reversed(installation_indexes):
             if index != exact_index:
@@ -1010,6 +1013,7 @@ def health():
         "live_thread_alive":bool(live_thread and live_thread.is_alive()),
         "push":{
             "supported":webpush is not None,
+            "single_installation":PUSH_SINGLE_INSTALLATION,
             "subscriptions":push_counts["stored"],
             "stored_subscriptions":push_counts["stored"],
             "enabled_subscriptions":push_counts["enabled"],
@@ -1036,6 +1040,7 @@ def api_live():
         **state,
         "push": {
             "supported": webpush is not None,
+            "single_installation": PUSH_SINGLE_INSTALLATION,
             "subscriptions": push_counts["stored"],
             "stored_subscriptions": push_counts["stored"],
             "enabled_subscriptions": push_counts["enabled"],
@@ -1159,6 +1164,10 @@ def push_subscribe():
     with push_lock:
         endpoint = data["endpoint"]
         installation_id = data.get("installation_id")
+        if PUSH_SINGLE_INSTALLATION:
+            push_subscriptions[:] = [
+                item for item in push_subscriptions if item.get("endpoint") == endpoint
+            ]
         known = any(
             item.get("endpoint") == endpoint
             or (installation_id and item.get("installation_id") == installation_id)
@@ -1175,12 +1184,20 @@ def push_subscribe():
         created = _upsert_subscription(push_subscriptions, data)
         _persist_subscriptions()
         stored = len(push_subscriptions)
+        current = next(
+            (item for item in push_subscriptions if item.get("endpoint") == endpoint),
+            {},
+        )
     token = _issue_endpoint_token(data["endpoint"])
     return jsonify({
         "ok": True,
         "created": created,
         "stored_subscriptions": stored,
         "subscriptions": stored,
+        "current_verified": bool(current.get("last_ack_at")),
+        "current_status": current.get("status") or "unverified",
+        "current_ack_miss_count": int(current.get("ack_miss_count") or 0),
+        "single_installation": PUSH_SINGLE_INSTALLATION,
         "test_token": token,
         "test_token_expires_in": 900,
     })

@@ -102,7 +102,8 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "await reg.update()" in dashboard
     assert 'fetch("/push/subscribe"' in dashboard
     assert 'id="lastpush"' in dashboard
-    assert 'b.textContent = sub ? "Pause notifications" : "Enable push notifications"' in dashboard
+    assert '"Repair notifications"' in dashboard
+    assert '"Pause notifications"' in dashboard
     assert "async function togglePush()" in dashboard
     assert 'fetch("/push/unsubscribe"' in dashboard
     assert "syncPushButton();" in dashboard
@@ -138,6 +139,24 @@ def test_subscribe_rejects_non_push_endpoint():
 
     assert response.status_code == 400
     assert response.get_json()["error"] == "unsupported push endpoint"
+
+
+def test_single_installation_registration_removes_legacy_endpoints(monkeypatch, tmp_path):
+    current = _subscription("https://web.push.apple.com/current")
+    legacy = _subscription("https://web.push.apple.com/legacy")
+    legacy["installation_id"] = "legacy-installation"
+    monkeypatch.setattr(web_app, "push_subscriptions", [legacy])
+    monkeypatch.setattr(web_app, "subscription_store", web_app.JsonStore(tmp_path / "subscriptions.json"))
+    monkeypatch.setattr(web_app, "PUSH_SINGLE_INSTALLATION", True)
+
+    response = web_app.app.test_client().post("/push/subscribe", json=current)
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["single_installation"] is True
+    assert payload["subscriptions"] == 1
+    assert payload["current_verified"] is False
+    assert [item["endpoint"] for item in web_app.push_subscriptions] == [current["endpoint"]]
 
 
 def test_known_push_service_hosts_are_allowed():

@@ -694,6 +694,7 @@
       }
 
       let installationIdFallback = null;
+      let pushNeedsRepair = false;
       function installationId() {
         try {
           const existing = localStorage.getItem("btc-flow-installation-id");
@@ -878,10 +879,20 @@
               body: JSON.stringify(subscriptionPayload(sub)),
             });
             if (!synced.ok) throw Error("Unable to synchronize push subscription");
+            const syncedState = await synced.json();
+            pushNeedsRepair = !syncedState.current_verified;
+          } else {
+            pushNeedsRepair = false;
           }
-          b.textContent = sub ? "Pause notifications" : "Enable push notifications";
+          b.textContent = sub
+            ? pushNeedsRepair
+              ? "Repair notifications"
+              : "Pause notifications"
+            : "Enable push notifications";
           b.title = sub
-            ? "Click to pause push notifications"
+            ? pushNeedsRepair
+              ? "Click to renew the device push endpoint and verify delivery"
+              : "Click to pause push notifications"
             : "Click to enable push notifications";
         } catch (_) {
           b.textContent = "Enable push notifications";
@@ -926,12 +937,19 @@
             ).json();
             if (!paused.ok) throw Error(paused.error || "Unable to pause notifications");
             await sub.unsubscribe();
-            b.textContent = "Enable push notifications";
-            b.title = "Click to enable push notifications";
-            return;
+            sub = null;
+            if (!pushNeedsRepair) {
+              pushNeedsRepair = false;
+              b.textContent = "Enable push notifications";
+              b.title = "Click to enable push notifications";
+              return;
+            }
           }
 
-          const permission = await Notification.requestPermission();
+          const permission =
+            Notification.permission === "granted"
+              ? "granted"
+              : await Notification.requestPermission();
           if (permission !== "granted") throw Error("Browser permission was not granted");
           if (sub && !subscriptionUsesKey(sub, c.vapid_public_key)) {
             await sub.unsubscribe();
@@ -966,8 +984,9 @@
             $("reason").textContent = "Push registered, but the delivery test failed";
             return;
           }
-          b.textContent = "Pause notifications";
-          b.title = "Click to pause push notifications";
+          b.textContent = "Verifying notification…";
+          b.title = "Waiting for this device to acknowledge the test notification";
+          setTimeout(syncPushButton, 3000);
         } catch (e) {
           b.textContent = "Enable push notifications";
           b.title = "Click to enable push notifications";
