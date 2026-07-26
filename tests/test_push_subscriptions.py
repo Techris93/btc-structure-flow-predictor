@@ -92,6 +92,11 @@ def test_webpush_receives_persistent_pem_file_path(monkeypatch):
     assert captured["ttl"] == 900
     assert captured["timeout"] == 10
     assert captured["headers"] == {"Urgency": "high"}
+    payload = json.loads(captured["data"])
+    assert payload["web_push"] == 8030
+    assert payload["notification"]["title"] == "test"
+    assert payload["notification"]["navigate"].startswith("https://")
+    assert payload["notification"]["silent"] is False
 
 
 def test_dashboard_restores_enabled_push_state_after_reload():
@@ -108,6 +113,7 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert 'fetch("/push/unsubscribe"' in dashboard
     assert "syncPushButton();" in dashboard
     assert "subscriptionPayload(sub)" in dashboard
+    assert "window.pushManager || registration.pushManager" in dashboard
     assert 'localStorage.getItem("btc-flow-installation-id")' in dashboard
     assert "accepted · awaiting device" in dashboard
     assert '" · delivered"' not in dashboard
@@ -229,6 +235,7 @@ def test_service_worker_supports_background_subscription_rotation():
     assert "acknowledge('received')" in script
     assert "acknowledge('notification_created')" in script
     assert "previous_endpoint" in script
+    assert "const proposed = data.notification || {}" in script
 
 
 def test_delivery_record_exists_before_fast_device_ack(monkeypatch, tmp_path):

@@ -693,8 +693,13 @@
         );
       }
 
+      function pushManagerFor(registration) {
+        return window.pushManager || registration.pushManager;
+      }
+
       let installationIdFallback = null;
       let pushNeedsRepair = false;
+      let verificationAttempted = false;
       function installationId() {
         try {
           const existing = localStorage.getItem("btc-flow-installation-id");
@@ -789,8 +794,14 @@
           const accepted = Number(lastDelivery.accepted ?? lastDelivery.sent ?? 0);
           const received = Number(lastDelivery.received || 0);
           const created = Number(lastDelivery.notification_created || 0);
+          const currentStored = Number(push.stored_subscriptions || 0);
+          const batchSubscriptions = Number(lastDelivery.subscriptions || 0);
+          const previousSubscriptionGeneration =
+            batchSubscriptions > 0 && batchSubscriptions !== currentStored;
           let deliveryState = "no targets";
-          if (created > 0) {
+          if (previousSubscriptionGeneration) {
+            deliveryState = `previous endpoints · current device awaiting verification`;
+          } else if (created > 0) {
             deliveryState = `${created}/${attempted} notification created`;
           } else if (received > 0) {
             deliveryState = `${received}/${attempted} received by device`;
@@ -848,7 +859,8 @@
           const c = await (await fetch("/push/config")).json();
           const reg = await navigator.serviceWorker.register("/sw.js");
           await reg.update();
-          let sub = reg ? await reg.pushManager.getSubscription() : null;
+          const manager = pushManagerFor(reg);
+          let sub = manager ? await manager.getSubscription() : null;
           if (sub && !subscriptionUsesKey(sub, c.vapid_public_key)) {
             const retired = await (
               await fetch("/push/subscribe", {
@@ -881,6 +893,25 @@
             if (!synced.ok) throw Error("Unable to synchronize push subscription");
             const syncedState = await synced.json();
             pushNeedsRepair = !syncedState.current_verified;
+            if (pushNeedsRepair && !verificationAttempted) {
+              verificationAttempted = true;
+              const verification = await (
+                await fetch("/push/test", {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({
+                    endpoint: sub.endpoint,
+                    test_token: syncedState.test_token,
+                  }),
+                })
+              ).json();
+              if (verification.accepted) {
+                b.textContent = "Verifying device…";
+                b.title = "A verification notification was sent to this device";
+                setTimeout(syncPushButton, 4000);
+                return;
+              }
+            }
           } else {
             pushNeedsRepair = false;
           }
@@ -911,7 +942,8 @@
         try {
           const c = await (await fetch("/push/config")).json();
           const reg = await navigator.serviceWorker.register("/sw.js");
-          let sub = await reg.pushManager.getSubscription();
+          const manager = pushManagerFor(reg);
+          let sub = await manager.getSubscription();
 
           if (sub) {
             // Mint a short-lived auth token from the active subscription, then
@@ -956,7 +988,7 @@
             sub = null;
           }
           if (!sub) {
-            sub = await reg.pushManager.subscribe({
+            sub = await manager.subscribe({
               userVisibleOnly: true,
               applicationServerKey: c.vapid_public_key,
             });

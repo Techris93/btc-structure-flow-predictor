@@ -67,6 +67,9 @@ PUSH_SINGLE_INSTALLATION = os.getenv("PUSH_SINGLE_INSTALLATION", "1").lower() in
 PUSH_ACK_RETRY_SECONDS = max(30, int(os.getenv("PUSH_ACK_RETRY_SECONDS", "90")))
 PUSH_MAX_ACK_RETRIES = max(0, min(3, int(os.getenv("PUSH_MAX_ACK_RETRIES", "2"))))
 PUSH_EVENT_RETENTION = max(100, int(os.getenv("PUSH_EVENT_RETENTION", "500")))
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL", "https://btc-structure-flow-predictor.onrender.com"
+).rstrip("/")
 
 vapid_path = data_dir / "vapid_private.pem"
 if vapid_path.exists():
@@ -319,6 +322,26 @@ def _delivery_ack_token(delivery_id, endpoint_fingerprint):
     return hmac.new(_push_secret, message, hashlib.sha256).hexdigest()
 
 
+def _declarative_push_payload(payload, delivery_id, ack_token):
+    navigate = str(payload.get("url") or "/")
+    if navigate.startswith("/"):
+        navigate = f"{PUBLIC_BASE_URL}{navigate}"
+    return {
+        "web_push": 8030,
+        "notification": {
+            "title": str(payload.get("title") or "BTC Predictor"),
+            "body": str(payload.get("body") or "Prediction update"),
+            "navigate": navigate,
+            "lang": "en-US",
+            "dir": "ltr",
+            "silent": False,
+        },
+        "event_id": payload.get("event_id"),
+        "delivery_id": delivery_id,
+        "ack_token": ack_token,
+    }
+
+
 def _push_error_status(exc):
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
@@ -383,11 +406,7 @@ def _send_push(payload, subscriptions=None, delivery_type="automatic"):
         endpoint_fingerprint = _endpoint_hash(endpoint)
         delivery_id = uuid.uuid4().hex
         ack_token = _delivery_ack_token(delivery_id, endpoint_fingerprint)
-        delivery_payload = {
-            **payload,
-            "delivery_id": delivery_id,
-            "ack_token": ack_token,
-        }
+        delivery_payload = _declarative_push_payload(payload, delivery_id, ack_token)
         event = {
             "delivery_id": delivery_id,
             "batch_id": batch_id,
@@ -527,11 +546,11 @@ def _retry_unacknowledged_pushes(now=None):
                 continue
             if not subscription:
                 continue
-            payload = {
-                **(event.get("payload") or {}),
-                "delivery_id": event["delivery_id"],
-                "ack_token": _delivery_ack_token(event["delivery_id"], event["endpoint_hash"]),
-            }
+            payload = _declarative_push_payload(
+                event.get("payload") or {},
+                event["delivery_id"],
+                _delivery_ack_token(event["delivery_id"], event["endpoint_hash"]),
+            )
             remaining_ttl = max(1, int((expires_at - now).total_seconds()))
             try:
                 webpush(
@@ -1083,14 +1102,18 @@ self.addEventListener('push', event => {{
   try {{
     data = event.data ? event.data.json() : {{}};
   }} catch (_) {{
-    data = {{ title: 'BTC Predictor', body: 'New prediction update' }};
+    data = {{ notification: {{ title: 'BTC Predictor', body: 'New prediction update', navigate: '/' }} }};
   }}
+  const proposed = data.notification || {{}};
+  const title = proposed.title || data.title || 'BTC Predictor';
+  const body = proposed.body || data.body || 'Prediction update';
+  const navigate = proposed.navigate || data.url || '/';
   const iconUrl = new URL('/apple-touch-icon.png', self.location.origin).href;
   const options = {{
-    body: data.body || 'Prediction update',
+    body,
     icon: iconUrl,
     tag: data.event_id ? `btc-predictor-${{data.event_id}}` : `btc-predictor-${{Date.now()}}`,
-    data: {{ url: data.url || '/' }},
+    data: {{ url: navigate }},
   }};
   const acknowledge = status => {{
     if (!data.delivery_id || !data.ack_token) return Promise.resolve();
@@ -1107,10 +1130,10 @@ self.addEventListener('push', event => {{
   event.waitUntil((async () => {{
     const receivedAcknowledgement = acknowledge('received');
     try {{
-      await self.registration.showNotification(data.title || 'BTC Predictor', options);
+      await self.registration.showNotification(title, options);
     }} catch (_) {{
-      await self.registration.showNotification(data.title || 'BTC Predictor', {{
-        body: data.body || 'Prediction update',
+      await self.registration.showNotification(title, {{
+        body,
         icon: iconUrl,
       }});
     }}
