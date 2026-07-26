@@ -905,13 +905,14 @@ def start_live_boot_supervisor():
     return live_boot_thread
 
 
+removed_delivery_events = _prune_delivery_history_to_current_subscriptions()
+if removed_delivery_events:
+    logger.info(
+        "Removed %s delivery records for retired push endpoints",
+        removed_delivery_events,
+    )
+
 if os.getenv("START_LIVE_LOOP_ON_BOOT", "0").lower() in ("1", "true", "yes", "on"):
-    removed_delivery_events = _prune_delivery_history_to_current_subscriptions()
-    if removed_delivery_events:
-        logger.info(
-            "Removed %s delivery records for retired push endpoints",
-            removed_delivery_events,
-        )
     start_live_boot_supervisor()
 
 
