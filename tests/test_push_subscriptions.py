@@ -115,8 +115,9 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "subscriptionPayload(sub)" in dashboard
     assert "window.pushManager || registration.pushManager" in dashboard
     assert 'localStorage.getItem("btc-flow-installation-id")' in dashboard
-    assert "const lastDelivery = push.last_automatic_delivery || {};" in dashboard
-    assert "No automatic notification has targeted the current device yet" in dashboard
+    assert "const decision = push.last_notification_decision || {};" in dashboard
+    assert "Last notification event" in dashboard
+    assert "No notification decision recorded yet" in dashboard
     assert "accepted by Apple · display not confirmed" in dashboard
     assert 'lastDelivery.delivery_type === "test"' not in dashboard
     assert '" · delivered"' not in dashboard
@@ -160,7 +161,7 @@ def test_latest_delivery_summaries_separate_automatic_and_test(monkeypatch, tmp_
     assert test["delivery_type"] == "test"
 
 
-def test_retired_endpoint_delivery_history_is_removed(monkeypatch, tmp_path):
+def test_subscription_sync_preserves_retired_endpoint_delivery_history(monkeypatch, tmp_path):
     current = _subscription("https://web.push.apple.com/current")
     retired = _subscription("https://web.push.apple.com/retired")
     events_store = web_app.JsonStore(tmp_path / "events.json")
@@ -176,15 +177,24 @@ def test_retired_endpoint_delivery_history_is_removed(monkeypatch, tmp_path):
     ])
     monkeypatch.setattr(web_app, "push_subscriptions", [current])
     monkeypatch.setattr(web_app, "push_delivery_events_store", events_store)
+    monkeypatch.setattr(
+        web_app,
+        "subscription_store",
+        web_app.JsonStore(tmp_path / "subscriptions.json"),
+    )
     monkeypatch.setattr(web_app, "PUSH_SINGLE_INSTALLATION", True)
 
-    assert web_app._prune_delivery_history_to_current_subscriptions() == 1
-    assert [event["delivery_id"] for event in events_store.read([])] == ["keep"]
+    response = web_app.app.test_client().post("/push/subscribe", json=current)
+
+    assert response.status_code == 200
+    assert [event["delivery_id"] for event in events_store.read([])] == ["keep", "drop"]
 
 
 def test_tp_notification_is_immediate_durable_and_deduplicated(monkeypatch, tmp_path):
     exit_store = web_app.JsonStore(tmp_path / "paper-exit-push.json")
+    decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
     monkeypatch.setattr(web_app, "paper_exit_push_store", exit_store)
+    monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
     submissions = []
 
     def fake_send(payload, subscriptions=None, delivery_type="automatic"):
@@ -217,7 +227,9 @@ def test_tp_notification_is_immediate_durable_and_deduplicated(monkeypatch, tmp_
 
 def test_failed_sl_notification_remains_pending_for_next_poll(monkeypatch, tmp_path):
     exit_store = web_app.JsonStore(tmp_path / "paper-exit-push.json")
+    decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
     monkeypatch.setattr(web_app, "paper_exit_push_store", exit_store)
+    monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
     outcomes = iter([(0, 1), (1, 0)])
     monkeypatch.setattr(
         web_app,
@@ -240,6 +252,30 @@ def test_failed_sl_notification_remains_pending_for_next_poll(monkeypatch, tmp_p
     assert len(exit_store.read({})["pending"]) == 1
     assert web_app._notify_paper_exits([]) == 1
     assert exit_store.read({})["pending"] == []
+
+
+def test_signal_state_uses_exact_deduplication_without_cooldown():
+    class Prediction:
+        bias = "bullish"
+        regime_4h = "bullish"
+        regime_1h = "bullish"
+        setup_15m = "bullish"
+        setup_type = "reversal"
+        zone = "equal_lows:abc"
+        sweep_status = "confirmed"
+        orderflow_confirmation = True
+        orderflow_reason = "confirmed"
+        no_trade_reason = None
+        entry = 65000.0
+        stop = 64750.0
+        target = 65500.0
+
+    state = web_app._prediction_push_state(Prediction())
+    key = web_app._prediction_push_key(state)
+
+    assert key.startswith("v2:")
+    assert key == web_app._prediction_push_key(state)
+    assert "PUSH_COOLDOWN_SECONDS" not in Path(web_app.__file__).read_text()
 
 
 def test_push_unsubscribe_endpoint_removes_subscription(monkeypatch):

@@ -36,6 +36,7 @@ data_dir = runtime_dir()
 live_lock = threading.Lock()
 push_lock = threading.Lock()
 push_delivery_lock = threading.RLock()
+push_decision_lock = threading.RLock()
 live_start_lock = threading.Lock()
 live_state = {"status":"starting","source":None,"prediction":None,"updated_at":None,"error":None}
 live_thread_started = False
@@ -48,6 +49,7 @@ subscription_store = JsonStore(data_dir / "push_subscriptions.json")
 push_state_store = JsonStore(data_dir / "push_state.json")
 push_delivery_store = JsonStore(data_dir / "push_delivery.json")
 push_delivery_events_store = JsonStore(data_dir / "push_delivery_events.json")
+push_decision_events_store = JsonStore(data_dir / "push_decision_events.json")
 paper_exit_push_store = JsonStore(data_dir / "paper_exit_push.json")
 live_state_store = JsonStore(data_dir / "live_state.json")
 research_status_store = JsonStore(os.getenv("BTC_RESEARCH_STATUS", str(data_dir / "research/status.json")))
@@ -396,28 +398,57 @@ def _latest_delivery_summary(delivery_type):
     }
 
 
-def _prune_delivery_history_to_current_subscriptions():
-    """Drop delivery history for endpoints that are no longer registered."""
-    if not PUSH_SINGLE_INSTALLATION:
-        return 0
-    with push_lock:
-        current_hashes = {
-            _endpoint_hash(item.get("endpoint"))
-            for item in push_subscriptions
-            if item.get("endpoint")
-        }
-    with push_delivery_lock:
-        events = push_delivery_events_store.read([])
+PUSH_STATE_FIELDS = (
+    "bias",
+    "regime_4h",
+    "regime_1h",
+    "setup_15m",
+    "setup_type",
+    "zone",
+    "sweep_status",
+    "orderflow_confirmation",
+    "orderflow_reason",
+    "no_trade_reason",
+    "entry",
+    "stop",
+    "target",
+)
+
+
+def _prediction_push_state(result):
+    return {field: getattr(result, field, None) for field in PUSH_STATE_FIELDS}
+
+
+def _prediction_push_key(state):
+    encoded = json.dumps(state, sort_keys=True, separators=(",", ":"), default=str)
+    return f"v2:{hashlib.sha256(encoded.encode()).hexdigest()}"
+
+
+def _record_push_decision(decision_id, **updates):
+    now = _utcnow().isoformat()
+    with push_decision_lock:
+        events = push_decision_events_store.read([])
         if not isinstance(events, list):
-            push_delivery_events_store.write([])
-            return 0
-        retained = [
-            event for event in events if event.get("endpoint_hash") in current_hashes
-        ]
-        removed = len(events) - len(retained)
-        if removed:
-            push_delivery_events_store.write(retained[-PUSH_EVENT_RETENTION:])
-    return removed
+            events = []
+        event = next(
+            (item for item in events if item.get("decision_id") == decision_id),
+            None,
+        )
+        if event is None:
+            event = {"decision_id": decision_id, "observed_at": now, "attempts": 0}
+            events.append(event)
+        event.update(updates)
+        event["updated_at"] = now
+        push_decision_events_store.write(events[-200:])
+        return dict(event)
+
+
+def _latest_push_decision():
+    with push_decision_lock:
+        events = push_decision_events_store.read([])
+    if not isinstance(events, list) or not events:
+        return {}
+    return dict(max(events, key=lambda item: str(item.get("updated_at") or "")))
 
 
 def _paper_exit_event_id(trade):
@@ -481,15 +512,38 @@ def _notify_paper_exits(newly_closed):
     for item in state["pending"]:
         event_id = item.get("event_id")
         trade = item.get("trade") or {}
+        decision = _record_push_decision(
+            event_id,
+            notification_kind="paper_exit",
+            status="detected",
+            summary=(
+                "Target hit"
+                if str(trade.get("exit_reason") or "").lower() == "target"
+                else "Stop hit"
+            ),
+        )
         accepted, _failed = _send_push(
             _paper_exit_payload(trade, event_id),
             delivery_type="automatic",
         )
+        delivery = _latest_delivery_summary("automatic")
         if accepted > 0:
             accepted_total += accepted
             notified_ids.append(event_id)
+            decision_status = "accepted"
         else:
             remaining.append(item)
+            decision_status = "failed" if _failed else "no_enabled_subscription"
+        _record_push_decision(
+            event_id,
+            notification_kind="paper_exit",
+            status=decision_status,
+            attempts=int(decision.get("attempts") or 0) + 1,
+            attempted=int(delivery.get("attempted") or 0),
+            accepted=int(delivery.get("accepted") or 0),
+            failed=int(delivery.get("failed") or 0),
+            delivery_batch_id=delivery.get("batch_id"),
+        )
     paper_exit_push_store.write({
         "pending": remaining[-100:],
         "notified_ids": notified_ids[-500:],
@@ -772,7 +826,10 @@ def _live_loop():
     global live_state
     persisted = push_state_store.read({})
     previous_key = persisted.get("key")
-    last_sent = pd.Timestamp(persisted["sent_at"]) if persisted.get("sent_at") else None
+    previous_notification_state = persisted.get("state") or {}
+    transition_sequence = int(persisted.get("transition_sequence") or 0)
+    pending_state_key = persisted.get("pending_state_key")
+    pending_decision_id = persisted.get("pending_decision_id")
     binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
     flow_retry_at = pd.Timestamp(0, tz="UTC")
     flow_bars_cache = None
@@ -871,52 +928,97 @@ def _live_loop():
                 paper_exit_notifications = 0
                 logger.exception("Paper exit notification dispatch failed")
             trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
-            key = "|".join(
-                str(getattr(result, k, None))
-                for k in (
-                    "bias",
-                    "regime_4h",
-                    "regime_1h",
-                    "setup_15m",
-                    "setup_type",
-                    "zone",
-                    "sweep_status",
-                    "orderflow_confirmation",
-                    "orderflow_reason",
-                    "no_trade_reason",
-                    "entry",
-                    "stop",
-                    "target",
-                )
-            )
-            now = pd.Timestamp.now(tz="UTC"); cooldown = pd.Timedelta(seconds=int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
-            # previous_key is the last successfully handled notification state.
-            # Failed deliveries keep the old key so the next poll can retry.
-            # Cooldown-blocked changes also keep the old key so the later state
-            # is still eligible once the cooldown expires.
+            notification_state = _prediction_push_state(result)
+            key = _prediction_push_key(notification_state)
+            now = pd.Timestamp.now(tz="UTC")
+            # The exact state hash deduplicates identical updates. Every genuine
+            # state change is submitted immediately; no time-based cooldown can
+            # suppress a transient change.
             # A specific TP/SL alert supersedes the generic state-change alert
-            # for this poll. It does not consume or extend the signal cooldown.
+            # for this poll.
             if paper_exit_notifications > 0:
                 previous_key = key
-            elif previous_key is None:
-                previous_key = key
-            elif key != previous_key and (last_sent is None or now - last_sent >= cooldown):
-                event_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+                previous_notification_state = notification_state
+                pending_state_key = None
+                pending_decision_id = None
+            elif key != previous_key:
+                if pending_state_key != key or not pending_decision_id:
+                    transition_sequence += 1
+                    pending_state_key = key
+                    pending_decision_id = (
+                        f"state-{transition_sequence}-"
+                        f"{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+                    )
+                event_id = pending_decision_id
                 detail = str(result.setup_type or result.no_trade_reason or result.sweep_status or "State changed")
                 detail = detail.replace("_", " ").strip().capitalize()
+                changed_fields = [
+                    field
+                    for field in PUSH_STATE_FIELDS
+                    if previous_notification_state.get(field) != notification_state.get(field)
+                ]
+                decision = _record_push_decision(
+                    event_id,
+                    notification_kind="state_change",
+                    status="detected",
+                    summary=f"{str(result.bias).capitalize()} · {detail}",
+                    changed_fields=changed_fields,
+                    state_key=key,
+                )
+                # Persist the transition identity before network I/O so a
+                # worker restart retries the same auditable event.
+                push_state_store.write({
+                    "key": previous_key,
+                    "state": previous_notification_state,
+                    "transition_sequence": transition_sequence,
+                    "pending_state_key": pending_state_key,
+                    "pending_decision_id": pending_decision_id,
+                    "updated_at": now.isoformat(),
+                })
                 sent, failed = _send_push({
                     "title":"BTC Predictor update",
                     "body":f"{str(result.bias).capitalize()} · {detail}",
                     "url":"/",
                     "event_id":event_id,
                 })
-                if sent > 0 or failed == 0:
+                delivery = _latest_delivery_summary("automatic")
+                decision_status = (
+                    "accepted"
+                    if sent > 0
+                    else "failed"
+                    if failed > 0
+                    else "no_enabled_subscription"
+                )
+                _record_push_decision(
+                    event_id,
+                    notification_kind="state_change",
+                    status=decision_status,
+                    attempts=int(decision.get("attempts") or 0) + 1,
+                    attempted=int(delivery.get("attempted") or 0),
+                    accepted=int(delivery.get("accepted") or 0),
+                    failed=int(delivery.get("failed") or 0),
+                    delivery_batch_id=delivery.get("batch_id"),
+                )
+                if sent > 0:
                     previous_key = key
-                    if sent > 0:
-                        last_sent = now
+                    previous_notification_state = notification_state
+                    pending_state_key = None
+                    pending_decision_id = None
+            elif pending_decision_id:
+                _record_push_decision(
+                    pending_decision_id,
+                    status="superseded",
+                    superseded_at=now.isoformat(),
+                )
+                pending_state_key = None
+                pending_decision_id = None
             push_state_store.write({
                 "key": previous_key,
-                "sent_at": last_sent.isoformat() if last_sent is not None else None,
+                "state": previous_notification_state,
+                "transition_sequence": transition_sequence,
+                "pending_state_key": pending_state_key,
+                "pending_decision_id": pending_decision_id,
+                "updated_at": now.isoformat(),
             })
             try:
                 _retry_unacknowledged_pushes(now)
@@ -993,13 +1095,6 @@ def start_live_boot_supervisor():
     live_boot_thread.start()
     return live_boot_thread
 
-
-removed_delivery_events = _prune_delivery_history_to_current_subscriptions()
-if removed_delivery_events:
-    logger.info(
-        "Removed %s delivery records for retired push endpoints",
-        removed_delivery_events,
-    )
 
 if os.getenv("START_LIVE_LOOP_ON_BOOT", "0").lower() in ("1", "true", "yes", "on"):
     start_live_boot_supervisor()
@@ -1154,6 +1249,7 @@ def health():
     stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
     last_automatic_delivery = _latest_delivery_summary("automatic")
     last_test_delivery = _latest_delivery_summary("test")
+    last_notification_decision = _latest_push_decision()
     push_counts = _subscription_counts()
     return jsonify({
         "status": "degraded" if stale_exchanges else "ok",
@@ -1178,6 +1274,7 @@ def health():
             "last_delivery":last_automatic_delivery,
             "last_automatic_delivery":last_automatic_delivery,
             "last_test_delivery":last_test_delivery,
+            "last_notification_decision":last_notification_decision,
         },
         "trade_store":store_stats,
         "collectors":collectors,
@@ -1194,6 +1291,7 @@ def api_live():
         state["prediction"] = dict(state["prediction"]); state["prediction"]["timestamp"] = str(state["prediction"]["timestamp"])
     last_automatic_delivery = _latest_delivery_summary("automatic")
     last_test_delivery = _latest_delivery_summary("test")
+    last_notification_decision = _latest_push_decision()
     push_counts = _subscription_counts()
     return jsonify({
         "paper_only": True,
@@ -1208,6 +1306,7 @@ def api_live():
             "last_delivery": last_automatic_delivery,
             "last_automatic_delivery": last_automatic_delivery,
             "last_test_delivery": last_test_delivery,
+            "last_notification_decision": last_notification_decision,
         },
     })
 
@@ -1354,7 +1453,6 @@ def push_subscribe():
             (item for item in push_subscriptions if item.get("endpoint") == endpoint),
             {},
         )
-    _prune_delivery_history_to_current_subscriptions()
     token = _issue_endpoint_token(data["endpoint"])
     return jsonify({
         "ok": True,
@@ -1451,6 +1549,7 @@ def push_admin_status():
         "last_delivery": _latest_delivery_summary("automatic"),
         "last_automatic_delivery": _latest_delivery_summary("automatic"),
         "last_test_delivery": _latest_delivery_summary("test"),
+        "last_notification_decision": _latest_push_decision(),
     })
 
 
