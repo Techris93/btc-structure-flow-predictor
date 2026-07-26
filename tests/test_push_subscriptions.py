@@ -115,8 +115,71 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "subscriptionPayload(sub)" in dashboard
     assert "window.pushManager || registration.pushManager" in dashboard
     assert 'localStorage.getItem("btc-flow-installation-id")' in dashboard
-    assert "accepted by push service · device display unconfirmed" in dashboard
+    assert "const lastDelivery = push.last_automatic_delivery || {};" in dashboard
+    assert "No automatic notification has targeted the current device yet" in dashboard
+    assert "accepted by Apple · display not confirmed" in dashboard
+    assert 'lastDelivery.delivery_type === "test"' not in dashboard
     assert '" · delivered"' not in dashboard
+
+
+def test_latest_delivery_summaries_separate_automatic_and_test(monkeypatch, tmp_path):
+    events_store = web_app.JsonStore(tmp_path / "events.json")
+    events_store.write([
+        {
+            "delivery_id": "auto-delivery",
+            "batch_id": "auto-batch",
+            "delivery_type": "automatic",
+            "created_at": "2026-07-26T12:00:00+00:00",
+            "accepted_at": "2026-07-26T12:00:01+00:00",
+            "failed_at": None,
+            "received_at": None,
+            "notification_created_at": None,
+            "retry_count": 0,
+        },
+        {
+            "delivery_id": "test-delivery",
+            "batch_id": "test-batch",
+            "delivery_type": "test",
+            "created_at": "2026-07-26T13:00:00+00:00",
+            "accepted_at": "2026-07-26T13:00:01+00:00",
+            "failed_at": None,
+            "received_at": None,
+            "notification_created_at": None,
+            "retry_count": 0,
+        },
+    ])
+    monkeypatch.setattr(web_app, "push_delivery_events_store", events_store)
+
+    automatic = web_app._latest_delivery_summary("automatic")
+    test = web_app._latest_delivery_summary("test")
+
+    assert automatic["batch_id"] == "auto-batch"
+    assert automatic["delivery_type"] == "automatic"
+    assert automatic["subscriptions"] == 1
+    assert test["batch_id"] == "test-batch"
+    assert test["delivery_type"] == "test"
+
+
+def test_retired_endpoint_delivery_history_is_removed(monkeypatch, tmp_path):
+    current = _subscription("https://web.push.apple.com/current")
+    retired = _subscription("https://web.push.apple.com/retired")
+    events_store = web_app.JsonStore(tmp_path / "events.json")
+    events_store.write([
+        {
+            "delivery_id": "keep",
+            "endpoint_hash": web_app._endpoint_hash(current["endpoint"]),
+        },
+        {
+            "delivery_id": "drop",
+            "endpoint_hash": web_app._endpoint_hash(retired["endpoint"]),
+        },
+    ])
+    monkeypatch.setattr(web_app, "push_subscriptions", [current])
+    monkeypatch.setattr(web_app, "push_delivery_events_store", events_store)
+    monkeypatch.setattr(web_app, "PUSH_SINGLE_INSTALLATION", True)
+
+    assert web_app._prune_delivery_history_to_current_subscriptions() == 1
+    assert [event["delivery_id"] for event in events_store.read([])] == ["keep"]
 
 
 def test_push_unsubscribe_endpoint_removes_subscription(monkeypatch):

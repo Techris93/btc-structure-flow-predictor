@@ -366,6 +366,59 @@ def _delivery_counts(events, batch_id):
     }
 
 
+def _latest_delivery_summary(delivery_type):
+    with push_delivery_lock:
+        events = push_delivery_events_store.read([])
+    if not isinstance(events, list):
+        return {}
+    matching = [
+        event for event in events if event.get("delivery_type") == delivery_type
+    ]
+    if not matching:
+        return {}
+    latest = max(matching, key=lambda event: str(event.get("created_at") or ""))
+    batch_id = latest.get("batch_id")
+    batch = [event for event in matching if event.get("batch_id") == batch_id]
+    counts = _delivery_counts(events, batch_id)
+    errors = [event.get("error") for event in batch if event.get("error")]
+    return {
+        "batch_id": batch_id,
+        "delivery_type": delivery_type,
+        "attempted_at": min(
+            (event.get("created_at") for event in batch if event.get("created_at")),
+            default=None,
+        ),
+        **counts,
+        "sent": counts["accepted"],
+        "subscriptions": counts["attempted"],
+        "error": errors[-1] if errors else None,
+    }
+
+
+def _prune_delivery_history_to_current_subscriptions():
+    """Drop delivery history for endpoints that are no longer registered."""
+    if not PUSH_SINGLE_INSTALLATION:
+        return 0
+    with push_lock:
+        current_hashes = {
+            _endpoint_hash(item.get("endpoint"))
+            for item in push_subscriptions
+            if item.get("endpoint")
+        }
+    with push_delivery_lock:
+        events = push_delivery_events_store.read([])
+        if not isinstance(events, list):
+            push_delivery_events_store.write([])
+            return 0
+        retained = [
+            event for event in events if event.get("endpoint_hash") in current_hashes
+        ]
+        removed = len(events) - len(retained)
+        if removed:
+            push_delivery_events_store.write(retained[-PUSH_EVENT_RETENTION:])
+    return removed
+
+
 def _update_last_delivery_from_events(events, batch_id):
     summary = push_delivery_store.read({})
     if summary.get("batch_id") != batch_id:
@@ -853,6 +906,12 @@ def start_live_boot_supervisor():
 
 
 if os.getenv("START_LIVE_LOOP_ON_BOOT", "0").lower() in ("1", "true", "yes", "on"):
+    removed_delivery_events = _prune_delivery_history_to_current_subscriptions()
+    if removed_delivery_events:
+        logger.info(
+            "Removed %s delivery records for retired push endpoints",
+            removed_delivery_events,
+        )
     start_live_boot_supervisor()
 
 
@@ -1003,7 +1062,8 @@ def health():
                 trade_store.set_collector_status(exchange, latest=store_latest)
     collectors = trade_store.collector_status(pd.Timestamp.now(tz="UTC"), COLLECTOR_STALE_SECONDS)
     stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
-    push_delivery = push_delivery_store.read({})
+    last_automatic_delivery = _latest_delivery_summary("automatic")
+    last_test_delivery = _latest_delivery_summary("test")
     push_counts = _subscription_counts()
     return jsonify({
         "status": "degraded" if stale_exchanges else "ok",
@@ -1023,7 +1083,11 @@ def health():
             "stored_subscriptions":push_counts["stored"],
             "enabled_subscriptions":push_counts["enabled"],
             "verified_subscriptions":push_counts["verified"],
-            "last_delivery":push_delivery,
+            # `last_delivery` remains for older clients, but it now means the
+            # latest automatic signal push. Manual tests have their own field.
+            "last_delivery":last_automatic_delivery,
+            "last_automatic_delivery":last_automatic_delivery,
+            "last_test_delivery":last_test_delivery,
         },
         "trade_store":store_stats,
         "collectors":collectors,
@@ -1038,7 +1102,8 @@ def api_live():
     if not live_thread_started: state = live_state_store.read(state)
     if state.get("prediction"):
         state["prediction"] = dict(state["prediction"]); state["prediction"]["timestamp"] = str(state["prediction"]["timestamp"])
-    push_delivery = push_delivery_store.read({})
+    last_automatic_delivery = _latest_delivery_summary("automatic")
+    last_test_delivery = _latest_delivery_summary("test")
     push_counts = _subscription_counts()
     return jsonify({
         "paper_only": True,
@@ -1050,7 +1115,9 @@ def api_live():
             "stored_subscriptions": push_counts["stored"],
             "enabled_subscriptions": push_counts["enabled"],
             "verified_subscriptions": push_counts["verified"],
-            "last_delivery": push_delivery,
+            "last_delivery": last_automatic_delivery,
+            "last_automatic_delivery": last_automatic_delivery,
+            "last_test_delivery": last_test_delivery,
         },
     })
 
@@ -1197,6 +1264,7 @@ def push_subscribe():
             (item for item in push_subscriptions if item.get("endpoint") == endpoint),
             {},
         )
+    _prune_delivery_history_to_current_subscriptions()
     token = _issue_endpoint_token(data["endpoint"])
     return jsonify({
         "ok": True,
@@ -1290,7 +1358,9 @@ def push_admin_status():
         ]
     return jsonify({
         "subscriptions": subscriptions,
-        "last_delivery": push_delivery_store.read({}),
+        "last_delivery": _latest_delivery_summary("automatic"),
+        "last_automatic_delivery": _latest_delivery_summary("automatic"),
+        "last_test_delivery": _latest_delivery_summary("test"),
     })
 
 

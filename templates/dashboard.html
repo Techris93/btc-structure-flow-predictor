@@ -486,7 +486,7 @@
               <h2>Feed</h2>
               <div class="row"><span>Market feed</span><span id="feed">—</span></div>
               <div class="row"><span>Binance feed</span><span id="binancefeed">—</span></div>
-              <div class="row"><span>Last push</span><span id="lastpush">—</span></div>
+              <div class="row"><span>Last automatic push</span><span id="lastpush">—</span></div>
             </section>
 
             <section class="section">
@@ -787,7 +787,7 @@
         setText("feed", feed);
         setText("binancefeed", humanize(s.binance_feed_mode));
         const push = s.push || {};
-        const lastDelivery = push.last_delivery || {};
+        const lastDelivery = push.last_automatic_delivery || {};
         if (lastDelivery.attempted_at) {
           const attempted = Number(lastDelivery.attempted || 0);
           const accepted = Number(lastDelivery.accepted ?? lastDelivery.sent ?? 0);
@@ -797,27 +797,31 @@
           const batchSubscriptions = Number(lastDelivery.subscriptions || 0);
           const previousSubscriptionGeneration =
             batchSubscriptions > 0 && batchSubscriptions !== currentStored;
-          let deliveryState = "no targets";
           if (previousSubscriptionGeneration) {
-            deliveryState = `previous endpoints · current device awaiting verification`;
-          } else if (created > 0) {
-            deliveryState = `${created}/${attempted} notification created`;
-          } else if (received > 0) {
-            deliveryState = `${received}/${attempted} received by device`;
-          } else if (accepted > 0) {
-            deliveryState = `${accepted}/${attempted} accepted by push service · device display unconfirmed`;
-          } else if (lastDelivery.failed > 0) {
-            deliveryState = "failed";
+            setText(
+              "lastpush",
+              "No automatic notification has targeted the current device yet",
+              "tone-muted",
+            );
+          } else {
+            let deliveryState = "No enabled notification target";
+            if (created > 0) {
+              deliveryState = `${created}/${attempted} notification created on device`;
+            } else if (received > 0) {
+              deliveryState = `${received}/${attempted} received by device`;
+            } else if (accepted > 0) {
+              deliveryState = `${accepted}/${attempted} accepted by Apple · display not confirmed`;
+            } else if (lastDelivery.failed > 0) {
+              deliveryState = "Delivery failed";
+            }
+            setText(
+              "lastpush",
+              fmtDate(lastDelivery.attempted_at) + " · " + deliveryState,
+              "mono tone-muted",
+            );
           }
-          const deliveryLabel =
-            (lastDelivery.delivery_type === "test" ? "Test" : "Auto") +
-            " · " +
-            fmtDate(lastDelivery.attempted_at) +
-            " · " +
-            deliveryState;
-          setText("lastpush", deliveryLabel, "mono tone-muted");
         } else {
-          setText("lastpush", "No delivery yet");
+          setText("lastpush", "No automatic notification yet");
         }
 
         setText("paperequity", fmtMoney(paper.equity), "mono");
