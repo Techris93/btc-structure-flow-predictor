@@ -115,7 +115,7 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "subscriptionPayload(sub)" in dashboard
     assert "window.pushManager || registration.pushManager" in dashboard
     assert 'localStorage.getItem("btc-flow-installation-id")' in dashboard
-    assert "accepted · awaiting device" in dashboard
+    assert "accepted by push service · device display unconfirmed" in dashboard
     assert '" · delivered"' not in dashboard
 
 

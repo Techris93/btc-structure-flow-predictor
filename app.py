@@ -503,7 +503,6 @@ def _retry_unacknowledged_pushes(now=None):
     now = now or _utcnow()
     retried = 0
     stale = []
-    subscription_changed = False
     with push_lock:
         with push_delivery_lock:
             events = push_delivery_events_store.read([])
@@ -516,6 +515,7 @@ def _retry_unacknowledged_pushes(now=None):
         for event in events:
             if (
                 event.get("delivery_type") != "automatic"
+                or event.get("accepted_at")
                 or event.get("received_at")
             ):
                 continue
@@ -526,18 +526,6 @@ def _retry_unacknowledged_pushes(now=None):
                 continue
             subscription = subscriptions_by_hash.get(event.get("endpoint_hash"))
             if now >= expires_at:
-                if (
-                    event.get("accepted_at")
-                    and subscription
-                    and not event.get("ack_miss_recorded_at")
-                ):
-                    subscription["ack_miss_count"] = int(subscription.get("ack_miss_count") or 0) + 1
-                    if subscription["ack_miss_count"] >= 3:
-                        subscription["enabled"] = False
-                        subscription["status"] = "unreachable"
-                    event["ack_miss_recorded_at"] = now.isoformat()
-                    subscription_changed = True
-                    changed_batches.add(event.get("batch_id"))
                 continue
             if (
                 now < retry_at
@@ -589,10 +577,8 @@ def _retry_unacknowledged_pushes(now=None):
             push_subscriptions[:] = [
                 item for item in push_subscriptions if item.get("endpoint") not in stale
             ]
-            subscription_changed = True
-        if subscription_changed:
             _persist_subscriptions()
-        if retried or stale or subscription_changed:
+        if retried or stale:
             with push_delivery_lock:
                 push_delivery_events_store.write(events[-PUSH_EVENT_RETENTION:])
                 for batch_id in changed_batches:

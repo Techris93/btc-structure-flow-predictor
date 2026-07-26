@@ -699,7 +699,6 @@
 
       let installationIdFallback = null;
       let pushNeedsRepair = false;
-      let verificationAttempted = false;
       function installationId() {
         try {
           const existing = localStorage.getItem("btc-flow-installation-id");
@@ -806,7 +805,7 @@
           } else if (received > 0) {
             deliveryState = `${received}/${attempted} received by device`;
           } else if (accepted > 0) {
-            deliveryState = `${accepted}/${attempted} accepted · awaiting device`;
+            deliveryState = `${accepted}/${attempted} accepted by push service · device display unconfirmed`;
           } else if (lastDelivery.failed > 0) {
             deliveryState = "failed";
           }
@@ -892,26 +891,7 @@
             });
             if (!synced.ok) throw Error("Unable to synchronize push subscription");
             const syncedState = await synced.json();
-            pushNeedsRepair = !syncedState.current_verified;
-            if (pushNeedsRepair && !verificationAttempted) {
-              verificationAttempted = true;
-              const verification = await (
-                await fetch("/push/test", {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({
-                    endpoint: sub.endpoint,
-                    test_token: syncedState.test_token,
-                  }),
-                })
-              ).json();
-              if (verification.accepted) {
-                b.textContent = "Verifying device…";
-                b.title = "A verification notification was sent to this device";
-                setTimeout(syncPushButton, 4000);
-                return;
-              }
-            }
+            pushNeedsRepair = syncedState.current_status === "unreachable";
           } else {
             pushNeedsRepair = false;
           }
@@ -1016,9 +996,9 @@
             $("reason").textContent = "Push registered, but the delivery test failed";
             return;
           }
-          b.textContent = "Verifying notification…";
-          b.title = "Waiting for this device to acknowledge the test notification";
-          setTimeout(syncPushButton, 3000);
+          pushNeedsRepair = false;
+          b.textContent = "Pause notifications";
+          b.title = "Click to pause push notifications";
         } catch (e) {
           b.textContent = "Enable push notifications";
           b.title = "Click to enable push notifications";
