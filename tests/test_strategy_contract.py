@@ -101,6 +101,8 @@ def test_paper_ledger_ignores_bars_before_entry():
     assert ledger._open is None
     assert status["closed_trades"] == 1
     assert status["last_closed"]["exit_reason"] == "stop"
+    assert len(status["newly_closed"]) == 1
+    assert status["newly_closed"][0]["exit_reason"] == "stop"
 
 
 def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):

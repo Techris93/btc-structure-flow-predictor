@@ -182,6 +182,66 @@ def test_retired_endpoint_delivery_history_is_removed(monkeypatch, tmp_path):
     assert [event["delivery_id"] for event in events_store.read([])] == ["keep"]
 
 
+def test_tp_notification_is_immediate_durable_and_deduplicated(monkeypatch, tmp_path):
+    exit_store = web_app.JsonStore(tmp_path / "paper-exit-push.json")
+    monkeypatch.setattr(web_app, "paper_exit_push_store", exit_store)
+    submissions = []
+
+    def fake_send(payload, subscriptions=None, delivery_type="automatic"):
+        submissions.append((payload, delivery_type))
+        return 1, 0
+
+    monkeypatch.setattr(web_app, "_send_push", fake_send)
+    trade = {
+        "entry_time": "2026-07-26T10:00:00+00:00",
+        "exit_time": "2026-07-26T11:00:00+00:00",
+        "side": "long",
+        "entry": 65000.0,
+        "exit": 66000.0,
+        "size": 0.25,
+        "pnl": 250.0,
+        "r_multiple": 2.0,
+        "exit_reason": "target",
+    }
+
+    assert web_app._notify_paper_exits([trade]) == 1
+    assert web_app._notify_paper_exits([trade]) == 0
+    assert len(submissions) == 1
+    payload, delivery_type = submissions[0]
+    assert payload["title"] == "BTC paper trade · Target hit"
+    assert "P&L +$250.00" in payload["body"]
+    assert delivery_type == "automatic"
+    assert exit_store.read({})["pending"] == []
+    assert len(exit_store.read({})["notified_ids"]) == 1
+
+
+def test_failed_sl_notification_remains_pending_for_next_poll(monkeypatch, tmp_path):
+    exit_store = web_app.JsonStore(tmp_path / "paper-exit-push.json")
+    monkeypatch.setattr(web_app, "paper_exit_push_store", exit_store)
+    outcomes = iter([(0, 1), (1, 0)])
+    monkeypatch.setattr(
+        web_app,
+        "_send_push",
+        lambda payload, subscriptions=None, delivery_type="automatic": next(outcomes),
+    )
+    trade = {
+        "entry_time": "2026-07-26T10:00:00+00:00",
+        "exit_time": "2026-07-26T10:15:00+00:00",
+        "side": "short",
+        "entry": 65000.0,
+        "exit": 65250.0,
+        "size": 1.0,
+        "pnl": -250.0,
+        "r_multiple": -1.0,
+        "exit_reason": "stop",
+    }
+
+    assert web_app._notify_paper_exits([trade]) == 0
+    assert len(exit_store.read({})["pending"]) == 1
+    assert web_app._notify_paper_exits([]) == 1
+    assert exit_store.read({})["pending"] == []
+
+
 def test_push_unsubscribe_endpoint_removes_subscription(monkeypatch):
     subscription = _subscription("https://web.push.apple.com/toggle")
     monkeypatch.setattr(web_app, "push_subscriptions", [subscription])

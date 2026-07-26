@@ -48,6 +48,7 @@ subscription_store = JsonStore(data_dir / "push_subscriptions.json")
 push_state_store = JsonStore(data_dir / "push_state.json")
 push_delivery_store = JsonStore(data_dir / "push_delivery.json")
 push_delivery_events_store = JsonStore(data_dir / "push_delivery_events.json")
+paper_exit_push_store = JsonStore(data_dir / "paper_exit_push.json")
 live_state_store = JsonStore(data_dir / "live_state.json")
 research_status_store = JsonStore(os.getenv("BTC_RESEARCH_STATUS", str(data_dir / "research/status.json")))
 push_subscriptions = subscription_store.read([])
@@ -419,6 +420,83 @@ def _prune_delivery_history_to_current_subscriptions():
     return removed
 
 
+def _paper_exit_event_id(trade):
+    identity = {
+        key: trade.get(key)
+        for key in (
+            "entry_time",
+            "exit_time",
+            "side",
+            "entry",
+            "exit",
+            "size",
+            "exit_reason",
+        )
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+    return f"paper-exit-{digest}"
+
+
+def _paper_exit_payload(trade, event_id):
+    reason = str(trade.get("exit_reason") or "").lower()
+    outcome = "Target hit" if reason == "target" else "Stop hit"
+    side = str(trade.get("side") or "trade").capitalize()
+    exit_price = float(trade.get("exit") or 0.0)
+    pnl = float(trade.get("pnl") or 0.0)
+    r_multiple = float(trade.get("r_multiple") or 0.0)
+    pnl_text = f"+${abs(pnl):,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+    return {
+        "title": f"BTC paper trade · {outcome}",
+        "body": (
+            f"{side} · Exit ${exit_price:,.2f} · "
+            f"P&L {pnl_text} · {r_multiple:+.2f}R"
+        ),
+        "url": "/",
+        "event_id": event_id,
+    }
+
+
+def _notify_paper_exits(newly_closed):
+    """Queue and immediately submit TP/SL notifications, with durable dedupe."""
+    state = paper_exit_push_store.read({})
+    pending = list(state.get("pending") or [])
+    notified_ids = list(state.get("notified_ids") or [])
+    known_ids = set(notified_ids)
+    known_ids.update(item.get("event_id") for item in pending)
+    for trade in newly_closed or []:
+        if str(trade.get("exit_reason") or "").lower() not in ("target", "stop"):
+            continue
+        event_id = _paper_exit_event_id(trade)
+        if event_id not in known_ids:
+            pending.append({"event_id": event_id, "trade": dict(trade)})
+            known_ids.add(event_id)
+    # Persist before network I/O so a process restart cannot lose an exit.
+    state = {"pending": pending[-100:], "notified_ids": notified_ids[-500:]}
+    paper_exit_push_store.write(state)
+
+    accepted_total = 0
+    remaining = []
+    for item in state["pending"]:
+        event_id = item.get("event_id")
+        trade = item.get("trade") or {}
+        accepted, _failed = _send_push(
+            _paper_exit_payload(trade, event_id),
+            delivery_type="automatic",
+        )
+        if accepted > 0:
+            accepted_total += accepted
+            notified_ids.append(event_id)
+        else:
+            remaining.append(item)
+    paper_exit_push_store.write({
+        "pending": remaining[-100:],
+        "notified_ids": notified_ids[-500:],
+    })
+    return accepted_total
+
+
 def _update_last_delivery_from_events(events, batch_id):
     summary = push_delivery_store.read({})
     if summary.get("batch_id") != batch_id:
@@ -785,6 +863,13 @@ def _live_loop():
                 flow_source = None
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
             paper_status = paper_ledger.update(result, ohlc)
+            try:
+                paper_exit_notifications = _notify_paper_exits(
+                    paper_status.get("newly_closed") or []
+                )
+            except Exception:
+                paper_exit_notifications = 0
+                logger.exception("Paper exit notification dispatch failed")
             trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
             key = "|".join(
                 str(getattr(result, k, None))
@@ -809,7 +894,11 @@ def _live_loop():
             # Failed deliveries keep the old key so the next poll can retry.
             # Cooldown-blocked changes also keep the old key so the later state
             # is still eligible once the cooldown expires.
-            if previous_key is None:
+            # A specific TP/SL alert supersedes the generic state-change alert
+            # for this poll. It does not consume or extend the signal cooldown.
+            if paper_exit_notifications > 0:
+                previous_key = key
+            elif previous_key is None:
                 previous_key = key
             elif key != previous_key and (last_sent is None or now - last_sent >= cooldown):
                 event_id = hashlib.sha256(key.encode()).hexdigest()[:16]

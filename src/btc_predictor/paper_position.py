@@ -98,6 +98,7 @@ class PaperLedger:
 
     def update(self, prediction, current_ohlc: pd.DataFrame | None = None):
         with self.lock:
+            closed_before_update = len(self._closed)
             last_close = None
             if current_ohlc is not None and not current_ohlc.empty:
                 last_close = float(current_ohlc["close"].iloc[-1])
@@ -143,7 +144,11 @@ class PaperLedger:
                     self._check_exit(current_ohlc)
 
             self._save()
-            return self._status()
+            status = self._status()
+            status["newly_closed"] = [
+                dict(trade) for trade in self._closed[closed_before_update:]
+            ]
+            return status
 
     def _check_exit(self, ohlc: pd.DataFrame):
         if self._open is None:
