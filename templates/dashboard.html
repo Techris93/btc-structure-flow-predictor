@@ -790,47 +790,11 @@
         const decision = push.last_notification_decision || {};
         const lastDelivery = push.last_automatic_delivery || {};
         if (decision.observed_at) {
-          const attempted = Number(decision.attempted || 0);
-          const accepted = Number(decision.accepted || 0);
-          let decisionState = "Change detected · submission pending";
-          if (decision.status === "accepted") {
-            decisionState = `Apple accepted ${accepted}/${attempted} · display not confirmed`;
-          } else if (decision.status === "failed") {
-            decisionState = "Submission failed · retry pending";
-          } else if (decision.status === "no_enabled_subscription") {
-            decisionState = "No enabled subscription · retry pending";
-          }
-          setText(
-            "lastpush",
-            fmtDate(decision.observed_at) +
-              " · " +
-              humanize(decision.notification_kind) +
-              " · " +
-              decisionState,
-            "mono tone-muted",
-          );
+          setText("lastpush", fmtDate(decision.observed_at), "mono tone-muted");
         } else if (lastDelivery.attempted_at) {
-          const attempted = Number(lastDelivery.attempted || 0);
-          const accepted = Number(lastDelivery.accepted ?? lastDelivery.sent ?? 0);
-          const received = Number(lastDelivery.received || 0);
-          const created = Number(lastDelivery.notification_created || 0);
-          let deliveryState = "No enabled notification target";
-          if (created > 0) {
-            deliveryState = `${created}/${attempted} notification created on device`;
-          } else if (received > 0) {
-            deliveryState = `${received}/${attempted} received by device`;
-          } else if (accepted > 0) {
-            deliveryState = `${accepted}/${attempted} accepted by Apple · display not confirmed`;
-          } else if (lastDelivery.failed > 0) {
-            deliveryState = "Delivery failed";
-          }
-          setText(
-            "lastpush",
-            fmtDate(lastDelivery.attempted_at) + " · " + deliveryState,
-            "mono tone-muted",
-          );
+          setText("lastpush", fmtDate(lastDelivery.attempted_at), "mono tone-muted");
         } else {
-          setText("lastpush", "No notification decision recorded yet");
+          setText("lastpush", "—", "mono tone-muted");
         }
 
         setText("paperequity", fmtMoney(paper.equity), "mono");
