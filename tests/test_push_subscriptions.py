@@ -115,7 +115,7 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "subscriptionPayload(sub)" in dashboard
     assert "window.pushManager || registration.pushManager" in dashboard
     assert 'localStorage.getItem("btc-flow-installation-id")' in dashboard
-    assert "const decision = push.last_notification_decision || {};" in dashboard
+    assert "const lastDelivery = push.last_automatic_delivery || {};" in dashboard
     assert "Last push" in dashboard
     assert "display not confirmed" not in dashboard
     assert "Apple accepted" not in dashboard
@@ -195,6 +195,8 @@ def test_tp_notification_is_immediate_durable_and_deduplicated(monkeypatch, tmp_
     decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
     monkeypatch.setattr(web_app, "paper_exit_push_store", exit_store)
     monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
+    # Paper exits must remain immediate even while generic state pushes are throttled.
+    monkeypatch.setattr(web_app, "PUSH_STATE_COOLDOWN_SECONDS", 3600)
     submissions = []
 
     def fake_send(payload, subscriptions=None, delivery_type="automatic"):
@@ -223,6 +225,7 @@ def test_tp_notification_is_immediate_durable_and_deduplicated(monkeypatch, tmp_
     assert delivery_type == "automatic"
     assert exit_store.read({})["pending"] == []
     assert len(exit_store.read({})["notified_ids"]) == 1
+    assert decision_store.read([])[-1]["status"] == "accepted"
 
 
 def test_failed_sl_notification_remains_pending_for_next_poll(monkeypatch, tmp_path):
@@ -254,7 +257,7 @@ def test_failed_sl_notification_remains_pending_for_next_poll(monkeypatch, tmp_p
     assert exit_store.read({})["pending"] == []
 
 
-def test_signal_state_uses_exact_deduplication_without_cooldown():
+def test_signal_state_uses_exact_deduplication_with_sixty_second_cooldown():
     class Prediction:
         bias = "bullish"
         regime_4h = "bullish"
@@ -275,7 +278,20 @@ def test_signal_state_uses_exact_deduplication_without_cooldown():
 
     assert key.startswith("v2:")
     assert key == web_app._prediction_push_key(state)
-    assert "PUSH_COOLDOWN_SECONDS" not in Path(web_app.__file__).read_text()
+    assert web_app.PUSH_STATE_COOLDOWN_SECONDS == 60
+
+    now = pd.Timestamp("2026-07-28T00:01:00Z")
+    eligible, eligible_at = web_app._state_push_cooldown(
+        now,
+        now - pd.Timedelta(seconds=30),
+    )
+    assert eligible is False
+    assert eligible_at == now + pd.Timedelta(seconds=30)
+    eligible, _ = web_app._state_push_cooldown(
+        now,
+        now - pd.Timedelta(seconds=60),
+    )
+    assert eligible is True
 
 
 def test_push_unsubscribe_endpoint_removes_subscription(monkeypatch):

@@ -21,6 +21,8 @@ services:
         value: /var/data
       - key: BTC_RESEARCH_STATUS
         value: /var/data/research/status.json
+      - key: PUSH_COOLDOWN_SECONDS
+        value: "60"
       - key: START_LIVE_LOOP_ON_BOOT
         value: "1"
       - key: LIVE_BOOT_RETRY_SECONDS

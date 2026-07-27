@@ -70,6 +70,7 @@ PUSH_SINGLE_INSTALLATION = os.getenv("PUSH_SINGLE_INSTALLATION", "1").lower() in
 PUSH_ACK_RETRY_SECONDS = max(30, int(os.getenv("PUSH_ACK_RETRY_SECONDS", "90")))
 PUSH_MAX_ACK_RETRIES = max(0, min(3, int(os.getenv("PUSH_MAX_ACK_RETRIES", "2"))))
 PUSH_EVENT_RETENTION = max(100, int(os.getenv("PUSH_EVENT_RETENTION", "500")))
+PUSH_STATE_COOLDOWN_SECONDS = max(0, int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://btc-structure-flow-predictor.onrender.com"
 ).rstrip("/")
@@ -451,6 +452,16 @@ def _latest_push_decision():
     return dict(max(events, key=lambda item: str(item.get("updated_at") or "")))
 
 
+def _state_push_cooldown(now, last_state_push_at):
+    """Return whether a generic state push is eligible and its next send time."""
+    now = pd.Timestamp(now)
+    if last_state_push_at is None or PUSH_STATE_COOLDOWN_SECONDS == 0:
+        return True, now
+    last = pd.Timestamp(last_state_push_at)
+    eligible_at = last + pd.Timedelta(seconds=PUSH_STATE_COOLDOWN_SECONDS)
+    return now >= eligible_at, eligible_at
+
+
 def _paper_exit_event_id(trade):
     identity = {
         key: trade.get(key)
@@ -830,6 +841,11 @@ def _live_loop():
     transition_sequence = int(persisted.get("transition_sequence") or 0)
     pending_state_key = persisted.get("pending_state_key")
     pending_decision_id = persisted.get("pending_decision_id")
+    last_state_push_at = (
+        pd.Timestamp(persisted["last_state_push_at"])
+        if persisted.get("last_state_push_at")
+        else None
+    )
     binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
     flow_retry_at = pd.Timestamp(0, tz="UTC")
     flow_bars_cache = None
@@ -931,18 +947,32 @@ def _live_loop():
             notification_state = _prediction_push_state(result)
             key = _prediction_push_key(notification_state)
             now = pd.Timestamp.now(tz="UTC")
-            # The exact state hash deduplicates identical updates. Every genuine
-            # state change is submitted immediately; no time-based cooldown can
-            # suppress a transient change.
+            # The exact state hash deduplicates identical updates. Generic state
+            # changes are coalesced during the cooldown; the latest state remains
+            # pending and is submitted once eligible. TP/SL alerts bypass this.
             # A specific TP/SL alert supersedes the generic state-change alert
             # for this poll.
             if paper_exit_notifications > 0:
+                if pending_decision_id:
+                    _record_push_decision(
+                        pending_decision_id,
+                        status="superseded",
+                        superseded_at=now.isoformat(),
+                        superseded_reason="paper_exit",
+                    )
                 previous_key = key
                 previous_notification_state = notification_state
                 pending_state_key = None
                 pending_decision_id = None
             elif key != previous_key:
                 if pending_state_key != key or not pending_decision_id:
+                    if pending_decision_id:
+                        _record_push_decision(
+                            pending_decision_id,
+                            status="superseded",
+                            superseded_at=now.isoformat(),
+                            superseded_reason="newer_state",
+                        )
                     transition_sequence += 1
                     pending_state_key = key
                     pending_decision_id = (
@@ -965,6 +995,9 @@ def _live_loop():
                     changed_fields=changed_fields,
                     state_key=key,
                 )
+                cooldown_elapsed, eligible_at = _state_push_cooldown(
+                    now, last_state_push_at
+                )
                 # Persist the transition identity before network I/O so a
                 # worker restart retries the same auditable event.
                 push_state_store.write({
@@ -973,37 +1006,51 @@ def _live_loop():
                     "transition_sequence": transition_sequence,
                     "pending_state_key": pending_state_key,
                     "pending_decision_id": pending_decision_id,
+                    "last_state_push_at": (
+                        last_state_push_at.isoformat()
+                        if last_state_push_at is not None
+                        else None
+                    ),
                     "updated_at": now.isoformat(),
                 })
-                sent, failed = _send_push({
-                    "title":"BTC Predictor update",
-                    "body":f"{str(result.bias).capitalize()} · {detail}",
-                    "url":"/",
-                    "event_id":event_id,
-                })
-                delivery = _latest_delivery_summary("automatic")
-                decision_status = (
-                    "accepted"
-                    if sent > 0
-                    else "failed"
-                    if failed > 0
-                    else "no_enabled_subscription"
-                )
-                _record_push_decision(
-                    event_id,
-                    notification_kind="state_change",
-                    status=decision_status,
-                    attempts=int(decision.get("attempts") or 0) + 1,
-                    attempted=int(delivery.get("attempted") or 0),
-                    accepted=int(delivery.get("accepted") or 0),
-                    failed=int(delivery.get("failed") or 0),
-                    delivery_batch_id=delivery.get("batch_id"),
-                )
-                if sent > 0:
-                    previous_key = key
-                    previous_notification_state = notification_state
-                    pending_state_key = None
-                    pending_decision_id = None
+                if not cooldown_elapsed:
+                    _record_push_decision(
+                        event_id,
+                        notification_kind="state_change",
+                        status="deferred",
+                        eligible_at=eligible_at.isoformat(),
+                    )
+                else:
+                    sent, failed = _send_push({
+                        "title":"BTC Predictor update",
+                        "body":f"{str(result.bias).capitalize()} · {detail}",
+                        "url":"/",
+                        "event_id":event_id,
+                    })
+                    delivery = _latest_delivery_summary("automatic")
+                    decision_status = (
+                        "accepted"
+                        if sent > 0
+                        else "failed"
+                        if failed > 0
+                        else "no_enabled_subscription"
+                    )
+                    _record_push_decision(
+                        event_id,
+                        notification_kind="state_change",
+                        status=decision_status,
+                        attempts=int(decision.get("attempts") or 0) + 1,
+                        attempted=int(delivery.get("attempted") or 0),
+                        accepted=int(delivery.get("accepted") or 0),
+                        failed=int(delivery.get("failed") or 0),
+                        delivery_batch_id=delivery.get("batch_id"),
+                    )
+                    if sent > 0:
+                        previous_key = key
+                        previous_notification_state = notification_state
+                        pending_state_key = None
+                        pending_decision_id = None
+                        last_state_push_at = now
             elif pending_decision_id:
                 _record_push_decision(
                     pending_decision_id,
@@ -1018,6 +1065,11 @@ def _live_loop():
                 "transition_sequence": transition_sequence,
                 "pending_state_key": pending_state_key,
                 "pending_decision_id": pending_decision_id,
+                "last_state_push_at": (
+                    last_state_push_at.isoformat()
+                    if last_state_push_at is not None
+                    else None
+                ),
                 "updated_at": now.isoformat(),
             })
             try:
@@ -1265,6 +1317,7 @@ def health():
         "push":{
             "supported":webpush is not None,
             "single_installation":PUSH_SINGLE_INSTALLATION,
+            "state_change_cooldown_seconds":PUSH_STATE_COOLDOWN_SECONDS,
             "subscriptions":push_counts["stored"],
             "stored_subscriptions":push_counts["stored"],
             "enabled_subscriptions":push_counts["enabled"],
@@ -1299,6 +1352,7 @@ def api_live():
         "push": {
             "supported": webpush is not None,
             "single_installation": PUSH_SINGLE_INSTALLATION,
+            "state_change_cooldown_seconds": PUSH_STATE_COOLDOWN_SECONDS,
             "subscriptions": push_counts["stored"],
             "stored_subscriptions": push_counts["stored"],
             "enabled_subscriptions": push_counts["enabled"],

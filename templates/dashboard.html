@@ -787,11 +787,8 @@
         setText("feed", feed);
         setText("binancefeed", humanize(s.binance_feed_mode));
         const push = s.push || {};
-        const decision = push.last_notification_decision || {};
         const lastDelivery = push.last_automatic_delivery || {};
-        if (decision.observed_at) {
-          setText("lastpush", fmtDate(decision.observed_at), "mono tone-muted");
-        } else if (lastDelivery.attempted_at) {
+        if (lastDelivery.attempted_at) {
           setText("lastpush", fmtDate(lastDelivery.attempted_at), "mono tone-muted");
         } else {
           setText("lastpush", "—", "mono tone-muted");
