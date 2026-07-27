@@ -1,6 +1,10 @@
 import pandas as pd
 
-from btc_predictor.footprint import cross_exchange_agreement, orderflow_features
+from btc_predictor.footprint import (
+    cross_exchange_agreement,
+    footprint_confirmation,
+    orderflow_features,
+)
 from btc_predictor.models import Zone
 from btc_predictor.strategy import detect_sweep
 from btc_predictor.trade_store import TradeStore
@@ -26,6 +30,31 @@ def test_orderflow_reversals_are_symmetric_and_exchange_agreement_is_required():
     assert f.bearish_delta_reversal.iloc[-1]
     agrees,deltas=cross_exchange_agreement(t,idx[0]-pd.Timedelta(minutes=1),idx[1],"bearish")
     assert agrees and set(deltas)=={"binance","bybit"}
+
+
+def test_footprint_confirmation_passes_complete_agreement_window():
+    idx = pd.date_range("2025-01-01", periods=30, freq="min", tz="UTC")
+    trades = []
+    for minute, timestamp in enumerate(idx):
+        for exchange in ("binance", "bybit"):
+            trades.append({
+                "time": timestamp - pd.Timedelta(seconds=10),
+                "price": 100.0 - minute * 0.1,
+                "qty": 1.0,
+                "side": "sell" if minute % 2 else "buy",
+                "exchange": exchange,
+            })
+    confirmed, details = footprint_confirmation(
+        pd.DataFrame(trades),
+        None,
+        "bearish",
+        idx[-5],
+        idx[-1],
+    )
+
+    assert isinstance(confirmed, bool)
+    assert 0.0 <= details["agreement"] <= 1.0
+    assert set(details["exchange_deltas"]) == {"binance", "bybit"}
 
 
 def test_trade_store_deduplicates_and_persists(tmp_path):

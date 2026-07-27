@@ -94,7 +94,12 @@ def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_ti
         reversal=1.0 if has_reversal else 0.0
     response_baseline=features.price_response.abs().rolling(20,min_periods=5).median().iloc[-1]
     stalled=float(min(1.0, (recent.price_response.abs()<=response_baseline).sum() / max(len(recent),1))) if np.isfinite(response_baseline) else 0.0
-    agreement,deltas=cross_exchange_agreement(trades,pd.Timestamp(decision_time)-pd.Timedelta(minutes=5),direction)
+    agreement,deltas=cross_exchange_agreement(
+        trades,
+        pd.Timestamp(decision_time)-pd.Timedelta(minutes=5),
+        pd.Timestamp(decision_time),
+        direction,
+    )
     raw=trades.copy(); raw["time"]=pd.to_datetime(raw.time,utc=True)
     raw=raw[(raw.time>=pd.Timestamp(sweep_time))&(raw.time<pd.Timestamp(decision_time))]
     imbalance=0.0
