@@ -181,12 +181,12 @@ class Predictor:
     def _output(self,now,bias,**kwargs):
         return PredictorOutput(now,bias,regime_4h=self.last_regimes["4h"],regime_1h=self.last_regimes["1h"],setup_15m=self.last_regimes["15m"],**kwargs)
 
-    def predict(self,ohlc,trades,equity=100_000,frames=None,flow_bars=None):
+    def predict(self,ohlc,trades,equity=100_000,frames=None,flow_bars=None,bias_override=None):
         if len(ohlc)<80 or trades.empty:return PredictorOutput(ohlc.index[-1],"neutral",no_trade_reason="insufficient_history")
         o=ohlc.copy(); o.index=pd.to_datetime(o.index,utc=True); t=trades.copy(); t["time"]=pd.to_datetime(t.time,utc=True)
         frames=frames or {}; setup=frames.get("15m",o)
         has_regime_frames=all(name in frames for name in ("4h","1h","15m"))
-        bias=self._regime_bias(frames) if has_regime_frames else self._last(o)[0]
+        bias=bias_override if bias_override in ("bullish","bearish","neutral") else (self._regime_bias(frames) if has_regime_frames else self._last(o)[0])
         now=o.index[-1]; price=float(o.close.iloc[-1]); setup_atr=atr(setup); a=float(setup_atr.iloc[-1]) if len(setup_atr) else np.nan
         if bias=="neutral" or not np.isfinite(a):return self._output(now,bias,no_trade_reason="timeframe_conflict" if self.last_regimes["4h"]!=self.last_regimes["1h"] else "neutral_or_unready_structure")
         risk_atr=self._risk_atr(o,frames,a)
@@ -198,7 +198,13 @@ class Predictor:
             return swept is not None and recent_cutoff<=swept<=now
         directional=[z for z in zones if _eligible(z) and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above"))]
         if not directional:return self._output(now,bias,no_trade_reason="no_projected_zone")
-        evaluated=[(z,detect_sweep(o,z,bias,a,*self.sweep_atr,self.reclaim_bars)) for z in directional]
+        recent=o.tail(self.reclaim_bars+1)
+        window_low=float(recent.low.min()); window_high=float(recent.high.max())
+        breached=[z for z in directional if (window_low<z.low if bias=="bullish" else window_high>z.high)]
+        if not breached:
+            z=max(directional,key=lambda q:(q.score,-abs(price-q.midpoint)))
+            return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="none",no_trade_reason="sweep_not_confirmed")
+        evaluated=[(z,detect_sweep(o,z,bias,a,*self.sweep_atr,self.reclaim_bars)) for z in breached]
         confirmed=[pair for pair in evaluated if pair[1].get("confirmed")]
         if not confirmed:
             waiting=[p for p in evaluated if p[1].get("status")=="waiting_reclaim"]

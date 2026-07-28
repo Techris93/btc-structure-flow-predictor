@@ -170,6 +170,12 @@ def test_reactive_risk_cap_uses_completed_15m_volatility():
     assert value >= 4.0
 
 
+def test_causal_replay_can_supply_precomputed_reactive_bias():
+    idx,o,frames,trades=_sweep_frames()
+    result=Predictor().predict(o,trades,frames={"15m":frames["15m"]},bias_override="neutral")
+    assert result.bias == "neutral"
+
+
 def test_failed_market_and_limit_candidates_are_both_reported(monkeypatch):
     idx,o,frames,trades=_sweep_frames()
     swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])

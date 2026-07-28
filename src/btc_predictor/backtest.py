@@ -5,6 +5,7 @@ import math
 import pandas as pd
 
 from .strategy import Predictor
+from .structure import structure_events
 from .timeframes import completed_timeframes
 
 
@@ -68,6 +69,8 @@ def run_event_backtest(
     # while MTF additionally receives the completed 1h/4h regime frames.
     derived = completed_timeframes(bars)
     frame_slice_cache = {}
+    reactive_events=structure_events(bars) if mode=="reactive" and isinstance(predictor,Predictor) else None
+    reactive_event_times=reactive_events.index if reactive_events is not None and not reactive_events.empty else None
 
     for i in range(max(80, int(state.get("next_i", 80))), len(bars)):
         now, b = bars.index[i], bars.iloc[i]
@@ -125,7 +128,12 @@ def run_event_backtest(
                 if ckey not in frame_slice_cache:
                     frame_slice_cache[ckey]=frame.iloc[max(0,pos-400):pos]
                 frames[name]=frame_slice_cache[ckey]
-            out = predictor.predict(history, tt, equity, frames=frames)
+            if reactive_event_times is not None:
+                event_pos=reactive_event_times.searchsorted(now,side="right")
+                reactive_bias=str(reactive_events.iloc[event_pos-1].bias) if event_pos else "neutral"
+                out=predictor.predict(history,tt,equity,frames=frames,bias_override=reactive_bias)
+            else:
+                out=predictor.predict(history,tt,equity,frames=frames)
             if out.entry is not None and out.position_size:
                 side = "long" if out.bias == "bullish" else "short"
                 setup_key="|".join(str(v or "") for v in (side,out.zone,out.sweep_time,out.reclaim_time))
