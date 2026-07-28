@@ -33,6 +33,7 @@ def run_event_backtest(
     mode: str = "reactive",
     same_bar_policy: str = "conservative",
     force_close: bool = True,
+    decision_start=None,
     progress=None,
     resume_state: dict | None = None,
     checkpoint=None,
@@ -100,7 +101,8 @@ def run_event_backtest(
                 row, equity = _close_trade(open_trade, exit_price, now, equity, fee_bps, "stop" if use_stop else "target")
                 records.append(row); open_trade = None
 
-        if open_trade is None and pending is None and i % decision_stride == 0 and i < len(bars) - 1:
+        decisions_open = decision_start is None or now >= pd.Timestamp(decision_start)
+        if decisions_open and open_trade is None and pending is None and i % decision_stride == 0 and i < len(bars) - 1:
             history = bars.iloc[max(0, i-analysis_lookback_bars+1):i+1]
             # Strict cutoff is the decision timestamp. Exchange events after it are invisible.
             trade_end = trade_times.searchsorted(pd.Timestamp(now), side="left")

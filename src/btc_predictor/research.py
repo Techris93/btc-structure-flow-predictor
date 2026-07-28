@@ -31,23 +31,44 @@ def fetch_binance_one_minute(start, end, dataset_path: Path, status: JsonStore):
     start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
     end = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
     existing = pd.read_csv(dataset_path, parse_dates=["close_time"]).set_index("close_time") if dataset_path.exists() else pd.DataFrame()
-    cursor = int(existing.index[-1].timestamp() * 1000) + 1 if len(existing) else int(start.timestamp() * 1000)
-    end_ms, pages = int(end.timestamp() * 1000), 0
-    while cursor < end_ms:
-        response = requests.get("https://fapi.binance.com/fapi/v1/klines", params={"symbol":"BTCUSDT","interval":"1m","startTime":cursor,"endTime":end_ms,"limit":1500}, timeout=30)
-        response.raise_for_status(); payload = response.json()
-        if not payload: break
-        raw = pd.DataFrame(payload)
-        page = pd.DataFrame({
-            "close_time": pd.to_datetime(pd.to_numeric(raw[6]), unit="ms", utc=True),
-            "open": pd.to_numeric(raw[1]), "high": pd.to_numeric(raw[2]), "low": pd.to_numeric(raw[3]),
-            "close": pd.to_numeric(raw[4]), "volume": pd.to_numeric(raw[5]),
-            "taker_buy_volume": pd.to_numeric(raw[9]), "trades": pd.to_numeric(raw[8]),
-        }).set_index("close_time")
-        existing = pd.concat([existing, page]).loc[lambda x: ~x.index.duplicated(keep="last")].sort_index()
-        existing.to_csv(dataset_path)
-        cursor = int(raw.iloc[-1, 6]) + 1; pages += 1
-        status.write({"status":"running","phase":"fetching","checkpoint":"dataset_page","pages":pages,"bars":len(existing),"last_close":str(existing.index[-1])})
+    start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+    def _fetch_pages(from_ms, to_ms, pages):
+        frames = []
+        cursor = from_ms
+        while cursor < to_ms:
+            response = requests.get("https://fapi.binance.com/fapi/v1/klines", params={"symbol":"BTCUSDT","interval":"1m","startTime":cursor,"endTime":to_ms,"limit":1500}, timeout=30)
+            response.raise_for_status(); payload = response.json()
+            if not payload: break
+            raw = pd.DataFrame(payload)
+            page = pd.DataFrame({
+                "close_time": pd.to_datetime(pd.to_numeric(raw[6]), unit="ms", utc=True),
+                "open": pd.to_numeric(raw[1]), "high": pd.to_numeric(raw[2]), "low": pd.to_numeric(raw[3]),
+                "close": pd.to_numeric(raw[4]), "volume": pd.to_numeric(raw[5]),
+                "taker_buy_volume": pd.to_numeric(raw[9]), "trades": pd.to_numeric(raw[8]),
+            }).set_index("close_time")
+            frames.append(page)
+            cursor = int(raw.iloc[-1, 6]) + 1; pages += 1
+            merged = pd.concat([existing, *frames]) if len(existing) else pd.concat(frames)
+            merged = merged.loc[lambda x: ~x.index.duplicated(keep="last")].sort_index()
+            merged.to_csv(dataset_path)
+            status.write({"status":"running","phase":"fetching","checkpoint":"dataset_page","pages":pages,"bars":len(merged),"last_close":str(merged.index[-1])})
+        return frames, pages
+
+    pages = 0
+    # Backfill the head when a reused dataset starts after the requested window.
+    if len(existing) and int(existing.index[0].timestamp() * 1000) > start_ms:
+        head_end = int(existing.index[0].timestamp() * 1000) - 1
+        head_frames, pages = _fetch_pages(start_ms, head_end, pages)
+        if head_frames:
+            existing = pd.concat([*head_frames, existing]).loc[lambda x: ~x.index.duplicated(keep="last")].sort_index()
+            existing.to_csv(dataset_path)
+    cursor = int(existing.index[-1].timestamp() * 1000) + 1 if len(existing) else start_ms
+    if cursor < end_ms:
+        tail_frames, pages = _fetch_pages(cursor, end_ms, pages)
+        if tail_frames:
+            existing = pd.concat([existing, *tail_frames]).loc[lambda x: ~x.index.duplicated(keep="last")].sort_index()
+            existing.to_csv(dataset_path)
     return existing.loc[(existing.index >= start) & (existing.index <= end)]
 
 
@@ -61,7 +82,8 @@ def proxy_trades(one_minute: pd.DataFrame):
 
 
 def run_comparison(data_dir, start, end, config=None):
-    config = {"fee_bps":5,"slippage_bps":2,"same_bar_policy":"conservative","decision_stride":1, **(config or {})}
+    config = {"fee_bps":5,"slippage_bps":2,"same_bar_policy":"conservative","decision_stride":1,"warmup_days":10, **(config or {})}
+    warmup_days = int(config.get("warmup_days", 10))
     root = Path(data_dir); root.mkdir(parents=True, exist_ok=True)
     status, result_store = JsonStore(root/"status.json"), JsonStore(root/"result.json")
     identity = {"revision":_revision(),"start":str(start),"end":str(end),"config":config}
@@ -69,10 +91,12 @@ def run_comparison(data_dir, start, end, config=None):
     prior = result_store.read({})
     if prior.get("run_hash") == run_hash and prior.get("status") == "complete": return prior
     status.write({"status":"running","phase":"fetching","run_hash":run_hash,"identity":identity,"started_at":pd.Timestamp.utcnow().isoformat()})
-    bars = fetch_binance_one_minute(start, end, root/"binance_1m.csv", status)
+    fetch_start = pd.Timestamp(start) - pd.Timedelta(days=warmup_days)
+    bars = fetch_binance_one_minute(fetch_start, end, root/"binance_1m.csv", status)
     dataset_hash = hashlib.sha256(pd.util.hash_pandas_object(bars, index=True).values.tobytes()).hexdigest()
     trades = proxy_trades(bars)
     outputs = {}
+    bt_config = {key: value for key, value in config.items() if key != "warmup_days"}
     for mode in ("reactive", "mtf"):
         checkpoint = JsonStore(root/f"{run_hash}-{mode}.json")
         saved = checkpoint.read({})
@@ -83,7 +107,7 @@ def run_comparison(data_dir, start, end, config=None):
             checkpoint.write({"complete":False,"dataset_hash":dataset_hash,"resume_state":replay_state,"bars_processed":replay_state["next_i"],"updated_at":pd.Timestamp.utcnow().isoformat()})
         def progress(done, total, ledger):
             status.write({"status":"running","phase":"backtesting","variant":mode,"bars_processed":done,"total_bars":total,"closed_trades":len(ledger),"run_hash":run_hash})
-        ledger, stats = run_event_backtest(bars, trades, Predictor(), mode=mode, progress=progress, resume_state=resume, checkpoint=save_resume, **config)
+        ledger, stats = run_event_backtest(bars, trades, Predictor(), mode=mode, progress=progress, resume_state=resume, checkpoint=save_resume, decision_start=start, **bt_config)
         ledger.to_csv(root/f"{run_hash}-{mode}-ledger.csv", index=False)
         checkpoint.write({"complete":True,"dataset_hash":dataset_hash,"stats":stats,"ledger":f"{run_hash}-{mode}-ledger.csv"})
         outputs[mode] = stats

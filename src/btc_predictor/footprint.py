@@ -41,9 +41,10 @@ def _finish_features(g, window):
 
 def orderflow_features(trades: pd.DataFrame, freq="1min", window=100) -> pd.DataFrame:
     x=trades.copy(); x["time"]=pd.to_datetime(x["time"],utc=True); x["notional"]=x.price*x.qty
-    x["signed"]=np.where(x.side.str.lower().eq("buy"),x.notional,-x.notional)
+    signed=np.where(x.side.str.lower().eq("buy"),x.notional,-x.notional)
+    x["buy_notional"]=np.clip(signed,0,None); x["sell_notional"]=np.clip(-signed,0,None)
     g=x.set_index("time").resample(freq,label="right",closed="right").agg(
-        price=("price","last"),buy=("signed",lambda s:s[s>0].sum()),sell=("signed",lambda s:-s[s<0].sum()),volume=("notional","sum"),trades=("price","size"))
+        price=("price","last"),buy=("buy_notional","sum"),sell=("sell_notional","sum"),volume=("notional","sum"),trades=("price","size"))
     return _finish_features(g,window)
 
 

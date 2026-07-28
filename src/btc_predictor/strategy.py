@@ -77,12 +77,12 @@ class Predictor:
             if frame is None or len(frame)<40:self.last_regimes[name]="unready"; return "neutral"
             signal,events=self._last(frame); signals.append(signal); event_sets.append(events); self.last_regimes[name]=signal
         setup=frames.get("15m")
-        if setup is not None:self.last_regimes["15m"]=self._last(setup)[0]
+        setup_bias=None
+        if setup is not None:
+            setup_bias=self._last(setup)[0]; self.last_regimes["15m"]=setup_bias
         candidate=signals[0] if signals[0]==signals[1] else "neutral"
         if candidate=="neutral":return "neutral"
-        if self.require_15m_align and setup is not None:
-            setup_bias=self._last(setup)[0]
-            self.last_regimes["15m"]=setup_bias
+        if self.require_15m_align and setup_bias is not None:
             if setup_bias not in ("neutral",candidate): return "neutral"
         if self._held_bias in ("bullish","bearish") and candidate!=self._held_bias:
             opposing=any(not e.empty and e.iloc[-1].event=="CHoCH" and e.iloc[-1].bias==candidate for e in event_sets)
