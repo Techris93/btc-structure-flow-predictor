@@ -36,7 +36,7 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
 class Predictor:
     def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.0,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,
                  stop_buffer_atr=0.3,max_stop_atr=2.5,min_target_distance_atr=0.25,measured_move_atr=2.0,
-                 cost_bps=12.0,min_expectancy_r=0.0,entry_mode="market",limit_expiry_minutes=30,
+                 cost_bps=12.0,max_cost_fraction=0.25,min_expectancy_r=0.0,entry_mode="market",limit_expiry_minutes=30,
                  limit_fallback=True,probability_calibration=None):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
@@ -44,7 +44,7 @@ class Predictor:
         self.stop_buffer_atr=stop_buffer_atr; self.max_stop_atr=max_stop_atr
         self.min_target_distance_atr=min_target_distance_atr; self.measured_move_atr=measured_move_atr
         # Execution economics: round-trip fees + slippage, charged against the gate.
-        self.cost_bps=cost_bps; self.min_expectancy_r=min_expectancy_r
+        self.cost_bps=cost_bps; self.max_cost_fraction=max_cost_fraction; self.min_expectancy_r=min_expectancy_r
         if entry_mode not in ("market","limit_retest"): raise ValueError("entry_mode must be market or limit_retest")
         self.entry_mode=entry_mode; self.limit_expiry_minutes=limit_expiry_minutes
         self.limit_fallback=limit_fallback
@@ -100,9 +100,10 @@ class Predictor:
                 return float(np.clip(calibrated*decay,0.05,0.95))
         base = 0.50
         score_add = 0.20 * (score - 0.50)
-        rr_add = 0.10 * (rr - 1.5)
         align = 0.05 if self.last_regimes.get("15m") == bias else 0.0
-        prob = (base + score_add + rr_add + align) * decay
+        # Payoff size must not inflate the hit probability: rr enters through the
+        # expectancy gate, never through the estimate itself.
+        prob = (base + score_add + align) * decay
         return float(np.clip(prob, 0.05, 0.95))
 
     def _calibrated_probability(self, score: float) -> float:
@@ -176,6 +177,7 @@ class Predictor:
             rejection=None
             if risk<=0 or not np.isfinite(risk):rejection="invalid_stop"
             elif risk>self.max_stop_atr*a:rejection="stop_too_wide"
+            elif cost_r is not None and cost_r>self.max_cost_fraction:rejection="costs_exceed_edge"
             elif reward<=0 or rr<self.min_rr:rejection="insufficient_reward_risk"
             elif expectancy_r is None or expectancy_r<self.min_expectancy_r:rejection="negative_expectancy"
             return base,risk,rejection

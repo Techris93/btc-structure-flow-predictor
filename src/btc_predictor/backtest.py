@@ -105,7 +105,7 @@ def run_event_backtest(
                 records.append(row); open_trade = None
 
         decisions_open = decision_start is None or now >= pd.Timestamp(decision_start)
-        if decisions_open and open_trade is None and pending is None and i % decision_stride == 0 and i < len(bars) - 1:
+        if decisions_open and open_trade is None and i % decision_stride == 0 and i < len(bars) - 1:
             history = bars.iloc[max(0, i-analysis_lookback_bars+1):i+1]
             # Strict cutoff is the decision timestamp. Exchange events after it are invisible.
             trade_end = trade_times.searchsorted(pd.Timestamp(now), side="left")
@@ -115,12 +115,18 @@ def run_event_backtest(
                 frames = {name: frame.loc[frame.index <= now].tail(400) for name, frame in derived.items()}
             out = predictor.predict(history, tt, equity, frames=frames)
             if out.entry is not None and out.position_size:
-                pending = {"decision_time": now, "side": "long" if out.bias == "bullish" else "short",
-                           "signal_entry": out.entry, "stop": out.stop, "target": out.target,
-                           "size": out.position_size, "zone": out.zone, "setup_type": out.setup_type,
-                           "limit_price": out.entry if getattr(out, "entry_type", "market") == "limit" else None,
-                           "valid_until": getattr(out, "entry_expires_at", None)}
-            else:
+                side = "long" if out.bias == "bullish" else "short"
+                if pending is not None and (pending["side"], pending["zone"]) != (side, out.zone):
+                    # Live-ledger parity: a new distinct setup supersedes the working order.
+                    rejections["pending_superseded"] += 1
+                    pending = None
+                if pending is None:
+                    pending = {"decision_time": now, "side": side,
+                               "signal_entry": out.entry, "stop": out.stop, "target": out.target,
+                               "size": out.position_size, "zone": out.zone, "setup_type": out.setup_type,
+                               "limit_price": out.entry if getattr(out, "entry_type", "market") == "limit" else None,
+                               "valid_until": getattr(out, "entry_expires_at", None)}
+            elif pending is None:
                 rejections[out.no_trade_reason or "unknown"] += 1
         if progress and (i % 1000 == 0 or i == len(bars)-1):
             progress(i + 1, len(bars), records)

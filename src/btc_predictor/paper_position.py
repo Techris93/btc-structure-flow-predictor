@@ -149,6 +149,7 @@ class PaperLedger:
                 }
 
             if self._open is None and not is_limit_setup and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
+                self._pending = None
                 self._open = {
                     "entry_time": pd.Timestamp(prediction.timestamp).isoformat(),
                     "side": "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else "neutral",

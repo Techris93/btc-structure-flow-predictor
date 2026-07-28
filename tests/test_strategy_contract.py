@@ -131,6 +131,30 @@ def test_limit_fallback_can_be_disabled(monkeypatch):
     assert result.position_size == 0.0
 
 
+def test_trade_rejected_when_costs_exceed_edge_fraction(monkeypatch):
+    idx,o,frames,trades=_sweep_frames()
+    swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
+    far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
+    _patch_bullish_sweep(monkeypatch,[swept,far])
+    # 300 bps round trip on a 4.5-point risk makes cost_r ~0.61 > 0.25 at market and limit.
+    result=Predictor(min_rr=.1,cost_bps=300.0).predict(o,trades,frames=frames)
+    assert result.no_trade_reason == "costs_exceed_edge"
+    assert result.position_size == 0.0
+
+
+def test_probability_does_not_inflate_with_payoff_size(monkeypatch):
+    idx,o,frames,trades=_sweep_frames()
+    swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
+    near_target=Zone("near_target","swing","above",95,96,1,idx[1],idx[2])
+    far_target=Zone("far_target","swing","above",140,141,1,idx[1],idx[2])
+    _patch_bullish_sweep(monkeypatch,[swept,near_target])
+    small_rr=Predictor(min_rr=.1).predict(o,trades,frames=frames)
+    _patch_bullish_sweep(monkeypatch,[swept,far_target])
+    big_rr=Predictor(min_rr=.1).predict(o,trades,frames=frames)
+    assert big_rr.reward_risk > small_rr.reward_risk
+    assert big_rr.probability_tp_before_sl == small_rr.probability_tp_before_sl
+
+
 def test_predictor_requires_15m_alignment_with_higher_timeframes(monkeypatch):
     idx=pd.date_range("2025-01-01",periods=100,freq="min",tz="UTC")
     o=pd.DataFrame({"open":100.,"high":101.,"low":99.,"close":100.,"volume":10.},index=idx)
@@ -314,3 +338,33 @@ def test_paper_ledger_limit_order_expires_unfilled(tmp_path):
     status = ledger.update(stale_pred, None)
     assert status["pending_order"] is None
     assert ledger._open is None
+
+
+def test_paper_ledger_market_entry_clears_working_limit_order(tmp_path):
+    ledger = PaperLedger(tmp_path / "ledger.json")
+    decision = pd.Timestamp("2026-07-25 10:00", tz="UTC")
+    limit_pred = PredictorOutput(
+        timestamp=decision,
+        bias="bullish",
+        entry=100.0,
+        stop=95.0,
+        target=110.0,
+        position_size=1.0,
+        zone="zone1",
+        entry_type="limit",
+        entry_expires_at=(decision + pd.Timedelta(minutes=30)).isoformat(),
+    )
+    ledger.update(limit_pred, None)
+    assert ledger._pending is not None
+    market_pred = PredictorOutput(
+        timestamp=decision + pd.Timedelta(minutes=1),
+        bias="bullish",
+        entry=101.0,
+        stop=96.0,
+        target=111.0,
+        position_size=1.0,
+        zone="zone2",
+    )
+    status = ledger.update(market_pred, None)
+    assert ledger._open is not None
+    assert status["pending_order"] is None

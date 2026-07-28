@@ -78,3 +78,27 @@ def test_limit_order_expires_unfilled():
     trades=pd.DataFrame({"time":ohlc.index,"price":100.,"qty":1.,"side":"buy"})
     ledger, stats = run_event_backtest(ohlc, trades, predictor=LimitPredictor(limit=95.0, valid_bars=2), fee_bps=0, slippage_bps=0)
     assert stats["rejection_counts"].get("limit_expired", 0) >= 1
+
+
+class RotatingLimitPredictor:
+    """Alternates zones so each new setup supersedes the working order."""
+    def __init__(self):
+        self.calls = 0
+    def predict(self, history, trades, equity, frames=None):
+        self.calls += 1
+        now = history.index[-1]
+        zone = "z-a" if self.calls % 2 else "z-b"
+        return PredictorOutput(now, "bullish", "reversal", zone, "confirmed", True,
+                               95.0, 90.0, 110.0, 2, None, 1,
+                               entry_type="limit",
+                               entry_expires_at=(now+pd.Timedelta(minutes=60)).isoformat())
+
+
+def test_new_setup_supersedes_working_limit_order():
+    ohlc=bars(90)
+    trades=pd.DataFrame({"time":ohlc.index,"price":100.,"qty":1.,"side":"buy"})
+    predictor = RotatingLimitPredictor()
+    ledger, stats = run_event_backtest(ohlc, trades, predictor=predictor, fee_bps=0, slippage_bps=0)
+    # Limit at 95 never touched by 99.5-100.5 bars: no fills, but supersession counted.
+    assert stats["rejection_counts"].get("pending_superseded", 0) >= 1
+    assert stats["rejection_counts"].get("limit_expired", 0) == 0
