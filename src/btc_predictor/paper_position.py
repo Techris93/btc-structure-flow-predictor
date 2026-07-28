@@ -146,6 +146,7 @@ class PaperLedger:
                     "zone": prediction.zone,
                     "probability_tp_before_sl": prediction.probability_tp_before_sl,
                     "valid_until": prediction.entry_expires_at,
+                    "max_holding_minutes": getattr(prediction, "max_holding_minutes", None),
                 }
 
             if self._open is None and not is_limit_setup and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
@@ -159,6 +160,7 @@ class PaperLedger:
                     "size": float(prediction.position_size),
                     "zone": prediction.zone,
                     "probability_tp_before_sl": prediction.probability_tp_before_sl,
+                    "max_holding_minutes": getattr(prediction, "max_holding_minutes", None),
                 }
 
                 # Check exit immediately on entry candle
@@ -202,6 +204,7 @@ class PaperLedger:
                 "size": pending["size"],
                 "zone": pending.get("zone"),
                 "probability_tp_before_sl": pending.get("probability_tp_before_sl"),
+                "max_holding_minutes": pending.get("max_holding_minutes"),
             }
             self._pending = None
             self._check_exit(current_ohlc.loc[ohlc_index_utc >= pd.Timestamp(ts)])
@@ -235,6 +238,15 @@ class PaperLedger:
                 if float(bar.low) <= target:
                     self._close(ts, target, "target")
                     return
+
+        # Time-based exit: continuation trades are thesised for a fixed
+        # horizon; if neither stop nor target resolved by then, close at market.
+        max_hold = self._open.get("max_holding_minutes")
+        if max_hold is not None and len(ohlc_index_utc):
+            latest = ohlc_index_utc[-1]
+            held_minutes = (latest - entry_time).total_seconds() / 60
+            if held_minutes >= max_hold:
+                self._close(latest, float(ohlc["close"].iloc[-1]), "time_exit")
 
     def _close(self, exit_time, exit_price, reason):
         if self._open is None:

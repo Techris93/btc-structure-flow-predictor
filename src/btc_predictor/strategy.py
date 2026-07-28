@@ -72,7 +72,8 @@ class Predictor:
                  require_drift_alignment=True,drift_lookback_bars=96,zone_score_adjustments=None,
                  regime_gating=True,continuation_enabled=True,reversal_enabled=True,
                  range_er=0.12,trend_er=0.24,continuation_stop_atr=1.75,continuation_min_rr=1.5,
-                 continuation_hold_hours=18.0,continuation_prior=0.55,continuation_funding_filter=True):
+                 continuation_hold_hours=18.0,continuation_prior=0.55,continuation_funding_filter=True,
+                 continuation_funding_required=True):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
         # Risk framework: structural stop + buffer, hard width cap, noise-filtered targets.
@@ -105,6 +106,9 @@ class Predictor:
         # continuation ran 60-71% at 12-24h); deliberately set below that.
         self.continuation_prior=continuation_prior
         self.continuation_funding_filter=continuation_funding_filter
+        # When required, a missing funding print means "do not trade blind":
+        # the validated system only ran with the filter active.
+        self.continuation_funding_required=continuation_funding_required
         self._calibration=self._load_calibration(probability_calibration)
         self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
 
@@ -230,7 +234,10 @@ class Predictor:
         funding=(context or {}).get("funding_rate")
         base=dict(setup_type="continuation",regime=regime_info["regime"],efficiency_ratio=regime_info["er"],
                   funding_rate=funding,sweep_status="none",entry_type="limit")
-        if self.continuation_funding_filter and funding is not None and np.isfinite(funding):
+        funding_known=funding is not None and np.isfinite(funding)
+        if self.continuation_funding_filter and not funding_known and self.continuation_funding_required:
+            return self._output(now,bias,**base,no_trade_reason="funding_unavailable")
+        if self.continuation_funding_filter and funding_known:
             # Funding sign confirms the crowd is positioned with the drift;
             # fighting it removed the edge in the feature study.
             if (bias=="bullish" and funding<0) or (bias=="bearish" and funding>0):

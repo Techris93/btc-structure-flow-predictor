@@ -497,3 +497,32 @@ def test_paper_ledger_market_entry_clears_working_limit_order(tmp_path):
     status = ledger.update(market_pred, None)
     assert ledger._open is not None
     assert status["pending_order"] is None
+
+
+def test_paper_ledger_time_exit_closes_at_horizon():
+    idx = pd.date_range("2025-01-01", periods=40, freq="h", tz="UTC")
+    ohlc = pd.DataFrame(
+        {"open": [100.0]*40, "high": [101.0]*40, "low": [99.0]*40,
+         "close": [100.0]*40, "volume": [1.0]*40}, index=idx)
+    ledger = PaperLedger()
+    pred = PredictorOutput(
+        timestamp=idx[0], bias="bullish", entry=100.0, stop=90.0, target=120.0,
+        position_size=1.0, max_holding_minutes=18*60,
+    )
+    ledger.update(pred, ohlc.iloc[:1])
+    assert ledger._open is not None
+    # 39 hours of bars with neither stop nor target touched -> time_exit at close.
+    ledger.update(PredictorOutput(timestamp=idx[-1], bias="bullish"), ohlc)
+    assert ledger._open is None
+    assert len(ledger._closed) == 1
+    assert ledger._closed[0]["exit_reason"] == "time_exit"
+    assert ledger._closed[0]["exit"] == 100.0
+    # Without a hold limit the same position stays open.
+    ledger2 = PaperLedger()
+    pred2 = PredictorOutput(
+        timestamp=idx[0], bias="bullish", entry=100.0, stop=90.0, target=120.0,
+        position_size=1.0,
+    )
+    ledger2.update(pred2, ohlc.iloc[:1])
+    ledger2.update(PredictorOutput(timestamp=idx[-1], bias="bullish"), ohlc)
+    assert ledger2._open is not None

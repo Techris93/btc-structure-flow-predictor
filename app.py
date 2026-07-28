@@ -42,6 +42,8 @@ predictor = Predictor(
     max_cost_fraction=float(os.getenv("PREDICTOR_MAX_COST_FRACTION", "0.25")),
     min_stop_atr=float(os.getenv("PREDICTOR_MIN_STOP_ATR", "0.5")),
     require_drift_alignment=os.getenv("PREDICTOR_DRIFT_ALIGNMENT", "true").lower() != "false",
+    reversal_enabled=os.getenv("PREDICTOR_REVERSAL_ENABLED", "false").lower() == "true",
+    continuation_funding_required=os.getenv("PREDICTOR_FUNDING_REQUIRED", "true").lower() != "false",
     allow_1h_15m_regime=os.getenv("PREDICTOR_ALLOW_1H_15M_REGIME", "false").lower() == "true",
     probability_calibration=os.getenv("PREDICTOR_CALIBRATION_PATH") or None,
 )
@@ -194,6 +196,41 @@ def _binance_flow_bars(limit=None):
         "taker_buy_volume":pd.to_numeric(raw[9]),
     }).set_index("close_time")
     return frame.loc[frame.index<=pd.Timestamp.now(tz="UTC")]
+
+
+_funding_cache = {"value": None, "fetched_at": None}
+
+
+def _funding_rate():
+    """Latest BTCUSDT perp funding rate, cached ~10 minutes.
+
+    Funding prints every 8h, so staleness is a non-issue. Binance premiumIndex
+    (weight 1) first, Bybit tickers as fallback; serves the last known value
+    for up to an hour if both endpoints fail.
+    """
+    now = pd.Timestamp.now(tz="UTC")
+    cached = _funding_cache
+    if cached["fetched_at"] is not None and (now - cached["fetched_at"]).total_seconds() < 600:
+        return cached["value"]
+    value = None
+    try:
+        response = _http_get("https://fapi.binance.com/fapi/v1/premiumIndex",
+                             params={"symbol": "BTCUSDT"}, timeout=10)
+        value = float(response.json()["lastFundingRate"])
+    except Exception as exc:
+        logger.warning("Binance funding unavailable: %s", exc)
+        try:
+            response = _http_get("https://api.bybit.com/v5/market/tickers",
+                                 params={"category": "linear", "symbol": "BTCUSDT"}, timeout=10)
+            value = float(response.json()["result"]["list"][0]["fundingRate"])
+        except Exception as exc2:
+            logger.warning("Bybit funding unavailable: %s", exc2)
+    if value is not None:
+        _funding_cache.update({"value": value, "fetched_at": now})
+        return value
+    if cached["fetched_at"] is not None and (now - cached["fetched_at"]).total_seconds() < 3600:
+        return cached["value"]
+    return None
 
 
 def _persist_subscriptions():
@@ -1078,7 +1115,9 @@ def _live_loop():
                     flow_source = None
             else:
                 flow_source = None
-            result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
+            funding = _funding_rate()
+            context = {"funding_rate": funding} if funding is not None else None
+            result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars, context=context)
             paper_status = paper_ledger.update(result, ohlc)
             notification_now = pd.Timestamp.now(tz="UTC")
             lifecycle_before = signal_lifecycle_store.read(
@@ -1086,7 +1125,7 @@ def _live_loop():
             )
             active_before = lifecycle_before.get("active") or {}
             definitive_exit = any(
-                str(trade.get("exit_reason") or "").lower() in ("target", "stop")
+                str(trade.get("exit_reason") or "").lower() in ("target", "stop", "time_exit")
                 for trade in (paper_status.get("newly_closed") or [])
             )
             try:
