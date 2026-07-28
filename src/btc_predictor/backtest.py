@@ -51,6 +51,9 @@ def run_event_backtest(
     if state.get("held_bias") in {"bullish","bearish","neutral"}: predictor._held_bias = state["held_bias"]
     bars = ohlc.sort_index().copy()
     bars.index = pd.to_datetime(bars.index, utc=True)
+    if decision_start is not None:
+        decision_start = pd.Timestamp(decision_start)
+        decision_start = decision_start.tz_localize("UTC") if decision_start.tzinfo is None else decision_start.tz_convert("UTC")
     trade_data = trades.copy()
     trade_data["time"] = pd.to_datetime(trade_data.time, utc=True)
     trade_data = trade_data.sort_values("time")
