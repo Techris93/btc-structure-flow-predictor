@@ -62,21 +62,28 @@ def fetch_binance_one_minute(start, end, dataset_path: Path, status: JsonStore):
             merged = merged.loc[lambda x: ~x.index.duplicated(keep="last")].sort_index()
             merged.to_csv(dataset_path)
             status.write({"status":"running","phase":"fetching","checkpoint":"dataset_page","pages":pages,"bars":len(merged),"last_close":str(merged.index[-1])})
-        return frames, pages
+        return (pd.concat(frames) if frames else pd.DataFrame()), pages
 
+    # Unified gap detection: close-indexed 1m bars arrive exactly 60s apart on a
+    # 24/7 market, so any wider spacing is missing data — head, tail, or holes
+    # left behind by interrupted partial downloads.
+    if len(existing):
+        ranges = []
+        prev = start_ms - 60_000
+        for ts in existing.index:
+            ts_ms = int(ts.timestamp() * 1000)
+            if ts_ms - prev > 90_000:
+                ranges.append((prev + 60_000, min(ts_ms - 1, end_ms)))
+            prev = ts_ms
+        if end_ms - prev > 90_000:
+            ranges.append((prev + 60_000, end_ms))
+    else:
+        ranges = [(start_ms, end_ms)]
     pages = 0
-    # Backfill the head when a reused dataset starts after the requested window.
-    if len(existing) and int(existing.index[0].timestamp() * 1000) > start_ms:
-        head_end = int(existing.index[0].timestamp() * 1000) - 1
-        head_frames, pages = _fetch_pages(start_ms, head_end, pages)
-        if head_frames:
-            existing = pd.concat([*head_frames, existing]).loc[lambda x: ~x.index.duplicated(keep="last")].sort_index()
-            existing.to_csv(dataset_path)
-    cursor = int(existing.index[-1].timestamp() * 1000) + 1 if len(existing) else start_ms
-    if cursor < end_ms:
-        tail_frames, pages = _fetch_pages(cursor, end_ms, pages)
-        if tail_frames:
-            existing = pd.concat([existing, *tail_frames]).loc[lambda x: ~x.index.duplicated(keep="last")].sort_index()
+    for from_ms, to_ms in ranges:
+        new_rows, pages = _fetch_pages(from_ms, to_ms, pages)
+        if len(new_rows):
+            existing = pd.concat([existing, new_rows]).loc[lambda x: ~x.index.duplicated(keep="last")].sort_index()
             existing.to_csv(dataset_path)
     return existing.loc[(existing.index >= start) & (existing.index <= end)]
 
