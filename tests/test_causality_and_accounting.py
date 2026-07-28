@@ -29,6 +29,7 @@ def test_decision_uses_closed_history_and_fills_next_open():
     assert ledger.iloc[0].entry_time == ohlc.index[81]
     assert ledger.iloc[0].entry == pytest.approx(float(ohlc.open.iloc[81]) * 1.001)
     assert stats["causality"].startswith("close-time decision")
+    assert set(predictor.calls[0][2]) == {"15m"}
 
 
 def test_same_bar_collision_policy_and_end_close_metrics():
@@ -71,6 +72,7 @@ def test_limit_order_fills_only_on_later_touch():
     assert ledger.iloc[0].entry_time == ohlc.index[82]
     # Touch fills at the limit, not at the open.
     assert ledger.iloc[0].entry == pytest.approx(99.0)
+    assert ledger.iloc[0].entry_fee_bps == 2
 
 
 def test_limit_order_expires_unfilled():

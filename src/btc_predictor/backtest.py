@@ -11,7 +11,8 @@ from .timeframes import completed_timeframes
 def _close_trade(open_trade, exit_price, exit_time, equity, fee_bps, reason):
     side_sign = 1 if open_trade["side"] == "long" else -1
     gross = (exit_price - open_trade["entry"]) * open_trade["size"] * side_sign
-    fees = (open_trade["entry"] + exit_price) * open_trade["size"] * fee_bps / 10_000
+    entry_fee_bps=float(open_trade.get("entry_fee_bps",fee_bps))
+    fees = (open_trade["entry"]*entry_fee_bps + exit_price*fee_bps) * open_trade["size"] / 10_000
     pnl = gross - fees
     equity += pnl
     risk_cash = abs(open_trade["entry"] - open_trade["stop"]) * open_trade["size"]
@@ -27,6 +28,7 @@ def run_event_backtest(
     predictor=None,
     initial_equity=100_000,
     fee_bps=5,
+    maker_fee_bps=2,
     slippage_bps=2,
     decision_stride: int = 1,
     analysis_lookback_bars: int = 400,
@@ -48,6 +50,8 @@ def run_event_backtest(
     equity = float(state.get("equity", initial_equity))
     records = list(state.get("records", [])); open_trade = state.get("open_trade"); pending = state.get("pending")
     rejections, collisions = Counter(state.get("rejections", {})), int(state.get("collisions", 0))
+    candidate_rejections = Counter(state.get("candidate_rejections", {}))
+    attempted_setups = set(state.get("attempted_setups", []))
     if state.get("held_bias") in {"bullish","bearish","neutral"}: predictor._held_bias = state["held_bias"]
     bars = ohlc.sort_index().copy()
     bars.index = pd.to_datetime(bars.index, utc=True)
@@ -60,7 +64,10 @@ def run_event_backtest(
     # Keep datetime values for searchsorted: integer representations can have
     # different units (us/ns) across pandas inputs and admit future rows.
     trade_times = trade_data["time"].reset_index(drop=True)
-    derived = completed_timeframes(bars) if mode == "mtf" else None
+    # Zone/risk construction is always 15m. Reactive mode keeps its 1m bias,
+    # while MTF additionally receives the completed 1h/4h regime frames.
+    derived = completed_timeframes(bars)
+    frame_slice_cache = {}
 
     for i in range(max(80, int(state.get("next_i", 80))), len(bars)):
         now, b = bars.index[i], bars.iloc[i]
@@ -70,7 +77,7 @@ def run_event_backtest(
             if limit_price is None:
                 sign = 1 if pending["side"] == "long" else -1
                 fill = float(b.open) * (1 + sign * slippage_bps / 10_000)
-                open_trade = {**pending, "entry_time": now, "entry": fill}
+                open_trade = {**pending, "entry_time": now, "entry": fill, "entry_fee_bps":fee_bps}
                 pending = None
             else:
                 valid_until = pending.get("valid_until")
@@ -81,11 +88,10 @@ def run_event_backtest(
                     is_long = pending["side"] == "long"
                     touched = float(b.low) <= limit_price if is_long else float(b.high) >= limit_price
                     if touched:
-                        sign = 1 if is_long else -1
-                        # Gaps through the limit fill at the open; touches fill at the limit.
+                        # Passive limits receive price improvement on gaps and no
+                        # adverse entry slippage; maker fees are charged separately.
                         raw_fill = min(float(b.open), limit_price) if is_long else max(float(b.open), limit_price)
-                        fill = raw_fill * (1 + sign * slippage_bps / 10_000)
-                        open_trade = {**pending, "entry_time": now, "entry": fill}
+                        open_trade = {**pending, "entry_time": now, "entry":raw_fill, "entry_fee_bps":maker_fee_bps}
                         pending = None
 
         if open_trade is not None:
@@ -110,29 +116,44 @@ def run_event_backtest(
             # Strict cutoff is the decision timestamp. Exchange events after it are invisible.
             trade_end = trade_times.searchsorted(pd.Timestamp(now), side="left")
             tt = trade_data.iloc[max(0, trade_end-3000):trade_end]
-            frames = None
-            if mode == "mtf":
-                frames = {name: frame.loc[frame.index <= now].tail(400) for name, frame in derived.items()}
+            frames = {}
+            frame_names=("15m",) if mode=="reactive" else ("15m","1h","4h")
+            for name in frame_names:
+                frame=derived[name]
+                pos=frame.index.searchsorted(now,side="right")
+                ckey=(name,pos)
+                if ckey not in frame_slice_cache:
+                    frame_slice_cache[ckey]=frame.iloc[max(0,pos-400):pos]
+                frames[name]=frame_slice_cache[ckey]
             out = predictor.predict(history, tt, equity, frames=frames)
             if out.entry is not None and out.position_size:
                 side = "long" if out.bias == "bullish" else "short"
-                if pending is not None and (pending["side"], pending["zone"]) != (side, out.zone):
-                    # Live-ledger parity: a new distinct setup supersedes the working order.
-                    rejections["pending_superseded"] += 1
-                    pending = None
-                if pending is None:
-                    pending = {"decision_time": now, "side": side,
-                               "signal_entry": out.entry, "stop": out.stop, "target": out.target,
+                setup_key="|".join(str(v or "") for v in (side,out.zone,out.sweep_time,out.reclaim_time))
+                if setup_key in attempted_setups:
+                    rejections["duplicate_setup"] += 1
+                else:
+                    if pending is not None and (pending["side"], pending["zone"]) != (side, out.zone):
+                        # Live-ledger parity: a new distinct setup supersedes the working order.
+                        rejections["pending_superseded"] += 1
+                        pending = None
+                    if pending is None:
+                        attempted_setups.add(setup_key)
+                        pending = {"decision_time": now, "side": side,
+                                   "signal_entry": out.entry, "stop": out.stop, "target": out.target,
                                "size": out.position_size, "zone": out.zone, "setup_type": out.setup_type,
-                               "limit_price": out.entry if getattr(out, "entry_type", "market") == "limit" else None,
-                               "valid_until": getattr(out, "entry_expires_at", None)}
+                               "entry_type":getattr(out,"entry_type","market"),
+                                   "limit_price": out.entry if getattr(out, "entry_type", "market") == "limit" else None,
+                                   "valid_until": getattr(out, "entry_expires_at", None)}
             elif pending is None:
                 rejections[out.no_trade_reason or "unknown"] += 1
+                for entry_type, reason in (getattr(out,"candidate_rejections",None) or {}).items():
+                    candidate_rejections[f"{entry_type}:{reason}"] += 1
         if progress and (i % 1000 == 0 or i == len(bars)-1):
             progress(i + 1, len(bars), records)
         if checkpoint and i % 1000 == 0:
             checkpoint({"next_i":i+1,"equity":equity,"records":records,"open_trade":open_trade,"pending":pending,
-                        "rejections":dict(rejections),"collisions":collisions,"held_bias":predictor._held_bias})
+                        "rejections":dict(rejections),"candidate_rejections":dict(candidate_rejections),
+                        "attempted_setups":sorted(attempted_setups),"collisions":collisions,"held_bias":predictor._held_bias})
 
     open_position_status = None
     if open_trade is not None:
@@ -164,6 +185,7 @@ def run_event_backtest(
         "average_hold_minutes": float(result.hold_minutes.mean()) if len(result) else None,
         "same_bar_collisions": collisions, "same_bar_policy": same_bar_policy,
         "open_position": open_position_status, "rejection_counts": dict(rejections),
+        "candidate_rejection_counts": dict(candidate_rejections),
         "causality": "close-time decision; next-open fill; trades < decision time",
     }
     return result, stats

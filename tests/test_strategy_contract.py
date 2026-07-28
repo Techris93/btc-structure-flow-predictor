@@ -91,7 +91,7 @@ def test_limit_retest_entry_rests_at_reclaimed_zone_edge(monkeypatch):
     swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
     far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
     _patch_bullish_sweep(monkeypatch,[swept,far])
-    result=Predictor(min_rr=.1,entry_mode="limit_retest",limit_expiry_minutes=30).predict(o,trades,frames=frames)
+    result=Predictor(min_rr=.1,entry_mode="limit_retest",limit_expiry_minutes=30,limit_buffer_atr=0.0).predict(o,trades,frames=frames)
     assert result.entry_type == "limit"
     assert result.entry == 91.0
     assert result.entry_expires_at is not None
@@ -103,7 +103,7 @@ def test_late_market_entry_falls_back_to_limit_at_reclaimed_edge(monkeypatch):
     far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
     _patch_bullish_sweep(monkeypatch,[swept,far])
     # Market risk 92-(89-1.5)=4.5 exceeds the 0.8 ATR cap; limit risk 91-87.5=3.5 does not.
-    result=Predictor(min_rr=.1,max_stop_atr=.8).predict(o,trades,frames=frames)
+    result=Predictor(min_rr=.1,max_stop_atr=.8,limit_buffer_atr=0.0).predict(o,trades,frames=frames)
     assert result.no_trade_reason is None
     assert result.entry_type == "limit"
     assert result.entry == 91.0
@@ -136,8 +136,8 @@ def test_trade_rejected_when_costs_exceed_edge_fraction(monkeypatch):
     swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
     far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
     _patch_bullish_sweep(monkeypatch,[swept,far])
-    # 300 bps round trip on a 4.5-point risk makes cost_r ~0.61 > 0.25 at market and limit.
-    result=Predictor(min_rr=.1,cost_bps=300.0).predict(o,trades,frames=frames)
+    # An extreme 300 bps estimate exceeds the safety ceiling for both routes.
+    result=Predictor(min_rr=.1,cost_bps=300.0,limit_cost_bps=300.0).predict(o,trades,frames=frames)
     assert result.no_trade_reason == "costs_exceed_edge"
     assert result.position_size == 0.0
 
@@ -155,6 +155,42 @@ def test_probability_does_not_inflate_with_payoff_size(monkeypatch):
     assert big_rr.probability_tp_before_sl == small_rr.probability_tp_before_sl
 
 
+def test_probability_decay_converges_to_neutral_not_zero():
+    predictor=Predictor()
+    fresh=predictor._probability_estimate(.9,2.0,"bullish",decay=1.0)
+    stale=predictor._probability_estimate(.9,2.0,"bullish",decay=0.0)
+    assert fresh > .5
+    assert stale == .5
+
+
+def test_reactive_risk_cap_uses_completed_15m_volatility():
+    idx=pd.date_range("2025-01-01",periods=400,freq="min",tz="UTC")
+    o=pd.DataFrame({"open":100.,"high":102.,"low":98.,"close":100.,"volume":10.},index=idx)
+    value=Predictor._risk_atr(o,{},setup_atr=.25)
+    assert value >= 4.0
+
+
+def test_failed_market_and_limit_candidates_are_both_reported(monkeypatch):
+    idx,o,frames,trades=_sweep_frames()
+    swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
+    far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
+    _patch_bullish_sweep(monkeypatch,[swept,far])
+    result=Predictor(min_rr=.1,max_stop_atr=.5).predict(o,trades,frames=frames)
+    assert set(result.candidate_rejections)=={"market","limit"}
+
+
+def test_limit_candidate_uses_lower_execution_cost_than_market(monkeypatch):
+    idx,o,frames,trades=_sweep_frames()
+    swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
+    far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
+    _patch_bullish_sweep(monkeypatch,[swept,far])
+    market=Predictor(min_rr=.1,limit_fallback=False,max_cost_fraction=10).predict(o,trades,frames=frames)
+    limit=Predictor(min_rr=.1,entry_mode="limit_retest",max_cost_fraction=10).predict(o,trades,frames=frames)
+    assert market.estimated_cost_bps == 14.0
+    assert limit.estimated_cost_bps == 9.0
+    assert limit.estimated_cost_r < market.estimated_cost_r
+
+
 def test_predictor_requires_15m_alignment_with_higher_timeframes(monkeypatch):
     idx=pd.date_range("2025-01-01",periods=100,freq="min",tz="UTC")
     o=pd.DataFrame({"open":100.,"high":101.,"low":99.,"close":100.,"volume":10.},index=idx)
@@ -166,6 +202,17 @@ def test_predictor_requires_15m_alignment_with_higher_timeframes(monkeypatch):
     monkeypatch.setattr(Predictor,"_last",fake_last)
     predictor=Predictor()
     assert predictor._regime_bias(frames)=="neutral"
+
+
+def test_predictor_does_not_override_4h_conflict_with_1h_15m_alignment(monkeypatch):
+    idx=pd.date_range("2025-01-01",periods=100,freq="min",tz="UTC")
+    frames={name:pd.DataFrame({"open":100.,"high":101.,"low":99.,"close":100.,"volume":1.},index=idx) for name in ("15m","1h","4h")}
+    def fake_last(self,frame):
+        if frame is frames["4h"]: bias="bearish"
+        else: bias="bullish"
+        return bias,pd.DataFrame(columns=["bias","event","level"])
+    monkeypatch.setattr(Predictor,"_last",fake_last)
+    assert Predictor()._regime_bias(frames)=="neutral"
 
 
 def test_paper_ledger_keeps_position_when_bias_remains_on_same_side():

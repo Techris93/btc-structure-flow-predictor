@@ -9,6 +9,8 @@ from .indicators import atr
 from .models import Zone
 from .structure import confirmed_pivots, structure_events
 
+_MAX_ZONE_CACHE_ENTRIES = 128
+
 
 def _zone_id(kind, side, level, available_at, extra=""):
     raw=f"{kind}|{side}|{level:.8f}|{pd.Timestamp(available_at).isoformat()}|{extra}"
@@ -68,6 +70,11 @@ def _profile_and_vwap(x, width):
 
 def build_projected_zones(ohlc: pd.DataFrame, lookback: int = 1000, pivot_left: int = 2, pivot_right: int = 2, expiry_bars: int = 120) -> list[Zone]:
     """Causal 15m zone book from swings, equal levels, periods, sessions, profile and VWAP."""
+    if ohlc.empty: return []
+    last=ohlc.iloc[-1]
+    cache_key = (ohlc.index[0],ohlc.index[-1],len(ohlc),float(last.open),float(last.high),float(last.low),float(last.close),lookback,pivot_left,pivot_right,expiry_bars)
+    if hasattr(build_projected_zones, "_cache") and cache_key in build_projected_zones._cache:
+        return build_projected_zones._cache[cache_key]
     x=ohlc.tail(lookback).copy().sort_index(); a=atr(x).ffill(); piv=confirmed_pivots(x,pivot_left,pivot_right)
     if piv.empty:
         return []
@@ -133,7 +140,11 @@ def build_projected_zones(ohlc: pd.DataFrame, lookback: int = 1000, pivot_left: 
     max_zones = int(os.getenv("MAX_PROJECTED_ZONES", "200"))
     final = final[:max_zones]
     unique={z.zone_id:z for z in final}
-    return sorted(unique.values(),key=lambda z:(pd.Timestamp(z.available_at),z.zone_id))
+    res = sorted(unique.values(),key=lambda z:(pd.Timestamp(z.available_at),z.zone_id))
+    if not hasattr(build_projected_zones, "_cache"): build_projected_zones._cache = {}
+    if len(build_projected_zones._cache) >= _MAX_ZONE_CACHE_ENTRIES: build_projected_zones._cache.clear()
+    build_projected_zones._cache[cache_key] = res
+    return res
 
 
 def mark_zone_state(zones: list[Zone], ohlc: pd.DataFrame) -> list[Zone]:

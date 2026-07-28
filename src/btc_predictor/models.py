@@ -85,3 +85,8 @@ class PredictorOutput:
     entry_type: str = "market"
     entry_expires_at: str | None = None
     expectancy_r: float | None = None
+    risk_atr: float | None = None
+    stop_distance_atr: float | None = None
+    candidate_rejections: dict[str, str] | None = None
+    estimated_cost_bps: float | None = None
+    estimated_cost_r: float | None = None

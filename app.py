@@ -37,7 +37,10 @@ predictor = Predictor(
     limit_fallback=os.getenv("PREDICTOR_LIMIT_FALLBACK", "true").lower() != "false",
     min_rr=float(os.getenv("PREDICTOR_MIN_RR", "1.0")),
     min_expectancy_r=float(os.getenv("PREDICTOR_MIN_EXPECTANCY_R", "0.0")),
-    cost_bps=float(os.getenv("PREDICTOR_COST_BPS", "12.0")),
+    cost_bps=float(os.getenv("PREDICTOR_COST_BPS", "14.0")),
+    limit_cost_bps=float(os.getenv("PREDICTOR_LIMIT_COST_BPS", "9.0")),
+    max_cost_fraction=float(os.getenv("PREDICTOR_MAX_COST_FRACTION", "0.50")),
+    allow_1h_15m_regime=os.getenv("PREDICTOR_ALLOW_1H_15M_REGIME", "false").lower() == "true",
     probability_calibration=os.getenv("PREDICTOR_CALIBRATION_PATH") or None,
 )
 data_dir = runtime_dir()

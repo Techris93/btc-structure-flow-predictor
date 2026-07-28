@@ -36,17 +36,18 @@ def fetch_binance_one_minute(start, end, dataset_path: Path, status: JsonStore):
     def _fetch_pages(from_ms, to_ms, pages):
         frames = []
         cursor = from_ms
+        session = requests.Session()
         while cursor < to_ms:
             payload = None
-            for attempt in range(5):
+            for attempt in range(10):
                 try:
-                    response = requests.get("https://fapi.binance.com/fapi/v1/klines", params={"symbol":"BTCUSDT","interval":"1m","startTime":cursor,"endTime":to_ms,"limit":1500}, timeout=30)
+                    response = session.get("https://fapi.binance.com/fapi/v1/klines", params={"symbol":"BTCUSDT","interval":"1m","startTime":cursor,"endTime":to_ms,"limit":1500}, timeout=30)
                     response.raise_for_status()
                     payload = response.json()
                     break
-                except requests.RequestException:
-                    if attempt == 4: raise
-                    time.sleep(min(2 ** attempt, 20))
+                except Exception as exc:
+                    if attempt == 9: raise
+                    time.sleep(min(2 * (attempt + 1), 15))
             if payload is None: break
             if not payload: break
             raw = pd.DataFrame(payload)

@@ -20,6 +20,15 @@ def test_sweep_is_atr_bounded_and_can_reclaim_over_multiple_bars():
     assert not detect_sweep(x,z,"bullish",1,.05,1,3)["confirmed"]
 
 
+def test_sweep_cannot_predate_zone_availability():
+    idx=pd.date_range("2025-01-01",periods=8,freq="min",tz="UTC")
+    x=pd.DataFrame({"open":100.,"high":101.,"low":[99,94,99,99,99,99,99,99],"close":[100,95,101,100,100,100,100,100],"volume":1.},index=idx)
+    # The apparent breach/reclaim happened before this dynamic zone was knowable.
+    z=Zone("z","volume_lvn","below",96,97,1,idx[0],idx[4])
+    result=detect_sweep(x,z,"bullish",10,.05,2,7)
+    assert result == {"status":"none","confirmed":False}
+
+
 def test_orderflow_reversals_are_symmetric_and_exchange_agreement_is_required():
     idx=pd.date_range("2025-01-01",periods=3,freq="min",tz="UTC")
     trades=[]

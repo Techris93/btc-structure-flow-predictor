@@ -3,8 +3,22 @@ import numpy as np
 import pandas as pd
 from .indicators import atr
 
+_pivots_cache: dict[tuple, pd.DataFrame] = {}
+_events_cache: dict[tuple, pd.DataFrame] = {}
+_MAX_CACHE_ENTRIES = 256
+
+
+def _frame_key(ohlc: pd.DataFrame) -> tuple:
+    last=ohlc.iloc[-1]
+    return (ohlc.index[0],ohlc.index[-1],len(ohlc),float(last.open),float(last.high),float(last.low),float(last.close))
+
 def confirmed_pivots(ohlc: pd.DataFrame, left: int = 2, right: int = 2) -> pd.DataFrame:
     """Return pivots only at their confirmation timestamp (right bars later)."""
+    if ohlc.empty:
+        return pd.DataFrame(columns=["swing_id", "pivot_time", "available_at", "price", "kind", "atr"])
+    cache_key = (*_frame_key(ohlc), left, right)
+    if cache_key in _pivots_cache:
+        return _pivots_cache[cache_key]
     n = len(ohlc)
     if n < left + right + 1:
         return pd.DataFrame(columns=["swing_id", "pivot_time", "available_at", "price", "kind", "atr"])
@@ -14,18 +28,35 @@ def confirmed_pivots(ohlc: pd.DataFrame, left: int = 2, right: int = 2) -> pd.Da
     roll_low = low.rolling(window, center=True).min().to_numpy()
     highs, lows = high.to_numpy(), low.to_numpy()
     atr_values = atr(ohlc).to_numpy()
-    index = ohlc.index
-    available = index.to_numpy()
-    rows = []
-    for i in range(left, n - right):
-        ts = index[i]
-        if highs[i] >= roll_high[i]:
-            rows.append({"swing_id": f"high:{pd.Timestamp(ts).isoformat()}:{highs[i]:.8f}", "pivot_time": ts, "available_at": available[i + right], "price": highs[i], "kind": "high", "atr": atr_values[i]})
-        if lows[i] <= roll_low[i]:
-            rows.append({"swing_id": f"low:{pd.Timestamp(ts).isoformat()}:{lows[i]:.8f}", "pivot_time": ts, "available_at": available[i + right], "price": lows[i], "kind": "low", "atr": atr_values[i]})
-    return pd.DataFrame(rows)
+    index_values = ohlc.index.to_numpy()
+    valid=np.arange(left,n-right,dtype=int)
+    high_pos=valid[highs[valid]>=roll_high[valid]]
+    low_pos=valid[lows[valid]<=roll_low[valid]]
+    positions=np.concatenate((high_pos,low_pos))
+    kinds=np.concatenate((np.repeat("high",len(high_pos)),np.repeat("low",len(low_pos))))
+    if len(positions):
+        order=np.argsort(positions,kind="stable"); positions=positions[order]; kinds=kinds[order]
+        prices=np.where(kinds=="high",highs[positions],lows[positions])
+        pivot_times=index_values[positions]
+        res=pd.DataFrame({
+            "swing_id":[f"{kind}:{pd.Timestamp(ts).isoformat()}:{price:.8f}" for kind,ts,price in zip(kinds,pivot_times,prices)],
+            "pivot_time":pivot_times,
+            "available_at":index_values[positions+right],
+            "price":prices,
+            "kind":kinds,
+            "atr":atr_values[positions],
+        })
+    else:
+        res=pd.DataFrame(columns=["swing_id","pivot_time","available_at","price","kind","atr"])
+    if len(_pivots_cache) >= _MAX_CACHE_ENTRIES: _pivots_cache.clear()
+    _pivots_cache[cache_key] = res
+    return res
 
 def structure_events(ohlc: pd.DataFrame, left: int = 2, right: int = 2, buffer_atr: float = .1) -> pd.DataFrame:
+    if ohlc.empty: return pd.DataFrame(columns=["bias", "event", "level"])
+    cache_key = (*_frame_key(ohlc), left, right, buffer_atr)
+    if cache_key in _events_cache:
+        return _events_cache[cache_key]
     piv = confirmed_pivots(ohlc, left, right)
     if piv.empty: return pd.DataFrame(columns=["bias", "event", "level"])
     piv = piv.sort_values("available_at")
@@ -59,4 +90,7 @@ def structure_events(ohlc: pd.DataFrame, left: int = 2, right: int = 2, buffer_a
             low_consumed = True
             rows.append({"timestamp":times[pos],"bias":bias,"event":event,"level":p_price[last_low],"swing_id":p_sid[last_low]})
     out = pd.DataFrame(rows)
-    return out.set_index("timestamp") if not out.empty else out
+    res = out.set_index("timestamp") if not out.empty else out
+    if len(_events_cache) >= _MAX_CACHE_ENTRIES: _events_cache.clear()
+    _events_cache[cache_key] = res
+    return res
