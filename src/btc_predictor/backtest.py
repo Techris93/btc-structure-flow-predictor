@@ -16,7 +16,9 @@ def _close_trade(open_trade, exit_price, exit_time, equity, fee_bps, reason):
     fees = (open_trade["entry"]*entry_fee_bps + exit_price*fee_bps) * open_trade["size"] / 10_000
     pnl = gross - fees
     equity += pnl
-    risk_cash = abs(open_trade["entry"] - open_trade["stop"]) * open_trade["size"]
+    # Original planned risk; the live stop may have been trailed to breakeven.
+    risk_price = float(open_trade.get("risk_price") or abs(open_trade["entry"] - open_trade["stop"]))
+    risk_cash = risk_price * open_trade["size"]
     row = {**open_trade, "exit": exit_price, "pnl": pnl, "equity": equity, "exit_time": exit_time,
            "exit_reason": reason, "r_multiple": pnl / risk_cash if risk_cash else None,
            "hold_minutes": (pd.Timestamp(exit_time) - pd.Timestamp(open_trade["entry_time"])).total_seconds() / 60}
@@ -41,6 +43,9 @@ def run_event_backtest(
     resume_state: dict | None = None,
     checkpoint=None,
     features: pd.DataFrame | None = None,
+    abort_if_below_r: float | None = None,
+    abort_after_minutes: float = 480.0,
+    breakeven_trail_r: float | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Causal replay: decide after close, fill at the next open, never expose future trades."""
     if mode not in {"reactive", "mtf"}:
@@ -87,6 +92,8 @@ def run_event_backtest(
                 sign = 1 if pending["side"] == "long" else -1
                 fill = float(b.open) * (1 + sign * slippage_bps / 10_000)
                 open_trade = {**pending, "entry_time": now, "entry": fill, "entry_fee_bps":fee_bps}
+                open_trade["risk_price"] = abs(fill - float(open_trade["stop"]))
+                open_trade["mfe_r"] = 0.0; open_trade["trailed"] = False
                 pending = None
             else:
                 valid_until = pending.get("valid_until")
@@ -101,23 +108,25 @@ def run_event_backtest(
                         # adverse entry slippage; maker fees are charged separately.
                         raw_fill = min(float(b.open), limit_price) if is_long else max(float(b.open), limit_price)
                         open_trade = {**pending, "entry_time": now, "entry":raw_fill, "entry_fee_bps":maker_fee_bps}
+                        open_trade["risk_price"] = abs(raw_fill - float(open_trade["stop"]))
+                        open_trade["mfe_r"] = 0.0; open_trade["trailed"] = False
                         pending = None
 
         if open_trade is not None:
             side = open_trade["side"]
-            hit_stop = b.low <= open_trade["stop"] if side == "long" else b.high >= open_trade["stop"]
-            hit_target = b.high >= open_trade["target"] if side == "long" else b.low <= open_trade["target"]
-            max_hold = open_trade.get("max_holding_minutes")
-            held = (now - pd.Timestamp(open_trade["entry_time"])).total_seconds() / 60
-            time_exit = max_hold is not None and held >= max_hold
-            if time_exit and not (hit_stop or hit_target):
-                sign = -1 if side == "long" else 1
-                exit_price = float(b.close) * (1 + sign * slippage_bps / 10_000)
-                row, equity = _close_trade(open_trade, exit_price, now, equity, fee_bps, "time_exit")
-                records.append(row); open_trade = None
-        if open_trade is not None:
-            side = open_trade["side"]
-            hit_stop = b.low <= open_trade["stop"] if side == "long" else b.high >= open_trade["stop"]
+            side_sign = 1 if side == "long" else -1
+            risk_price = float(open_trade.get("risk_price") or abs(open_trade["entry"] - open_trade["stop"]))
+            # Track max favorable excursion for management rules.
+            if risk_price > 0:
+                favorable = (float(b.high) - open_trade["entry"]) if side_sign > 0 else (open_trade["entry"] - float(b.low))
+                open_trade["mfe_r"] = max(float(open_trade.get("mfe_r", 0.0)), favorable / risk_price)
+            # Breakeven trail: once the trade proves itself, stop at entry.
+            if (breakeven_trail_r is not None and not open_trade.get("trailed")
+                    and float(open_trade.get("mfe_r", 0.0)) >= breakeven_trail_r):
+                open_trade["stop"] = float(open_trade["entry"])
+                open_trade["trailed"] = True
+            stop_now = float(open_trade["stop"])
+            hit_stop = b.low <= stop_now if side == "long" else b.high >= stop_now
             hit_target = b.high >= open_trade["target"] if side == "long" else b.low <= open_trade["target"]
             if hit_stop or hit_target:
                 if hit_stop and hit_target:
@@ -125,11 +134,27 @@ def run_event_backtest(
                     use_stop = same_bar_policy == "conservative"
                 else:
                     use_stop = hit_stop
-                raw_exit = open_trade["stop"] if use_stop else open_trade["target"]
+                raw_exit = stop_now if use_stop else open_trade["target"]
                 sign = -1 if side == "long" else 1
                 exit_price = float(raw_exit) * (1 + sign * slippage_bps / 10_000)
-                row, equity = _close_trade(open_trade, exit_price, now, equity, fee_bps, "stop" if use_stop else "target")
+                reason = ("breakeven_stop" if (use_stop and open_trade.get("trailed"))
+                          else ("stop" if use_stop else "target"))
+                row, equity = _close_trade(open_trade, exit_price, now, equity, fee_bps, reason)
                 records.append(row); open_trade = None
+            else:
+                held = (now - pd.Timestamp(open_trade["entry_time"])).total_seconds() / 60
+                max_hold = open_trade.get("max_holding_minutes")
+                time_exit = max_hold is not None and held >= max_hold
+                # Momentum abort: a trade that never proved itself by the deadline
+                # almost never recovers; scratch it at market.
+                abort = (abort_if_below_r is not None and held >= abort_after_minutes
+                         and float(open_trade.get("mfe_r", 0.0)) < abort_if_below_r)
+                if time_exit or abort:
+                    sign = -1 if side == "long" else 1
+                    exit_price = float(b.close) * (1 + sign * slippage_bps / 10_000)
+                    reason = "time_exit" if time_exit else "abort_no_momentum"
+                    row, equity = _close_trade(open_trade, exit_price, now, equity, fee_bps, reason)
+                    records.append(row); open_trade = None
 
         decisions_open = decision_start is None or now >= pd.Timestamp(decision_start)
         if decisions_open and open_trade is None and i % decision_stride == 0 and i < len(bars) - 1:
