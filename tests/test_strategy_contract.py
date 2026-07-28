@@ -36,12 +36,61 @@ def test_drift_gate_rejects_counter_drift_bias():
                    index=pd.date_range("2025-01-02 22:00",periods=100,freq="min",tz="UTC"))
     trades=pd.DataFrame({"time":o.index,"price":100.,"qty":1.,"side":"buy"})
     frames={"15m":setup,"1h":setup.tail(40),"4h":setup.tail(40)}
-    result=Predictor().predict(o,trades,frames=frames,bias_override="bearish")
+    # A perfectly linear rise is a high-ER trend regime, where the gate lifts by
+    # design; test the gate itself with regime gating disabled.
+    result=Predictor(regime_gating=False).predict(o,trades,frames=frames,bias_override="bearish")
     assert result.no_trade_reason=="counter_drift"
     # Flat drift imposes no constraint.
     flat=setup.copy(); flat["close"]=100.
-    result=Predictor().predict(o,trades,frames={"15m":flat,"1h":flat.tail(40),"4h":flat.tail(40)},bias_override="bearish")
+    result=Predictor(regime_gating=False).predict(o,trades,frames={"15m":flat,"1h":flat.tail(40),"4h":flat.tail(40)},bias_override="bearish")
     assert result.no_trade_reason!="counter_drift"
+
+
+def _regime_frame(kind):
+    """200-bar 15m frames: sawtooth = range, gentle trend = transition, linear = trend."""
+    import numpy as np
+    idx=pd.date_range("2025-01-01",periods=200,freq="15min",tz="UTC")
+    if kind=="range":
+        closes=[100+(i%8) for i in range(200)]
+    elif kind=="transition":
+        closes=[100+0.35*i+((i%6)-3) for i in range(200)]
+    else:
+        closes=[100+2.0*i for i in range(200)]
+    setup=pd.DataFrame({"open":closes,"high":[c+1 for c in closes],"low":[c-1 for c in closes],
+                        "close":closes,"volume":10.},index=idx)
+    o=pd.DataFrame({"open":100.,"high":101.,"low":99.,"close":float(closes[-1]),"volume":10.},
+                   index=pd.date_range("2025-01-02 22:00",periods=100,freq="min",tz="UTC"))
+    o.iloc[-1,o.columns.get_loc("close")]=float(closes[-1])
+    trades=pd.DataFrame({"time":o.index,"price":float(closes[-1]),"qty":1.,"side":"buy"})
+    return {"15m":setup,"1h":setup.tail(40),"4h":setup.tail(40)},o,trades
+
+
+def test_range_regime_stands_down():
+    frames,o,trades=_regime_frame("range")
+    result=Predictor().predict(o,trades,frames=frames,bias_override="bullish")
+    assert result.no_trade_reason=="regime_range"
+    assert result.regime=="range"
+
+
+def test_transition_regime_emits_continuation_with_time_exit():
+    frames,o,trades=_regime_frame("transition")
+    result=Predictor(continuation_funding_filter=False).predict(o,trades,frames=frames,bias_override="bullish")
+    assert result.setup_type=="continuation"
+    assert result.bias=="bullish"  # drift is upward in the fixture
+    assert result.entry is not None and result.stop<result.entry<result.target
+    assert result.max_holding_minutes==18*60
+    assert result.expectancy_r is not None and result.expectancy_r>=0.05
+    assert result.position_size>0
+
+
+def test_continuation_funding_filter_blocks_crowd_against_drift():
+    frames,o,trades=_regime_frame("transition")
+    blocked=Predictor().predict(o,trades,frames=frames,bias_override="bullish",
+                                context={"funding_rate":-0.0001})
+    assert blocked.no_trade_reason=="funding_disagrees"
+    allowed=Predictor().predict(o,trades,frames=frames,bias_override="bullish",
+                                context={"funding_rate":0.0001})
+    assert allowed.entry is not None
 
 
 def test_zone_demotion_prefers_swing_over_untested_breakout(monkeypatch):

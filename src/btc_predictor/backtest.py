@@ -40,6 +40,7 @@ def run_event_backtest(
     progress=None,
     resume_state: dict | None = None,
     checkpoint=None,
+    features: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Causal replay: decide after close, fill at the next open, never expose future trades."""
     if mode not in {"reactive", "mtf"}:
@@ -65,6 +66,11 @@ def run_event_backtest(
     # Keep datetime values for searchsorted: integer representations can have
     # different units (us/ns) across pandas inputs and admit future rows.
     trade_times = trade_data["time"].reset_index(drop=True)
+    feature_index = None
+    if features is not None and len(features):
+        features = features.sort_index()
+        features.index = pd.to_datetime(features.index, utc=True)
+        feature_index = features.index
     # Zone/risk construction is always 15m. Reactive mode keeps its 1m bias,
     # while MTF additionally receives the completed 1h/4h regime frames.
     derived = completed_timeframes(bars)
@@ -101,6 +107,18 @@ def run_event_backtest(
             side = open_trade["side"]
             hit_stop = b.low <= open_trade["stop"] if side == "long" else b.high >= open_trade["stop"]
             hit_target = b.high >= open_trade["target"] if side == "long" else b.low <= open_trade["target"]
+            max_hold = open_trade.get("max_holding_minutes")
+            held = (now - pd.Timestamp(open_trade["entry_time"])).total_seconds() / 60
+            time_exit = max_hold is not None and held >= max_hold
+            if time_exit and not (hit_stop or hit_target):
+                sign = -1 if side == "long" else 1
+                exit_price = float(b.close) * (1 + sign * slippage_bps / 10_000)
+                row, equity = _close_trade(open_trade, exit_price, now, equity, fee_bps, "time_exit")
+                records.append(row); open_trade = None
+        if open_trade is not None:
+            side = open_trade["side"]
+            hit_stop = b.low <= open_trade["stop"] if side == "long" else b.high >= open_trade["stop"]
+            hit_target = b.high >= open_trade["target"] if side == "long" else b.low <= open_trade["target"]
             if hit_stop or hit_target:
                 if hit_stop and hit_target:
                     collisions += 1
@@ -119,6 +137,12 @@ def run_event_backtest(
             # Strict cutoff is the decision timestamp. Exchange events after it are invisible.
             trade_end = trade_times.searchsorted(pd.Timestamp(now), side="left")
             tt = trade_data.iloc[max(0, trade_end-3000):trade_end]
+            context = None
+            if feature_index is not None:
+                fpos = feature_index.searchsorted(pd.Timestamp(now), side="right") - 1
+                if fpos >= 0:
+                    context = {k: (None if pd.isna(v) else float(v))
+                               for k, v in features.iloc[fpos].items()}
             frames = {}
             frame_names=("15m",) if mode=="reactive" else ("15m","1h","4h")
             for name in frame_names:
@@ -131,12 +155,20 @@ def run_event_backtest(
             if reactive_event_times is not None:
                 event_pos=reactive_event_times.searchsorted(now,side="right")
                 reactive_bias=str(reactive_events.iloc[event_pos-1].bias) if event_pos else "neutral"
-                out=predictor.predict(history,tt,equity,frames=frames,bias_override=reactive_bias)
+                extra={"bias_override":reactive_bias}
             else:
-                out=predictor.predict(history,tt,equity,frames=frames)
+                extra={}
+            if context is not None:
+                extra["context"]=context
+            out=predictor.predict(history,tt,equity,frames=frames,**extra)
             if out.entry is not None and out.position_size:
                 side = "long" if out.bias == "bullish" else "short"
-                setup_key="|".join(str(v or "") for v in (side,out.zone,out.sweep_time,out.reclaim_time))
+                if getattr(out, "setup_type", None) == "continuation":
+                    # Continuation setups share zone/sweep fields; bucket by 4h so
+                    # re-entry is possible after a cooldown but not every bar.
+                    setup_key = f"{side}|continuation|{pd.Timestamp(now).floor('4h')}"
+                else:
+                    setup_key="|".join(str(v or "") for v in (side,out.zone,out.sweep_time,out.reclaim_time))
                 if setup_key in attempted_setups:
                     rejections["duplicate_setup"] += 1
                 else:
@@ -151,7 +183,8 @@ def run_event_backtest(
                                "size": out.position_size, "zone": out.zone, "setup_type": out.setup_type,
                                "entry_type":getattr(out,"entry_type","market"),
                                    "limit_price": out.entry if getattr(out, "entry_type", "market") == "limit" else None,
-                                   "valid_until": getattr(out, "entry_expires_at", None)}
+                                   "valid_until": getattr(out, "entry_expires_at", None),
+                                   "max_holding_minutes": getattr(out, "max_holding_minutes", None)}
             elif pending is None:
                 rejections[out.no_trade_reason or "unknown"] += 1
                 for entry_type, reason in (getattr(out,"candidate_rejections",None) or {}).items():

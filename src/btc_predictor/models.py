@@ -90,3 +90,7 @@ class PredictorOutput:
     candidate_rejections: dict[str, str] | None = None
     estimated_cost_bps: float | None = None
     estimated_cost_r: float | None = None
+    regime: str | None = None
+    efficiency_ratio: float | None = None
+    funding_rate: float | None = None
+    max_holding_minutes: float | None = None

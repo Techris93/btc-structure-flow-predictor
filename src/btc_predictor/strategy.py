@@ -9,6 +9,7 @@ import pandas as pd
 from .footprint import footprint_confirmation
 from .indicators import atr
 from .models import PredictorOutput
+from .regime import classify as classify_regime
 from .structure import structure_events
 from .timeframes import completed_timeframes
 from .zones import build_projected_zones
@@ -68,7 +69,10 @@ class Predictor:
                  stop_buffer_atr=0.3,max_stop_atr=2.5,min_target_distance_atr=0.25,measured_move_atr=2.0,
                  cost_bps=14.0,limit_cost_bps=9.0,max_cost_fraction=0.25,min_expectancy_r=0.05,min_stop_atr=0.5,entry_mode="market",limit_expiry_minutes=30,
                  limit_fallback=True,limit_buffer_atr=0.05,allow_1h_15m_regime=False,probability_calibration=None,
-                 require_drift_alignment=True,drift_lookback_bars=96,zone_score_adjustments=None):
+                 require_drift_alignment=True,drift_lookback_bars=96,zone_score_adjustments=None,
+                 regime_gating=True,continuation_enabled=True,reversal_enabled=True,
+                 range_er=0.12,trend_er=0.24,continuation_stop_atr=1.75,continuation_min_rr=1.5,
+                 continuation_hold_hours=18.0,continuation_prior=0.55,continuation_funding_filter=True):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
         # Risk framework: structural stop + buffer, hard width cap, noise-filtered targets.
@@ -89,6 +93,18 @@ class Predictor:
         # drift imposes no constraint.
         self.require_drift_alignment=require_drift_alignment; self.drift_lookback_bars=drift_lookback_bars
         self.zone_score_adjustments=dict(DEFAULT_ZONE_SCORE_ADJUSTMENTS if zone_score_adjustments is None else zone_score_adjustments)
+        # Regime rulebook (frozen from train-window study): transition -> trade
+        # continuation with the drift; trend -> allow counter-drift reversal
+        # (exhaustion mean-reversion); range -> stand down entirely.
+        self.regime_gating=regime_gating
+        self.continuation_enabled=continuation_enabled; self.reversal_enabled=reversal_enabled
+        self.range_er=range_er; self.trend_er=trend_er
+        self.continuation_stop_atr=continuation_stop_atr; self.continuation_min_rr=continuation_min_rr
+        self.continuation_hold_hours=continuation_hold_hours
+        # Hit-rate prior from the train-window persistence study (mid-ER drift
+        # continuation ran 60-71% at 12-24h); deliberately set below that.
+        self.continuation_prior=continuation_prior
+        self.continuation_funding_filter=continuation_funding_filter
         self._calibration=self._load_calibration(probability_calibration)
         self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
 
@@ -206,7 +222,42 @@ class Predictor:
     def _output(self,now,bias,**kwargs):
         return PredictorOutput(now,bias,regime_4h=self.last_regimes["4h"],regime_1h=self.last_regimes["1h"],setup_15m=self.last_regimes["15m"],**kwargs)
 
-    def predict(self,ohlc,trades,equity=100_000,frames=None,flow_bars=None,bias_override=None):
+    def _continuation(self,now,drift,price,a,risk_atr,equity,context,regime_info):
+        """Trend-continuation candidate: direction is the 24h drift, wide
+        ATR stop, fixed-R target, time-based exit. Passive limit at the
+        decision close keeps execution costs inside the cost gate."""
+        bias="bullish" if drift>0 else "bearish"
+        funding=(context or {}).get("funding_rate")
+        base=dict(setup_type="continuation",regime=regime_info["regime"],efficiency_ratio=regime_info["er"],
+                  funding_rate=funding,sweep_status="none",entry_type="limit")
+        if self.continuation_funding_filter and funding is not None and np.isfinite(funding):
+            # Funding sign confirms the crowd is positioned with the drift;
+            # fighting it removed the edge in the feature study.
+            if (bias=="bullish" and funding<0) or (bias=="bearish" and funding>0):
+                return self._output(now,bias,**base,no_trade_reason="funding_disagrees")
+        # 15m ATR scaled to the 1h horizon this trade lives on (vol ~ sqrt(time)).
+        trend_atr=a*2.0
+        stop_dist=self.continuation_stop_atr*trend_atr
+        entry=price
+        stop=entry-stop_dist if bias=="bullish" else entry+stop_dist
+        reward=self.continuation_min_rr*stop_dist
+        target=entry+reward if bias=="bullish" else entry-reward
+        cost_r=(entry*self.limit_cost_bps/10_000)/stop_dist
+        prob=self.continuation_prior
+        expectancy_r=prob*self.continuation_min_rr-(1.0-prob)-cost_r
+        base.update(entry=entry,stop=stop,target=target,reward_risk=self.continuation_min_rr,
+                    probability_tp_before_sl=prob,expectancy_r=expectancy_r,risk_atr=trend_atr,
+                    stop_distance_atr=stop_dist/trend_atr,estimated_cost_bps=self.limit_cost_bps,
+                    estimated_cost_r=cost_r,entry_expires_at=(now+pd.Timedelta(minutes=self.limit_expiry_minutes)).isoformat(),
+                    max_holding_minutes=self.continuation_hold_hours*60.0)
+        if cost_r>self.max_cost_fraction:
+            return self._output(now,bias,**base,no_trade_reason="costs_exceed_edge")
+        if expectancy_r<self.min_expectancy_r:
+            return self._output(now,bias,**base,no_trade_reason="negative_expectancy")
+        return self._output(now,bias,**base,orderflow_confirmation=True,orderflow_reason="drift_regime",
+                            position_size=equity*self.risk_fraction/stop_dist)
+
+    def predict(self,ohlc,trades,equity=100_000,frames=None,flow_bars=None,bias_override=None,context=None):
         if len(ohlc)<80 or trades.empty:return PredictorOutput(ohlc.index[-1],"neutral",no_trade_reason="insufficient_history")
         o=ohlc.copy(); o.index=pd.to_datetime(o.index,utc=True); t=trades.copy(); t["time"]=pd.to_datetime(t.time,utc=True)
         frames=frames or {}; setup=frames.get("15m",o)
@@ -214,10 +265,24 @@ class Predictor:
         bias=bias_override if bias_override in ("bullish","bearish","neutral") else (self._regime_bias(frames) if has_regime_frames else self._last(o)[0])
         now=o.index[-1]; price=float(o.close.iloc[-1]); setup_atr=atr(setup); a=float(setup_atr.iloc[-1]) if len(setup_atr) else np.nan
         if bias=="neutral" or not np.isfinite(a):return self._output(now,bias,no_trade_reason="timeframe_conflict" if self.last_regimes["4h"]!=self.last_regimes["1h"] else "neutral_or_unready_structure")
-        if self.require_drift_alignment:
+        regime_info=classify_regime(setup,self.range_er,self.trend_er,self.drift_lookback_bars) if self.regime_gating else None
+        regime=regime_info["regime"] if regime_info else None
+        if regime=="range":
+            return self._output(now,bias,regime=regime,efficiency_ratio=regime_info["er"],no_trade_reason="regime_range")
+        drift_for_gate=None
+        if regime=="transition" and self.continuation_enabled:
+            drift=regime_info["drift"]
+            if drift==0:return self._output(now,bias,regime=regime,efficiency_ratio=regime_info["er"],no_trade_reason="no_drift")
+            risk_atr=self._risk_atr(o,frames,a)
+            return self._continuation(now,drift,price,a,risk_atr,equity,context,regime_info)
+        if not self.reversal_enabled:
+            return self._output(now,bias,regime=regime,efficiency_ratio=regime_info["er"] if regime_info else None,no_trade_reason="reversal_disabled")
+        # In trend-exhaustion regimes the drift gate lifts: counter-drift
+        # reversals are the intended trade there. Everywhere else it applies.
+        if self.require_drift_alignment and regime!="trend":
             drift=self._drift_sign(setup)
             if drift is not None and ((bias=="bullish" and drift<0) or (bias=="bearish" and drift>0)):
-                return self._output(now,bias,no_trade_reason="counter_drift")
+                return self._output(now,bias,regime=regime,efficiency_ratio=regime_info["er"] if regime_info else None,no_trade_reason="counter_drift")
         risk_atr=self._risk_atr(o,frames,a)
         zones=build_projected_zones(setup)
         recent_cutoff=now-pd.Timedelta(minutes=self.reclaim_bars)
