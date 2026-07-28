@@ -78,5 +78,7 @@ class PredictorOutput:
     setup_15m: str | None = None
     zone_kind: str | None = None
     sweep_depth_atr: float | None = None
+    sweep_time: str | None = None
+    reclaim_time: str | None = None
     orderflow_reason: str | None = None
     exchange_agreement: bool | None = None

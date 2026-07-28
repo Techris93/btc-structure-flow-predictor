@@ -28,6 +28,7 @@ from btc_predictor.persistence import JsonStore, runtime_dir
 from btc_predictor.strategy import Predictor
 from btc_predictor.trade_store import TradeStore, start_collectors
 from btc_predictor.paper_position import PaperLedger
+from btc_predictor.signal_lifecycle import SignalLifecycle
 
 app = Flask(__name__)
 logger = logging.getLogger("btc_predictor")
@@ -46,11 +47,12 @@ _live_lock_handle = None
 live_boot_thread = None
 
 subscription_store = JsonStore(data_dir / "push_subscriptions.json")
-push_state_store = JsonStore(data_dir / "push_state.json")
 push_delivery_store = JsonStore(data_dir / "push_delivery.json")
 push_delivery_events_store = JsonStore(data_dir / "push_delivery_events.json")
 push_decision_events_store = JsonStore(data_dir / "push_decision_events.json")
 paper_exit_push_store = JsonStore(data_dir / "paper_exit_push.json")
+signal_lifecycle_store = JsonStore(data_dir / "signal_lifecycle.json")
+signal_event_queue_store = JsonStore(data_dir / "signal_event_queue.json")
 live_state_store = JsonStore(data_dir / "live_state.json")
 research_status_store = JsonStore(os.getenv("BTC_RESEARCH_STATUS", str(data_dir / "research/status.json")))
 push_subscriptions = subscription_store.read([])
@@ -71,6 +73,9 @@ PUSH_ACK_RETRY_SECONDS = max(30, int(os.getenv("PUSH_ACK_RETRY_SECONDS", "90")))
 PUSH_MAX_ACK_RETRIES = max(0, min(3, int(os.getenv("PUSH_MAX_ACK_RETRIES", "2"))))
 PUSH_EVENT_RETENTION = max(100, int(os.getenv("PUSH_EVENT_RETENTION", "500")))
 PUSH_STATE_COOLDOWN_SECONDS = max(0, int(os.getenv("PUSH_COOLDOWN_SECONDS", "60")))
+SIGNAL_CONFIRM_OBSERVATIONS = max(1, int(os.getenv("SIGNAL_CONFIRM_OBSERVATIONS", "2")))
+SIGNAL_INVALIDATION_OBSERVATIONS = max(1, int(os.getenv("SIGNAL_INVALIDATION_OBSERVATIONS", "3")))
+BIAS_CONFIRM_OBSERVATIONS = max(1, int(os.getenv("BIAS_CONFIRM_OBSERVATIONS", "2")))
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://btc-structure-flow-predictor.onrender.com"
 ).rstrip("/")
@@ -90,6 +95,11 @@ if not secret_path.exists():
 _push_secret = secret_path.read_bytes()
 trade_store = TradeStore(data_dir / "live_trades.sqlite3", max_rows=int(os.getenv("TRADE_STORE_MAX_ROWS", "80000")))
 paper_ledger = PaperLedger(os.getenv("PAPER_LEDGER_PATH", str(data_dir / "paper_ledger.json")))
+signal_lifecycle = SignalLifecycle(
+    confirm_observations=SIGNAL_CONFIRM_OBSERVATIONS,
+    invalidation_observations=SIGNAL_INVALIDATION_OBSERVATIONS,
+    bias_observations=BIAS_CONFIRM_OBSERVATIONS,
+)
 
 MARKET_TYPE = os.getenv("MARKET_TYPE", "linear").lower()
 if MARKET_TYPE not in ("spot", "linear"):
@@ -399,32 +409,6 @@ def _latest_delivery_summary(delivery_type):
     }
 
 
-PUSH_STATE_FIELDS = (
-    "bias",
-    "regime_4h",
-    "regime_1h",
-    "setup_15m",
-    "setup_type",
-    "zone",
-    "sweep_status",
-    "orderflow_confirmation",
-    "orderflow_reason",
-    "no_trade_reason",
-    "entry",
-    "stop",
-    "target",
-)
-
-
-def _prediction_push_state(result):
-    return {field: getattr(result, field, None) for field in PUSH_STATE_FIELDS}
-
-
-def _prediction_push_key(state):
-    encoded = json.dumps(state, sort_keys=True, separators=(",", ":"), default=str)
-    return f"v2:{hashlib.sha256(encoded.encode()).hexdigest()}"
-
-
 def _record_push_decision(decision_id, **updates):
     now = _utcnow().isoformat()
     with push_decision_lock:
@@ -460,6 +444,166 @@ def _state_push_cooldown(now, last_state_push_at):
     last = pd.Timestamp(last_state_push_at)
     eligible_at = last + pd.Timedelta(seconds=PUSH_STATE_COOLDOWN_SECONDS)
     return now >= eligible_at, eligible_at
+
+
+def _signal_queue_state():
+    state = signal_event_queue_store.read({})
+    return {
+        "pending": list(state.get("pending") or []),
+        "notified_ids": list(state.get("notified_ids") or []),
+        "last_generic_push_at": state.get("last_generic_push_at"),
+    }
+
+
+def _write_signal_queue(state):
+    signal_event_queue_store.write({
+        "pending": list(state.get("pending") or [])[-100:],
+        "notified_ids": list(state.get("notified_ids") or [])[-500:],
+        "last_generic_push_at": state.get("last_generic_push_at"),
+    })
+
+
+def _enqueue_signal_events(events):
+    """Persist lifecycle events before any Web Push network call."""
+    state = _signal_queue_state()
+    incoming = [dict(event) for event in (events or [])]
+    superseded = {}
+    for event in incoming:
+        event_type = event.get("event_type")
+        signal_id = event.get("signal_id")
+        if event_type in ("setup_invalidated", "setup_expired") and signal_id:
+            superseded[signal_id] = event_type
+        replaced = event.get("replaced_signal_id")
+        if event_type == "setup_confirmed" and replaced:
+            superseded[replaced] = "replaced_by_confirmed_setup"
+    if superseded:
+        retained = []
+        for pending in state["pending"]:
+            reason = superseded.get(pending.get("signal_id"))
+            if reason:
+                _record_push_decision(
+                    pending.get("event_id"),
+                    status="superseded",
+                    superseded_at=_utcnow().isoformat(),
+                    superseded_reason=reason,
+                )
+            else:
+                retained.append(pending)
+        state["pending"] = retained
+    known = set(state["notified_ids"])
+    known.update(item.get("event_id") for item in state["pending"])
+    for event in incoming:
+        event_id = event.get("event_id")
+        if event_id and event_id not in known:
+            state["pending"].append(dict(event))
+            known.add(event_id)
+            _record_push_decision(
+                event_id,
+                notification_kind=event.get("event_type"),
+                status="detected",
+                signal_id=event.get("signal_id"),
+                summary=event.get("body"),
+            )
+    _write_signal_queue(state)
+    return len(state["pending"])
+
+
+def _cancel_signal_events(signal_id, reason):
+    """Remove obsolete generic events when a definitive trade exit wins priority."""
+    if not signal_id:
+        return 0
+    state = _signal_queue_state()
+    remaining = []
+    cancelled = 0
+    for event in state["pending"]:
+        if event.get("signal_id") == signal_id:
+            cancelled += 1
+            _record_push_decision(
+                event.get("event_id"),
+                status="superseded",
+                superseded_at=_utcnow().isoformat(),
+                superseded_reason=reason,
+            )
+        else:
+            remaining.append(event)
+    state["pending"] = remaining
+    _write_signal_queue(state)
+    return cancelled
+
+
+def _dispatch_signal_event(now):
+    """Submit at most one durable lifecycle event; retain it until accepted."""
+    state = _signal_queue_state()
+    if not state["pending"]:
+        return 0
+    event = state["pending"][0]
+    event_id = event.get("event_id")
+    eligible, eligible_at = _state_push_cooldown(
+        now, state.get("last_generic_push_at")
+    )
+    if not eligible and not event.get("cooldown_exempt"):
+        _record_push_decision(
+            event_id,
+            notification_kind=event.get("event_type"),
+            status="deferred",
+            eligible_at=eligible_at.isoformat(),
+        )
+        return 0
+
+    decision = _record_push_decision(
+        event_id,
+        notification_kind=event.get("event_type"),
+        status="submitting",
+        signal_id=event.get("signal_id"),
+        summary=event.get("body"),
+    )
+    accepted, failed = _send_push({
+        "title": event.get("title") or "BTC Predictor update",
+        "body": event.get("body") or "Signal lifecycle changed",
+        "url": "/",
+        "event_id": event_id,
+    }, delivery_type="automatic")
+    delivery = _latest_delivery_summary("automatic")
+    status = (
+        "accepted"
+        if accepted > 0
+        else "failed"
+        if failed > 0
+        else "no_enabled_subscription"
+    )
+    _record_push_decision(
+        event_id,
+        notification_kind=event.get("event_type"),
+        status=status,
+        attempts=int(decision.get("attempts") or 0) + 1,
+        attempted=int(delivery.get("attempted") or 0),
+        accepted=int(delivery.get("accepted") or 0),
+        failed=int(delivery.get("failed") or 0),
+        delivery_batch_id=delivery.get("batch_id"),
+    )
+    if accepted > 0:
+        state["pending"].pop(0)
+        state["notified_ids"].append(event_id)
+        state["last_generic_push_at"] = pd.Timestamp(now).isoformat()
+        _write_signal_queue(state)
+    return accepted
+
+
+def _signal_lifecycle_status():
+    lifecycle = signal_lifecycle_store.read(SignalLifecycle.initial_state())
+    queue = _signal_queue_state()
+    active = lifecycle.get("active") or {}
+    candidate = lifecycle.get("candidate") or {}
+    return {
+        "active_signal_id": active.get("signal_id"),
+        "candidate_signal_id": candidate.get("signal_id"),
+        "candidate_observations": int(candidate.get("observations") or 0),
+        "pending_events": len(queue["pending"]),
+        "last_generic_push_at": queue.get("last_generic_push_at"),
+        "confirmation_observations": SIGNAL_CONFIRM_OBSERVATIONS,
+        "invalidation_observations": SIGNAL_INVALIDATION_OBSERVATIONS,
+        "bias_confirmation_observations": BIAS_CONFIRM_OBSERVATIONS,
+    }
 
 
 def _paper_exit_event_id(trade):
@@ -835,19 +979,7 @@ def _ack_delivery(delivery_id, token, status):
 
 def _live_loop():
     global live_state
-    persisted = push_state_store.read({})
-    previous_key = persisted.get("key")
-    previous_notification_state = persisted.get("state") or {}
-    transition_sequence = int(persisted.get("transition_sequence") or 0)
-    pending_state_key = persisted.get("pending_state_key")
-    pending_decision_id = persisted.get("pending_decision_id")
-    last_state_push_at = (
-        pd.Timestamp(persisted["last_state_push_at"])
-        if persisted.get("last_state_push_at")
-        else None
-    )
     binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
-    flow_retry_at = pd.Timestamp(0, tz="UTC")
     flow_bars_cache = None
     binance_rest_last_ok_at = None
     binance_rest_last_error = None
@@ -936,142 +1068,34 @@ def _live_loop():
                 flow_source = None
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
             paper_status = paper_ledger.update(result, ohlc)
+            notification_now = pd.Timestamp.now(tz="UTC")
+            lifecycle_before = signal_lifecycle_store.read(
+                SignalLifecycle.initial_state()
+            )
+            active_before = lifecycle_before.get("active") or {}
+            definitive_exit = any(
+                str(trade.get("exit_reason") or "").lower() in ("target", "stop")
+                for trade in (paper_status.get("newly_closed") or [])
+            )
             try:
-                paper_exit_notifications = _notify_paper_exits(
-                    paper_status.get("newly_closed") or []
-                )
+                _notify_paper_exits(paper_status.get("newly_closed") or [])
             except Exception:
-                paper_exit_notifications = 0
                 logger.exception("Paper exit notification dispatch failed")
+            if definitive_exit:
+                _cancel_signal_events(
+                    active_before.get("signal_id"), "paper_exit"
+                )
+            lifecycle_state, lifecycle_events = signal_lifecycle.evaluate(
+                lifecycle_before, result, paper_status, notification_now
+            )
+            signal_lifecycle_store.write(lifecycle_state)
+            _enqueue_signal_events(lifecycle_events)
+            # TP/SL is always the only alert dispatched in its poll. Lifecycle
+            # alerts resume next poll and retain their durable queue position.
+            if not definitive_exit:
+                _dispatch_signal_event(notification_now)
             trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
-            notification_state = _prediction_push_state(result)
-            key = _prediction_push_key(notification_state)
-            now = pd.Timestamp.now(tz="UTC")
-            # The exact state hash deduplicates identical updates. Generic state
-            # changes are coalesced during the cooldown; the latest state remains
-            # pending and is submitted once eligible. TP/SL alerts bypass this.
-            # A specific TP/SL alert supersedes the generic state-change alert
-            # for this poll.
-            if paper_exit_notifications > 0:
-                if pending_decision_id:
-                    _record_push_decision(
-                        pending_decision_id,
-                        status="superseded",
-                        superseded_at=now.isoformat(),
-                        superseded_reason="paper_exit",
-                    )
-                previous_key = key
-                previous_notification_state = notification_state
-                pending_state_key = None
-                pending_decision_id = None
-            elif key != previous_key:
-                if pending_state_key != key or not pending_decision_id:
-                    if pending_decision_id:
-                        _record_push_decision(
-                            pending_decision_id,
-                            status="superseded",
-                            superseded_at=now.isoformat(),
-                            superseded_reason="newer_state",
-                        )
-                    transition_sequence += 1
-                    pending_state_key = key
-                    pending_decision_id = (
-                        f"state-{transition_sequence}-"
-                        f"{hashlib.sha256(key.encode()).hexdigest()[:12]}"
-                    )
-                event_id = pending_decision_id
-                detail = str(result.setup_type or result.no_trade_reason or result.sweep_status or "State changed")
-                detail = detail.replace("_", " ").strip().capitalize()
-                changed_fields = [
-                    field
-                    for field in PUSH_STATE_FIELDS
-                    if previous_notification_state.get(field) != notification_state.get(field)
-                ]
-                decision = _record_push_decision(
-                    event_id,
-                    notification_kind="state_change",
-                    status="detected",
-                    summary=f"{str(result.bias).capitalize()} · {detail}",
-                    changed_fields=changed_fields,
-                    state_key=key,
-                )
-                cooldown_elapsed, eligible_at = _state_push_cooldown(
-                    now, last_state_push_at
-                )
-                # Persist the transition identity before network I/O so a
-                # worker restart retries the same auditable event.
-                push_state_store.write({
-                    "key": previous_key,
-                    "state": previous_notification_state,
-                    "transition_sequence": transition_sequence,
-                    "pending_state_key": pending_state_key,
-                    "pending_decision_id": pending_decision_id,
-                    "last_state_push_at": (
-                        last_state_push_at.isoformat()
-                        if last_state_push_at is not None
-                        else None
-                    ),
-                    "updated_at": now.isoformat(),
-                })
-                if not cooldown_elapsed:
-                    _record_push_decision(
-                        event_id,
-                        notification_kind="state_change",
-                        status="deferred",
-                        eligible_at=eligible_at.isoformat(),
-                    )
-                else:
-                    sent, failed = _send_push({
-                        "title":"BTC Predictor update",
-                        "body":f"{str(result.bias).capitalize()} · {detail}",
-                        "url":"/",
-                        "event_id":event_id,
-                    })
-                    delivery = _latest_delivery_summary("automatic")
-                    decision_status = (
-                        "accepted"
-                        if sent > 0
-                        else "failed"
-                        if failed > 0
-                        else "no_enabled_subscription"
-                    )
-                    _record_push_decision(
-                        event_id,
-                        notification_kind="state_change",
-                        status=decision_status,
-                        attempts=int(decision.get("attempts") or 0) + 1,
-                        attempted=int(delivery.get("attempted") or 0),
-                        accepted=int(delivery.get("accepted") or 0),
-                        failed=int(delivery.get("failed") or 0),
-                        delivery_batch_id=delivery.get("batch_id"),
-                    )
-                    if sent > 0:
-                        previous_key = key
-                        previous_notification_state = notification_state
-                        pending_state_key = None
-                        pending_decision_id = None
-                        last_state_push_at = now
-            elif pending_decision_id:
-                _record_push_decision(
-                    pending_decision_id,
-                    status="superseded",
-                    superseded_at=now.isoformat(),
-                )
-                pending_state_key = None
-                pending_decision_id = None
-            push_state_store.write({
-                "key": previous_key,
-                "state": previous_notification_state,
-                "transition_sequence": transition_sequence,
-                "pending_state_key": pending_state_key,
-                "pending_decision_id": pending_decision_id,
-                "last_state_push_at": (
-                    last_state_push_at.isoformat()
-                    if last_state_push_at is not None
-                    else None
-                ),
-                "updated_at": now.isoformat(),
-            })
+            now = notification_now
             try:
                 _retry_unacknowledged_pushes(now)
             except Exception as exc:
@@ -1318,6 +1342,7 @@ def health():
             "supported":webpush is not None,
             "single_installation":PUSH_SINGLE_INSTALLATION,
             "state_change_cooldown_seconds":PUSH_STATE_COOLDOWN_SECONDS,
+            "signal_lifecycle":_signal_lifecycle_status(),
             "subscriptions":push_counts["stored"],
             "stored_subscriptions":push_counts["stored"],
             "enabled_subscriptions":push_counts["enabled"],
@@ -1353,6 +1378,7 @@ def api_live():
             "supported": webpush is not None,
             "single_installation": PUSH_SINGLE_INSTALLATION,
             "state_change_cooldown_seconds": PUSH_STATE_COOLDOWN_SECONDS,
+            "signal_lifecycle": _signal_lifecycle_status(),
             "subscriptions": push_counts["stored"],
             "stored_subscriptions": push_counts["stored"],
             "enabled_subscriptions": push_counts["enabled"],

@@ -23,6 +23,12 @@ services:
         value: /var/data/research/status.json
       - key: PUSH_COOLDOWN_SECONDS
         value: "60"
+      - key: SIGNAL_CONFIRM_OBSERVATIONS
+        value: "2"
+      - key: SIGNAL_INVALIDATION_OBSERVATIONS
+        value: "3"
+      - key: BIAS_CONFIRM_OBSERVATIONS
+        value: "2"
       - key: START_LIVE_LOOP_ON_BOOT
         value: "1"
       - key: LIVE_BOOT_RETRY_SECONDS

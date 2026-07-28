@@ -257,41 +257,149 @@ def test_failed_sl_notification_remains_pending_for_next_poll(monkeypatch, tmp_p
     assert exit_store.read({})["pending"] == []
 
 
-def test_signal_state_uses_exact_deduplication_with_sixty_second_cooldown():
-    class Prediction:
-        bias = "bullish"
-        regime_4h = "bullish"
-        regime_1h = "bullish"
-        setup_15m = "bullish"
-        setup_type = "reversal"
-        zone = "equal_lows:abc"
-        sweep_status = "confirmed"
-        orderflow_confirmation = True
-        orderflow_reason = "confirmed"
-        no_trade_reason = None
-        entry = 65000.0
-        stop = 64750.0
-        target = 65500.0
-
-    state = web_app._prediction_push_state(Prediction())
-    key = web_app._prediction_push_key(state)
-
-    assert key.startswith("v2:")
-    assert key == web_app._prediction_push_key(state)
+def test_lifecycle_push_queue_deduplicates_and_respects_safety_cooldown(
+    monkeypatch, tmp_path
+):
+    queue_store = web_app.JsonStore(tmp_path / "signal-events.json")
+    decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
+    monkeypatch.setattr(web_app, "signal_event_queue_store", queue_store)
+    monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
+    monkeypatch.setattr(
+        web_app,
+        "_latest_delivery_summary",
+        lambda delivery_type: {
+            "batch_id": "batch-1",
+            "attempted": 1,
+            "accepted": 1,
+            "failed": 0,
+        },
+    )
+    sent = []
+    monkeypatch.setattr(
+        web_app,
+        "_send_push",
+        lambda payload, subscriptions=None, delivery_type="automatic": (
+            sent.append(payload) or 1,
+            0,
+        ),
+    )
+    event = {
+        "event_id": "lifecycle-1-setup_confirmed-abc",
+        "event_type": "setup_confirmed",
+        "signal_id": "abc",
+        "title": "BTC setup confirmed",
+        "body": "Bullish reversal confirmed",
+    }
+    assert web_app._enqueue_signal_events([event, event]) == 1
     assert web_app.PUSH_STATE_COOLDOWN_SECONDS == 60
 
     now = pd.Timestamp("2026-07-28T00:01:00Z")
-    eligible, eligible_at = web_app._state_push_cooldown(
-        now,
-        now - pd.Timedelta(seconds=30),
+    queue_store.write({
+        **queue_store.read({}),
+        "last_generic_push_at": (now - pd.Timedelta(seconds=30)).isoformat(),
+    })
+    assert web_app._dispatch_signal_event(now) == 0
+    assert len(queue_store.read({})["pending"]) == 1
+    assert sent == []
+
+    assert web_app._dispatch_signal_event(now + pd.Timedelta(seconds=30)) == 1
+    assert queue_store.read({})["pending"] == []
+    assert queue_store.read({})["notified_ids"] == [event["event_id"]]
+    assert len(sent) == 1
+
+
+def test_failed_lifecycle_push_remains_durable(monkeypatch, tmp_path):
+    queue_store = web_app.JsonStore(tmp_path / "signal-events.json")
+    decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
+    monkeypatch.setattr(web_app, "signal_event_queue_store", queue_store)
+    monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
+    monkeypatch.setattr(
+        web_app,
+        "_latest_delivery_summary",
+        lambda delivery_type: {
+            "batch_id": "failed-batch",
+            "attempted": 1,
+            "accepted": 0,
+            "failed": 1,
+        },
     )
-    assert eligible is False
-    assert eligible_at == now + pd.Timedelta(seconds=30)
-    eligible, _ = web_app._state_push_cooldown(
-        now,
-        now - pd.Timedelta(seconds=60),
+    monkeypatch.setattr(
+        web_app,
+        "_send_push",
+        lambda payload, subscriptions=None, delivery_type="automatic": (0, 1),
     )
-    assert eligible is True
+    event = {
+        "event_id": "lifecycle-2-setup_invalidated-abc",
+        "event_type": "setup_invalidated",
+        "signal_id": "abc",
+        "title": "BTC setup invalidated",
+        "body": "Bullish setup invalidated",
+    }
+    web_app._enqueue_signal_events([event])
+
+    assert web_app._dispatch_signal_event(pd.Timestamp("2026-07-28T00:01:00Z")) == 0
+    state = queue_store.read({})
+    assert [item["event_id"] for item in state["pending"]] == [event["event_id"]]
+    assert state["last_generic_push_at"] is None
+
+
+def test_terminal_lifecycle_event_supersedes_stale_pending_setup(
+    monkeypatch, tmp_path
+):
+    queue_store = web_app.JsonStore(tmp_path / "signal-events.json")
+    decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
+    monkeypatch.setattr(web_app, "signal_event_queue_store", queue_store)
+    monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
+    setup = {
+        "event_id": "setup-abc",
+        "event_type": "setup_confirmed",
+        "signal_id": "abc",
+        "title": "BTC setup confirmed",
+        "body": "Bullish reversal confirmed",
+    }
+    invalidated = {
+        "event_id": "invalidated-abc",
+        "event_type": "setup_invalidated",
+        "signal_id": "abc",
+        "title": "BTC setup invalidated",
+        "body": "Bullish setup invalidated",
+    }
+    web_app._enqueue_signal_events([setup])
+
+    assert web_app._enqueue_signal_events([invalidated]) == 1
+    state = queue_store.read({})
+    assert [item["event_id"] for item in state["pending"]] == ["invalidated-abc"]
+    decisions = decision_store.read([])
+    old = next(item for item in decisions if item["decision_id"] == "setup-abc")
+    assert old["status"] == "superseded"
+
+
+def test_replacement_setup_supersedes_old_pending_setup(monkeypatch, tmp_path):
+    queue_store = web_app.JsonStore(tmp_path / "signal-events.json")
+    decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
+    monkeypatch.setattr(web_app, "signal_event_queue_store", queue_store)
+    monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
+    old = {
+        "event_id": "setup-old",
+        "event_type": "setup_confirmed",
+        "signal_id": "old",
+        "title": "BTC setup confirmed",
+        "body": "Bullish reversal confirmed",
+    }
+    new = {
+        "event_id": "setup-new",
+        "event_type": "setup_confirmed",
+        "signal_id": "new",
+        "replaced_signal_id": "old",
+        "title": "BTC setup confirmed",
+        "body": "Bearish reversal confirmed",
+    }
+    web_app._enqueue_signal_events([old])
+
+    assert web_app._enqueue_signal_events([new]) == 1
+    assert [
+        item["event_id"] for item in queue_store.read({})["pending"]
+    ] == ["setup-new"]
 
 
 def test_push_unsubscribe_endpoint_removes_subscription(monkeypatch):

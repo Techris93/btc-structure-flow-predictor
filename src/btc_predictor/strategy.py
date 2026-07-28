@@ -88,11 +88,11 @@ class Predictor:
         if not confirmed:
             waiting=[p for p in evaluated if p[1].get("status")=="waiting_reclaim"]
             z,sweep=max(waiting or evaluated,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
-            return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),no_trade_reason="sweep_not_confirmed")
+            return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,no_trade_reason="sweep_not_confirmed")
         z,sweep=max(confirmed,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
         usable=t.loc[t.time<now]
         confirm,flow=footprint_confirmation(usable,flow_bars,bias,sweep["time"],now)
-        if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement",0.0)>0.5,no_trade_reason="orderflow_not_confirmed")
+        if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement",0.0)>0.5,no_trade_reason="orderflow_not_confirmed")
         
         # Exponential state decay calculation
         reclaim_time = pd.Timestamp(sweep.get("reclaim_time", now))
@@ -106,6 +106,6 @@ class Predictor:
         else:
             stop=max(sweep["extreme"]+.5*a,price+self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price]; target=max(options or [price-2*a]); rr=(price-target)/(stop-price)
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
-        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
+        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
         if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
         return self._output(now,bias,**base,position_size=equity*self.risk_fraction/abs(price-stop))
