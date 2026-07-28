@@ -13,6 +13,11 @@ from .structure import structure_events
 from .timeframes import completed_timeframes
 from .zones import build_projected_zones
 
+# Replay evidence (63-trade ledger): these zone families lost systematically
+# (untested_breakout -0.75R/trade, volume nodes -1.3R/trade), so their score is
+# demoted rather than removed — they still trade when nothing better exists.
+DEFAULT_ZONE_SCORE_ADJUSTMENTS = {"untested_breakout": -0.6, "volume_lvn": -0.6, "volume_hvn": -0.6}
+
 
 def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,reclaim_bars=15):
     """Find the latest causal breach/reclaim event after the zone became knowable."""
@@ -61,12 +66,16 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
 class Predictor:
     def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.0,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,
                  stop_buffer_atr=0.3,max_stop_atr=2.5,min_target_distance_atr=0.25,measured_move_atr=2.0,
-                 cost_bps=14.0,limit_cost_bps=9.0,max_cost_fraction=0.50,min_expectancy_r=0.0,entry_mode="market",limit_expiry_minutes=30,
-                 limit_fallback=True,limit_buffer_atr=0.05,allow_1h_15m_regime=False,probability_calibration=None):
+                 cost_bps=14.0,limit_cost_bps=9.0,max_cost_fraction=0.25,min_expectancy_r=0.05,min_stop_atr=0.5,entry_mode="market",limit_expiry_minutes=30,
+                 limit_fallback=True,limit_buffer_atr=0.05,allow_1h_15m_regime=False,probability_calibration=None,
+                 require_drift_alignment=True,drift_lookback_bars=96,zone_score_adjustments=None):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
         # Risk framework: structural stop + buffer, hard width cap, noise-filtered targets.
         self.stop_buffer_atr=stop_buffer_atr; self.max_stop_atr=max_stop_atr
+        # Stops tighter than this fraction of the risk ATR are churned by noise:
+        # the measured replay drag was ~0.3R per trade in fees and slippage.
+        self.min_stop_atr=min_stop_atr
         self.min_target_distance_atr=min_target_distance_atr; self.measured_move_atr=measured_move_atr
         # Execution economics: round-trip fees + slippage, charged against the gate.
         self.cost_bps=cost_bps; self.limit_cost_bps=limit_cost_bps
@@ -75,8 +84,24 @@ class Predictor:
         self.entry_mode=entry_mode; self.limit_expiry_minutes=limit_expiry_minutes
         self.limit_fallback=limit_fallback; self.limit_buffer_atr=limit_buffer_atr
         self.allow_1h_15m_regime=allow_1h_15m_regime
+        # Drift gate: fading the prevailing 24h drift lost 0.92R/trade in replay
+        # (14% win rate); aligned trades were near breakeven. Zero or unknown
+        # drift imposes no constraint.
+        self.require_drift_alignment=require_drift_alignment; self.drift_lookback_bars=drift_lookback_bars
+        self.zone_score_adjustments=dict(DEFAULT_ZONE_SCORE_ADJUSTMENTS if zone_score_adjustments is None else zone_score_adjustments)
         self._calibration=self._load_calibration(probability_calibration)
         self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
+
+    def _drift_sign(self, setup):
+        """Sign of the setup-frame drift over drift_lookback_bars; None when unknown."""
+        if setup is None or len(setup)<=self.drift_lookback_bars: return None
+        closes=setup.close.to_numpy(dtype=float,copy=False)
+        delta=float(closes[-1]-closes[-1-self.drift_lookback_bars])
+        if not np.isfinite(delta) or delta==0.0: return None
+        return 1 if delta>0 else -1
+
+    def _zone_rank(self, z, price):
+        return (z.score + self.zone_score_adjustments.get(z.kind, 0.0), -abs(price-z.midpoint))
 
     @staticmethod
     def _load_calibration(source):
@@ -189,6 +214,10 @@ class Predictor:
         bias=bias_override if bias_override in ("bullish","bearish","neutral") else (self._regime_bias(frames) if has_regime_frames else self._last(o)[0])
         now=o.index[-1]; price=float(o.close.iloc[-1]); setup_atr=atr(setup); a=float(setup_atr.iloc[-1]) if len(setup_atr) else np.nan
         if bias=="neutral" or not np.isfinite(a):return self._output(now,bias,no_trade_reason="timeframe_conflict" if self.last_regimes["4h"]!=self.last_regimes["1h"] else "neutral_or_unready_structure")
+        if self.require_drift_alignment:
+            drift=self._drift_sign(setup)
+            if drift is not None and ((bias=="bullish" and drift<0) or (bias=="bearish" and drift>0)):
+                return self._output(now,bias,no_trade_reason="counter_drift")
         risk_atr=self._risk_atr(o,frames,a)
         zones=build_projected_zones(setup)
         recent_cutoff=now-pd.Timedelta(minutes=self.reclaim_bars)
@@ -196,21 +225,21 @@ class Predictor:
             if z.is_active(now):return True
             swept=pd.Timestamp(z.swept_at) if z.swept_at is not None else None
             return swept is not None and recent_cutoff<=swept<=now
-        directional=[z for z in zones if _eligible(z) and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above"))]
+        directional=sorted((z for z in zones if _eligible(z) and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above"))),key=lambda z:self._zone_rank(z,price),reverse=True)
         if not directional:return self._output(now,bias,no_trade_reason="no_projected_zone")
         recent=o.tail(self.reclaim_bars+1)
         window_low=float(recent.low.min()); window_high=float(recent.high.max())
         breached=[z for z in directional if (window_low<z.low if bias=="bullish" else window_high>z.high)]
         if not breached:
-            z=max(directional,key=lambda q:(q.score,-abs(price-q.midpoint)))
+            z=directional[0]
             return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="none",no_trade_reason="sweep_not_confirmed")
         evaluated=[(z,detect_sweep(o,z,bias,a,*self.sweep_atr,self.reclaim_bars)) for z in breached]
         confirmed=[pair for pair in evaluated if pair[1].get("confirmed")]
         if not confirmed:
             waiting=[p for p in evaluated if p[1].get("status")=="waiting_reclaim"]
-            z,sweep=max(waiting or evaluated,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
+            z,sweep=max(waiting or evaluated,key=lambda p:self._zone_rank(p[0],price))
             return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,no_trade_reason="sweep_not_confirmed")
-        z,sweep=max(confirmed,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
+        z,sweep=max(confirmed,key=lambda p:self._zone_rank(p[0],price))
         usable=t.loc[t.time<now]
         confirm,flow=footprint_confirmation(usable,flow_bars,bias,sweep["time"],now)
         if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement",0.0)>0.5,no_trade_reason="orderflow_not_confirmed")
@@ -236,6 +265,7 @@ class Predictor:
             base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=entry,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob,entry_type=entry_type,entry_expires_at=entry_expires_at,expectancy_r=expectancy_r,risk_atr=risk_atr,stop_distance_atr=risk/risk_atr if risk_atr>0 else None,estimated_cost_bps=estimated_cost_bps,estimated_cost_r=cost_r)
             rejection=None
             if risk<=0 or not np.isfinite(risk):rejection="invalid_stop"
+            elif risk<self.min_stop_atr*risk_atr:rejection="stop_too_tight"
             elif risk>self.max_stop_atr*risk_atr:rejection="stop_too_wide"
             elif cost_r is not None and cost_r>self.max_cost_fraction:rejection="costs_exceed_edge"
             elif reward<=0 or rr<self.min_rr:rejection="insufficient_reward_risk"

@@ -26,6 +26,33 @@ def test_strategy_uses_setup_atr_checks_all_zones_and_leaves_probability_uncalib
     assert result.probability_tp_before_sl is not None and 0 <= result.probability_tp_before_sl <= 1
 
 
+def test_drift_gate_rejects_counter_drift_bias():
+    # 200 rising 15m bars: 24h drift is clearly positive, so a bearish bias must
+    # be rejected before any zone work happens.
+    idx=pd.date_range("2025-01-01",periods=200,freq="15min",tz="UTC")
+    setup=pd.DataFrame({"open":100.,"high":101.,"low":99.,"volume":10.},index=idx)
+    setup["close"]=pd.Series(range(100,300),index=idx,dtype=float)
+    o=pd.DataFrame({"open":100.,"high":101.,"low":99.,"close":100.,"volume":10.},
+                   index=pd.date_range("2025-01-02 22:00",periods=100,freq="min",tz="UTC"))
+    trades=pd.DataFrame({"time":o.index,"price":100.,"qty":1.,"side":"buy"})
+    frames={"15m":setup,"1h":setup.tail(40),"4h":setup.tail(40)}
+    result=Predictor().predict(o,trades,frames=frames,bias_override="bearish")
+    assert result.no_trade_reason=="counter_drift"
+    # Flat drift imposes no constraint.
+    flat=setup.copy(); flat["close"]=100.
+    result=Predictor().predict(o,trades,frames={"15m":flat,"1h":flat.tail(40),"4h":flat.tail(40)},bias_override="bearish")
+    assert result.no_trade_reason!="counter_drift"
+
+
+def test_zone_demotion_prefers_swing_over_untested_breakout(monkeypatch):
+    idx,o,frames,trades=_sweep_frames()
+    swing=Zone("swing","swing","below",90,91,3,idx[1],idx[2])
+    demoted=Zone("demoted","untested_breakout","below",90,91,3.4,idx[1],idx[2])
+    _patch_bullish_sweep(monkeypatch,[demoted,swing])
+    result=Predictor(min_rr=.1).predict(o,trades,frames=frames)
+    assert result.zone=="swing"
+
+
 def _sweep_frames():
     idx=pd.date_range("2025-01-01",periods=100,freq="min",tz="UTC")
     o=pd.DataFrame({"open":100.,"high":101.,"low":99.,"close":100.,"volume":10.},index=idx)
