@@ -82,3 +82,6 @@ class PredictorOutput:
     reclaim_time: str | None = None
     orderflow_reason: str | None = None
     exchange_agreement: bool | None = None
+    entry_type: str = "market"
+    entry_expires_at: str | None = None
+    expectancy_r: float | None = None

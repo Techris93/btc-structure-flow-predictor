@@ -32,7 +32,13 @@ from btc_predictor.signal_lifecycle import SignalLifecycle
 
 app = Flask(__name__)
 logger = logging.getLogger("btc_predictor")
-predictor = Predictor()
+predictor = Predictor(
+    entry_mode=os.getenv("PREDICTOR_ENTRY_MODE", "market"),
+    min_rr=float(os.getenv("PREDICTOR_MIN_RR", "1.0")),
+    min_expectancy_r=float(os.getenv("PREDICTOR_MIN_EXPECTANCY_R", "0.0")),
+    cost_bps=float(os.getenv("PREDICTOR_COST_BPS", "12.0")),
+    probability_calibration=os.getenv("PREDICTOR_CALIBRATION_PATH") or None,
+)
 data_dir = runtime_dir()
 live_lock = threading.Lock()
 push_lock = threading.Lock()

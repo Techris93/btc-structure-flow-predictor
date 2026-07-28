@@ -65,6 +65,7 @@ class PaperLedger:
         self.store = JsonStore(self.path) if self.path else None
         self.lock = threading.RLock()
         self._open: dict | None = None
+        self._pending: dict | None = None
         self._closed: list[dict] = []
         self._equity = 100_000.0
         self._load()
@@ -75,6 +76,7 @@ class PaperLedger:
                 with self.lock:
                     data = self.store.read({})
                     self._open = data.get("open")
+                    self._pending = data.get("pending")
                     self._closed = list(data.get("closed", []))
                     self._equity = float(data.get("equity", 100_000.0))
             except Exception as exc:
@@ -92,6 +94,7 @@ class PaperLedger:
             with self.lock:
                 self.store.write({
                     "open": self._open,
+                    "pending": self._pending,
                     "closed": self._closed[-5000:],
                     "equity": self._equity,
                 })
@@ -126,8 +129,26 @@ class PaperLedger:
                 elif is_new_setup and (zone_changed or time_changed):
                     self._close(prediction.timestamp, last_close, "superseded_by_new_setup")
 
-            # 3. Enter new position if no position is open and setup is confirmed
-            if self._open is None and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
+            # 3a. Working limit orders fill on a later touch and expire unfilled.
+            if self._open is None and self._pending is not None:
+                self._check_pending_fill(prediction, current_ohlc)
+
+            # 3b. Enter new position if no position is open and setup is confirmed
+            is_limit_setup = getattr(prediction, "entry_type", "market") == "limit"
+            if self._open is None and is_limit_setup and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
+                self._pending = {
+                    "decision_time": pd.Timestamp(prediction.timestamp).isoformat(),
+                    "side": "long" if prediction.bias == "bullish" else "short",
+                    "limit": float(prediction.entry),
+                    "stop": float(prediction.stop),
+                    "target": float(prediction.target),
+                    "size": float(prediction.position_size),
+                    "zone": prediction.zone,
+                    "probability_tp_before_sl": prediction.probability_tp_before_sl,
+                    "valid_until": prediction.entry_expires_at,
+                }
+
+            if self._open is None and not is_limit_setup and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
                 self._open = {
                     "entry_time": pd.Timestamp(prediction.timestamp).isoformat(),
                     "side": "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else "neutral",
@@ -149,6 +170,41 @@ class PaperLedger:
                 dict(trade) for trade in self._closed[closed_before_update:]
             ]
             return status
+
+    def _check_pending_fill(self, prediction, current_ohlc: pd.DataFrame | None):
+        pending = self._pending
+        now = pd.Timestamp(prediction.timestamp)
+        valid_until = pending.get("valid_until")
+        if valid_until and now > pd.Timestamp(valid_until):
+            self._pending = None
+            return
+        if current_ohlc is None or current_ohlc.empty:
+            return
+        # Only bars printed after the decision can fill the order; the decision
+        # bar itself is already closed history at signal time.
+        decision_time = pd.Timestamp(pending["decision_time"])
+        ohlc_index_utc = pd.to_datetime(current_ohlc.index, utc=True)
+        future = current_ohlc.loc[ohlc_index_utc > decision_time]
+        limit = float(pending["limit"])
+        for ts, bar in future.iterrows():
+            is_long = pending["side"] == "long"
+            touched = float(bar.low) <= limit if is_long else float(bar.high) >= limit
+            if not touched:
+                continue
+            fill = min(float(bar.open), limit) if is_long else max(float(bar.open), limit)
+            self._open = {
+                "entry_time": pd.Timestamp(ts).isoformat(),
+                "side": pending["side"],
+                "entry": float(fill),
+                "stop": pending["stop"],
+                "target": pending["target"],
+                "size": pending["size"],
+                "zone": pending.get("zone"),
+                "probability_tp_before_sl": pending.get("probability_tp_before_sl"),
+            }
+            self._pending = None
+            self._check_exit(current_ohlc.loc[ohlc_index_utc >= pd.Timestamp(ts)])
+            return
 
     def _check_exit(self, ohlc: pd.DataFrame):
         if self._open is None:
@@ -227,6 +283,7 @@ class PaperLedger:
             return {
                 "equity": round(self._equity, 2),
                 "open_position": self._open,
+                "pending_order": self._pending,
                 "closed_trades": len(closed),
                 "wins": wins,
                 "losses": losses,

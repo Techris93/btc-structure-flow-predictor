@@ -62,10 +62,27 @@ def run_event_backtest(
         now, b = bars.index[i], bars.iloc[i]
         # A signal from the prior close is filled only now, at this bar's open.
         if pending is not None and open_trade is None:
-            sign = 1 if pending["side"] == "long" else -1
-            fill = float(b.open) * (1 + sign * slippage_bps / 10_000)
-            open_trade = {**pending, "entry_time": now, "entry": fill}
-            pending = None
+            limit_price = pending.get("limit_price")
+            if limit_price is None:
+                sign = 1 if pending["side"] == "long" else -1
+                fill = float(b.open) * (1 + sign * slippage_bps / 10_000)
+                open_trade = {**pending, "entry_time": now, "entry": fill}
+                pending = None
+            else:
+                valid_until = pending.get("valid_until")
+                if valid_until is not None and now > pd.Timestamp(valid_until):
+                    rejections["limit_expired"] += 1
+                    pending = None
+                else:
+                    is_long = pending["side"] == "long"
+                    touched = float(b.low) <= limit_price if is_long else float(b.high) >= limit_price
+                    if touched:
+                        sign = 1 if is_long else -1
+                        # Gaps through the limit fill at the open; touches fill at the limit.
+                        raw_fill = min(float(b.open), limit_price) if is_long else max(float(b.open), limit_price)
+                        fill = raw_fill * (1 + sign * slippage_bps / 10_000)
+                        open_trade = {**pending, "entry_time": now, "entry": fill}
+                        pending = None
 
         if open_trade is not None:
             side = open_trade["side"]
@@ -95,7 +112,9 @@ def run_event_backtest(
             if out.entry is not None and out.position_size:
                 pending = {"decision_time": now, "side": "long" if out.bias == "bullish" else "short",
                            "signal_entry": out.entry, "stop": out.stop, "target": out.target,
-                           "size": out.position_size, "zone": out.zone, "setup_type": out.setup_type}
+                           "size": out.position_size, "zone": out.zone, "setup_type": out.setup_type,
+                           "limit_price": out.entry if getattr(out, "entry_type", "market") == "limit" else None,
+                           "valid_until": getattr(out, "entry_expires_at", None)}
             else:
                 rejections[out.no_trade_reason or "unknown"] += 1
         if progress and (i % 1000 == 0 or i == len(bars)-1):

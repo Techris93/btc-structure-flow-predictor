@@ -47,3 +47,34 @@ def test_open_position_is_force_closed_or_reported():
     assert ledger.iloc[-1].exit_reason == "end_of_data"
     ledger, stats = run_event_backtest(ohlc,trades,predictor=RecordingPredictor(),force_close=False)
     assert stats["open_position"] is not None
+
+
+class LimitPredictor:
+    def __init__(self, limit=99.0, stop=90, target=110, valid_bars=3):
+        self.limit=limit; self.stop=stop; self.target=target; self.valid_bars=valid_bars
+    def predict(self, history, trades, equity, frames=None):
+        now=history.index[-1]
+        return PredictorOutput(now, "bullish", "reversal", "z", "confirmed", True,
+                               self.limit, self.stop, self.target, 2, None, 1,
+                               entry_type="limit",
+                               entry_expires_at=(now+pd.Timedelta(minutes=self.valid_bars)).isoformat())
+
+
+def test_limit_order_fills_only_on_later_touch():
+    ohlc=bars()
+    # First bar after the decision does not touch the limit; the next one does.
+    ohlc.iloc[81, ohlc.columns.get_loc("low")] = 99.4
+    ohlc.iloc[82, ohlc.columns.get_loc("low")] = 98.5
+    trades=pd.DataFrame({"time":ohlc.index,"price":100.,"qty":1.,"side":"buy"})
+    ledger, stats = run_event_backtest(ohlc, trades, predictor=LimitPredictor(), fee_bps=0, slippage_bps=0)
+    assert stats["trades"] >= 1
+    assert ledger.iloc[0].entry_time == ohlc.index[82]
+    # Touch fills at the limit, not at the open.
+    assert ledger.iloc[0].entry == pytest.approx(99.0)
+
+
+def test_limit_order_expires_unfilled():
+    ohlc=bars(88)
+    trades=pd.DataFrame({"time":ohlc.index,"price":100.,"qty":1.,"side":"buy"})
+    ledger, stats = run_event_backtest(ohlc, trades, predictor=LimitPredictor(limit=95.0, valid_bars=2), fee_bps=0, slippage_bps=0)
+    assert stats["rejection_counts"].get("limit_expired", 0) >= 1

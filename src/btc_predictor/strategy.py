@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -31,10 +34,36 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.0,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,
+                 stop_buffer_atr=0.3,max_stop_atr=2.5,min_target_distance_atr=0.25,measured_move_atr=2.0,
+                 cost_bps=12.0,min_expectancy_r=0.0,entry_mode="market",limit_expiry_minutes=30,
+                 probability_calibration=None):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
+        # Risk framework: structural stop + buffer, hard width cap, noise-filtered targets.
+        self.stop_buffer_atr=stop_buffer_atr; self.max_stop_atr=max_stop_atr
+        self.min_target_distance_atr=min_target_distance_atr; self.measured_move_atr=measured_move_atr
+        # Execution economics: round-trip fees + slippage, charged against the gate.
+        self.cost_bps=cost_bps; self.min_expectancy_r=min_expectancy_r
+        if entry_mode not in ("market","limit_retest"): raise ValueError("entry_mode must be market or limit_retest")
+        self.entry_mode=entry_mode; self.limit_expiry_minutes=limit_expiry_minutes
+        self._calibration=self._load_calibration(probability_calibration)
         self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
+
+    @staticmethod
+    def _load_calibration(source):
+        """Optional empirical P(TP before SL) by footprint-score bucket, fit offline from replay results."""
+        if source is None: return None
+        data=source
+        if isinstance(source,(str,Path)):
+            path=Path(source)
+            if not path.exists(): return None
+            data=json.loads(path.read_text())
+        if not isinstance(data,dict) or not data: return None
+        try:
+            return sorted((float(k),float(v)) for k,v in data.items())
+        except (TypeError,ValueError):
+            return None
 
     @staticmethod
     def _last(frame):
@@ -64,12 +93,43 @@ class Predictor:
         """Empirical probability estimate with half-life signal decay."""
         if not (np.isfinite(score) and np.isfinite(rr)):
             return None
+        if self._calibration:
+            calibrated=self._calibrated_probability(score)
+            if calibrated is not None:
+                return float(np.clip(calibrated*decay,0.05,0.95))
         base = 0.50
         score_add = 0.20 * (score - 0.50)
         rr_add = 0.10 * (rr - 1.5)
         align = 0.05 if self.last_regimes.get("15m") == bias else 0.0
         prob = (base + score_add + rr_add + align) * decay
         return float(np.clip(prob, 0.05, 0.95))
+
+    def _calibrated_probability(self, score: float) -> float:
+        """Piecewise-constant lookup: first bucket upper bound >= score wins."""
+        for upper, prob in self._calibration:
+            if score <= upper:
+                return prob
+        return self._calibration[-1][1]
+
+    def _structural_stop(self, bias: str, sweep: dict, a: float, entry: float):
+        """Stop beyond the sweep extreme plus a volatility buffer; never widened to fit."""
+        buffer = self.stop_buffer_atr * a
+        if bias == "bullish":
+            stop = float(sweep["extreme"]) - buffer
+            risk = entry - stop
+        else:
+            stop = float(sweep["extreme"]) + buffer
+            risk = stop - entry
+        return stop, risk
+
+    def _project_target(self, bias: str, entry: float, a: float, active_targets):
+        """Nearest opposing pool beyond the noise band; measured-move fallback when none exists."""
+        min_distance = self.min_target_distance_atr * a
+        if bias == "bullish":
+            options = sorted(q.midpoint for q in active_targets if q.side == "above" and q.midpoint > entry + min_distance)
+            return options[0] if options else entry + self.measured_move_atr * a
+        options = sorted((q.midpoint for q in active_targets if q.side == "below" and q.midpoint < entry - min_distance), reverse=True)
+        return options[0] if options else entry - self.measured_move_atr * a
     
     def _output(self,now,bias,**kwargs):
         return PredictorOutput(now,bias,regime_4h=self.last_regimes["4h"],regime_1h=self.last_regimes["1h"],setup_15m=self.last_regimes["15m"],**kwargs)
@@ -101,11 +161,26 @@ class Predictor:
         signal_decay = float(np.exp(-delta_t_minutes / tau))
 
         active_targets=[q for q in zones if q.is_active(now) and q.zone_id!=z.zone_id]
-        if bias=="bullish":
-            stop=min(sweep["extreme"]-.5*a,price-self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price]; target=min(options or [price+2*a]); rr=(target-price)/(price-stop)
-        else:
-            stop=max(sweep["extreme"]+.5*a,price+self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price]; target=max(options or [price-2*a]); rr=(price-target)/(stop-price)
+
+        # Entry: market at the decision close, or a resting limit at the reclaimed
+        # zone edge waiting for a retest (expires after limit_expiry_minutes).
+        entry=price; entry_type="market"; entry_expires_at=None
+        if self.entry_mode=="limit_retest":
+            entry=float(z.high) if bias=="bullish" else float(z.low)
+            entry_type="limit"
+            entry_expires_at=(now+pd.Timedelta(minutes=self.limit_expiry_minutes)).isoformat()
+
+        stop,risk=self._structural_stop(bias,sweep,a,entry)
+        target=self._project_target(bias,entry,a,active_targets)
+        reward=(target-entry) if bias=="bullish" else (entry-target)
+        rr=reward/risk if risk>0 else 0.0
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
-        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
-        if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
-        return self._output(now,bias,**base,position_size=equity*self.risk_fraction/abs(price-stop))
+        # Round-trip cost in R units charged against expectancy.
+        cost_r=(entry*self.cost_bps/10_000)/risk if risk>0 else None
+        expectancy_r=(prob*rr-(1.0-prob)-cost_r) if prob is not None and cost_r is not None else None
+        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=entry,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob,entry_type=entry_type,entry_expires_at=entry_expires_at,expectancy_r=expectancy_r)
+        if risk<=0 or not np.isfinite(risk):return self._output(now,bias,**base,no_trade_reason="invalid_stop")
+        if risk>self.max_stop_atr*a:return self._output(now,bias,**base,no_trade_reason="stop_too_wide")
+        if reward<=0 or rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
+        if expectancy_r is None or expectancy_r<self.min_expectancy_r:return self._output(now,bias,**base,no_trade_reason="negative_expectancy")
+        return self._output(now,bias,**base,position_size=equity*self.risk_fraction/risk)
