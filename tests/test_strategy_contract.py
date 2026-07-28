@@ -68,7 +68,7 @@ def test_trade_rejected_when_structural_stop_exceeds_width_cap(monkeypatch):
     o.iloc[-1,o.columns.get_loc("low")]=69.5
     far=Zone("far","swing","above",110,111,1,idx[1],idx[2])
     _patch_bullish_sweep(monkeypatch,[deep,far])
-    result=Predictor(min_rr=.1).predict(o,trades,frames=frames)
+    result=Predictor(min_rr=.1,limit_fallback=False).predict(o,trades,frames=frames)
     assert result.no_trade_reason == "stop_too_wide"
     assert result.position_size == 0.0
 
@@ -80,7 +80,7 @@ def test_trade_rejected_on_negative_expectancy(monkeypatch):
     _patch_bullish_sweep(monkeypatch,[swept,far])
     # Low flow score collapses the probability estimate below breakeven for this RR.
     monkeypatch.setattr("btc_predictor.strategy.footprint_confirmation",lambda *a,**k:(True,{"reason":"confirmed","agreement":True,"score":0.0}))
-    result=Predictor(min_rr=.1).predict(o,trades,frames=frames)
+    result=Predictor(min_rr=.1,limit_fallback=False).predict(o,trades,frames=frames)
     assert result.no_trade_reason == "negative_expectancy"
     assert result.expectancy_r is not None and result.expectancy_r < 0
     assert result.position_size == 0.0
@@ -95,6 +95,40 @@ def test_limit_retest_entry_rests_at_reclaimed_zone_edge(monkeypatch):
     assert result.entry_type == "limit"
     assert result.entry == 91.0
     assert result.entry_expires_at is not None
+
+
+def test_late_market_entry_falls_back_to_limit_at_reclaimed_edge(monkeypatch):
+    idx,o,frames,trades=_sweep_frames()
+    swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
+    far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
+    _patch_bullish_sweep(monkeypatch,[swept,far])
+    # Market risk 92-(89-1.5)=4.5 exceeds the 0.8 ATR cap; limit risk 91-87.5=3.5 does not.
+    result=Predictor(min_rr=.1,max_stop_atr=.8).predict(o,trades,frames=frames)
+    assert result.no_trade_reason is None
+    assert result.entry_type == "limit"
+    assert result.entry == 91.0
+    assert result.position_size > 0
+
+
+def test_fallback_reports_market_rejection_when_limit_also_fails(monkeypatch):
+    idx,o,frames,trades=_sweep_frames()
+    swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
+    far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
+    _patch_bullish_sweep(monkeypatch,[swept,far])
+    result=Predictor(min_rr=.1,max_stop_atr=.5).predict(o,trades,frames=frames)
+    assert result.no_trade_reason == "stop_too_wide"
+    assert result.entry_type == "market"
+    assert result.position_size == 0.0
+
+
+def test_limit_fallback_can_be_disabled(monkeypatch):
+    idx,o,frames,trades=_sweep_frames()
+    swept=Zone("swept","swing","below",90,91,3,idx[1],idx[2])
+    far=Zone("far","swing","above",98,99,1,idx[1],idx[2])
+    _patch_bullish_sweep(monkeypatch,[swept,far])
+    result=Predictor(min_rr=.1,max_stop_atr=.8,limit_fallback=False).predict(o,trades,frames=frames)
+    assert result.no_trade_reason == "stop_too_wide"
+    assert result.position_size == 0.0
 
 
 def test_predictor_requires_15m_alignment_with_higher_timeframes(monkeypatch):

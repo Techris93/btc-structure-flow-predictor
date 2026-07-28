@@ -34,6 +34,7 @@ app = Flask(__name__)
 logger = logging.getLogger("btc_predictor")
 predictor = Predictor(
     entry_mode=os.getenv("PREDICTOR_ENTRY_MODE", "market"),
+    limit_fallback=os.getenv("PREDICTOR_LIMIT_FALLBACK", "true").lower() != "false",
     min_rr=float(os.getenv("PREDICTOR_MIN_RR", "1.0")),
     min_expectancy_r=float(os.getenv("PREDICTOR_MIN_EXPECTANCY_R", "0.0")),
     cost_bps=float(os.getenv("PREDICTOR_COST_BPS", "12.0")),

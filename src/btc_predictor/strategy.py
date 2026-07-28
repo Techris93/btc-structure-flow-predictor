@@ -37,7 +37,7 @@ class Predictor:
     def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.0,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,
                  stop_buffer_atr=0.3,max_stop_atr=2.5,min_target_distance_atr=0.25,measured_move_atr=2.0,
                  cost_bps=12.0,min_expectancy_r=0.0,entry_mode="market",limit_expiry_minutes=30,
-                 probability_calibration=None):
+                 limit_fallback=True,probability_calibration=None):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
         # Risk framework: structural stop + buffer, hard width cap, noise-filtered targets.
@@ -47,6 +47,7 @@ class Predictor:
         self.cost_bps=cost_bps; self.min_expectancy_r=min_expectancy_r
         if entry_mode not in ("market","limit_retest"): raise ValueError("entry_mode must be market or limit_retest")
         self.entry_mode=entry_mode; self.limit_expiry_minutes=limit_expiry_minutes
+        self.limit_fallback=limit_fallback
         self._calibration=self._load_calibration(probability_calibration)
         self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
 
@@ -162,25 +163,37 @@ class Predictor:
 
         active_targets=[q for q in zones if q.is_active(now) and q.zone_id!=z.zone_id]
 
+        def _candidate(entry,entry_type,entry_expires_at):
+            stop,risk=self._structural_stop(bias,sweep,a,entry)
+            target=self._project_target(bias,entry,a,active_targets)
+            reward=(target-entry) if bias=="bullish" else (entry-target)
+            rr=reward/risk if risk>0 else 0.0
+            prob=self._probability_estimate(flow.get("score",0.0),rr,bias,decay=signal_decay)
+            # Round-trip cost in R units charged against expectancy.
+            cost_r=(entry*self.cost_bps/10_000)/risk if risk>0 else None
+            expectancy_r=(prob*rr-(1.0-prob)-cost_r) if prob is not None and cost_r is not None else None
+            base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=entry,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob,entry_type=entry_type,entry_expires_at=entry_expires_at,expectancy_r=expectancy_r)
+            rejection=None
+            if risk<=0 or not np.isfinite(risk):rejection="invalid_stop"
+            elif risk>self.max_stop_atr*a:rejection="stop_too_wide"
+            elif reward<=0 or rr<self.min_rr:rejection="insufficient_reward_risk"
+            elif expectancy_r is None or expectancy_r<self.min_expectancy_r:rejection="negative_expectancy"
+            return base,risk,rejection
+
         # Entry: market at the decision close, or a resting limit at the reclaimed
         # zone edge waiting for a retest (expires after limit_expiry_minutes).
-        entry=price; entry_type="market"; entry_expires_at=None
-        if self.entry_mode=="limit_retest":
-            entry=float(z.high) if bias=="bullish" else float(z.low)
-            entry_type="limit"
-            entry_expires_at=(now+pd.Timedelta(minutes=self.limit_expiry_minutes)).isoformat()
+        limit_entry=float(z.high) if bias=="bullish" else float(z.low)
+        limit_expires=(now+pd.Timedelta(minutes=self.limit_expiry_minutes)).isoformat()
+        candidates=[(price,"market",None)] if self.entry_mode=="market" else [(limit_entry,"limit",limit_expires)]
+        # Late market entries fail the location gates; rather than chase, work a
+        # limit at the reclaimed edge where the same stop/target framework is viable.
+        if self.limit_fallback and self.entry_mode=="market":
+            candidates.append((limit_entry,"limit",limit_expires))
 
-        stop,risk=self._structural_stop(bias,sweep,a,entry)
-        target=self._project_target(bias,entry,a,active_targets)
-        reward=(target-entry) if bias=="bullish" else (entry-target)
-        rr=reward/risk if risk>0 else 0.0
-        prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
-        # Round-trip cost in R units charged against expectancy.
-        cost_r=(entry*self.cost_bps/10_000)/risk if risk>0 else None
-        expectancy_r=(prob*rr-(1.0-prob)-cost_r) if prob is not None and cost_r is not None else None
-        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=entry,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob,entry_type=entry_type,entry_expires_at=entry_expires_at,expectancy_r=expectancy_r)
-        if risk<=0 or not np.isfinite(risk):return self._output(now,bias,**base,no_trade_reason="invalid_stop")
-        if risk>self.max_stop_atr*a:return self._output(now,bias,**base,no_trade_reason="stop_too_wide")
-        if reward<=0 or rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
-        if expectancy_r is None or expectancy_r<self.min_expectancy_r:return self._output(now,bias,**base,no_trade_reason="negative_expectancy")
-        return self._output(now,bias,**base,position_size=equity*self.risk_fraction/risk)
+        first_base=first_rejection=None
+        for entry,entry_type,expires_at in candidates:
+            base,risk,rejection=_candidate(entry,entry_type,expires_at)
+            if first_base is None:first_base,first_rejection=base,rejection
+            if rejection is None:
+                return self._output(now,bias,**base,position_size=equity*self.risk_fraction/risk)
+        return self._output(now,bias,**first_base,no_trade_reason=first_rejection)
