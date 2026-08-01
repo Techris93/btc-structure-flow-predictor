@@ -183,7 +183,7 @@ class SignalLifecycle:
                 active = None
                 state["active"] = None
                 state["missing_observations"] = 0
-            elif reason in ("signal_flipped", "superseded_by_new_setup"):
+            elif reason in ("signal_flipped", "superseded_by_new_setup", "signal_neutralized"):
                 events.append(self._event(
                     state,
                     "setup_invalidated",

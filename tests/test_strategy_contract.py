@@ -272,3 +272,81 @@ def test_pending_retrace_order_waits_for_a_real_limit_touch(tmp_path):
     assert status["pending_order"] is None
     assert status["open_position"] is not None
     assert status["open_position"]["entry"] == 95.0
+
+
+def test_paper_ledger_neutral_exit_and_unrealized_pnl(tmp_path):
+    """Neutral grace closes a dead thesis and reports mark-to-market P&L."""
+    ledger = PaperLedger(tmp_path / "ledger.json", neutral_exit_observations=3)
+    pred_open = PredictorOutput(
+        timestamp=pd.Timestamp("2026-07-25 10:00", tz="UTC"),
+        bias="bearish",
+        entry=65000.0,
+        stop=65200.0,
+        target=64500.0,
+        position_size=1.0,
+        zone="zone1",
+        sweep_time="2026-07-25 09:58:00+00:00",
+    )
+    ledger.update(pred_open)
+
+    ohlc = pd.DataFrame(
+        {"open": [64900.0], "high": [64950.0], "low": [64850.0], "close": [64900.0], "volume": [1.0]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-07-25 10:01", tz="UTC")]),
+    )
+    neutral = lambda minute: PredictorOutput(
+        timestamp=pd.Timestamp(f"2026-07-25 10:0{minute}", tz="UTC"),
+        bias="neutral",
+    )
+
+    status = ledger.update(neutral(1), ohlc)
+    assert ledger._open is not None
+    assert status["open_unrealized_pnl"] == 100.0
+    assert status["mark_to_market_equity"] == round(status["equity"] + 100.0, 2)
+
+    ledger.update(neutral(2), ohlc)
+    assert ledger._open is not None
+    status = ledger.update(neutral(3), ohlc)
+    assert ledger._open is None
+    assert status["last_closed"]["exit_reason"] == "signal_neutralized"
+    assert status["last_closed"]["exit"] == 64900.0
+
+    # A directional re-confirmation resets the neutral grace counter.
+    ledger2 = PaperLedger(tmp_path / "ledger2.json", neutral_exit_observations=3)
+    ledger2.update(pred_open)
+    ledger2.update(neutral(1), ohlc)
+    ledger2.update(
+        PredictorOutput(
+            timestamp=pd.Timestamp("2026-07-25 10:02", tz="UTC"),
+            bias="bearish",
+            entry=65000.0,
+            stop=65200.0,
+            target=64500.0,
+            position_size=1.0,
+            zone="zone1",
+            sweep_time="2026-07-25 09:58:00+00:00",
+        ),
+        ohlc,
+    )
+    ledger2.update(neutral(3), ohlc)
+    ledger2.update(neutral(4), ohlc)
+    assert ledger2._open is not None
+
+
+def test_pending_retrace_order_cancels_after_sustained_neutral(tmp_path):
+    ledger = PaperLedger(tmp_path / "ledger.json", neutral_exit_observations=2)
+    t0 = pd.Timestamp("2026-01-01 00:00", tz="UTC")
+    pending = PredictorOutput(
+        timestamp=t0,
+        bias="bullish",
+        entry=95.0,
+        stop=87.5,
+        target=120.0,
+        position_size=1.0,
+        zone="zone1",
+        sweep_time="2026-01-01 00:00:00+00:00",
+        entry_type="limit",
+    )
+    ledger.update(pending)
+    ledger.update(PredictorOutput(timestamp=t0 + pd.Timedelta(minutes=1), bias="neutral"))
+    status = ledger.update(PredictorOutput(timestamp=t0 + pd.Timedelta(minutes=2), bias="neutral"))
+    assert status["pending_order"] is None

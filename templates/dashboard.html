@@ -492,7 +492,9 @@
             <section class="section">
               <h2>Paper performance</h2>
               <div class="row"><span>Equity</span><span id="paperequity" class="mono">—</span></div>
+              <div class="row"><span>Mark-to-market equity</span><span id="papermtm" class="mono">—</span></div>
               <div class="row"><span>Net P&amp;L</span><span id="paperpnl" class="mono">—</span></div>
+              <div class="row"><span>Open unrealized P&amp;L</span><span id="paperunrealized" class="mono">—</span></div>
               <div class="row"><span>Closed trades</span><span id="papertrades">—</span></div>
               <div class="row"><span>Win rate</span><span id="winrate">—</span></div>
               <div class="row"><span>Profit factor</span><span id="pf">—</span></div>
@@ -795,7 +797,13 @@
         }
 
         setText("paperequity", fmtMoney(paper.equity), "mono");
+        setText("papermtm", fmtMoney(paper.mark_to_market_equity ?? paper.equity), "mono");
         setText("paperpnl", fmtMoney(paper.net_pnl), "mono");
+        setText(
+          "paperunrealized",
+          paper.open_unrealized_pnl == null ? "—" : fmtMoney(paper.open_unrealized_pnl),
+          "mono",
+        );
         setText(
           "papertrades",
           paper.closed_trades == null

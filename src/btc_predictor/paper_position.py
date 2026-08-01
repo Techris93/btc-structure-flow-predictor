@@ -60,10 +60,13 @@ HISTORICAL_SEEDED_TRADES = [
 class PaperLedger:
     """Track hypothetical fills and P&L for emitted signals."""
 
-    def __init__(self, path: str | Path | None = None):
+    def __init__(self, path: str | Path | None = None, neutral_exit_observations: int = 3):
         self.path = Path(path) if path else None
         self.store = JsonStore(self.path) if self.path else None
         self.lock = threading.RLock()
+        # Consecutive neutral predictions required before an open trade is
+        # closed as "signal_neutralized" (mirrors lifecycle invalidation).
+        self.neutral_exit_observations = max(1, int(neutral_exit_observations))
         self._open: dict | None = None
         self._pending: dict | None = None
         self._closed: list[dict] = []
@@ -113,7 +116,17 @@ class PaperLedger:
             if self._open is not None and current_ohlc is not None and not current_ohlc.empty:
                 self._check_exit(current_ohlc)
 
-            # 2. Check for signal flip or superseded position if still open
+            # 2a. Neutral-exit: the structure thesis is dead after a sustained
+            # neutral state. A brief flicker remains within the grace period.
+            if self._open is not None and prediction.bias == "neutral":
+                count = int(self._open.get("neutral_observations") or 0) + 1
+                self._open["neutral_observations"] = count
+                if count >= self.neutral_exit_observations:
+                    self._close(prediction.timestamp, last_close, "signal_neutralized")
+            elif self._open is not None and self._open.get("neutral_observations"):
+                self._open["neutral_observations"] = 0
+
+            # 2b. Check for signal flip or superseded position if still open
             if self._open is not None and prediction.bias != "neutral":
                 current_side = "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else None
                 is_new_setup = (
@@ -167,7 +180,7 @@ class PaperLedger:
                         self._check_exit(current_ohlc)
 
             self._save()
-            status = self._status()
+            status = self._status(last_close)
             status["newly_closed"] = [
                 dict(trade) for trade in self._closed[closed_before_update:]
             ]
@@ -179,6 +192,18 @@ class PaperLedger:
             return
         pending = self._pending
         side = pending["side"]
+
+        # Cancel on sustained neutral: a pending limit order must not survive
+        # after the structure thesis has been neutralized.
+        if prediction.bias == "neutral":
+            count = int(pending.get("neutral_observations") or 0) + 1
+            pending["neutral_observations"] = count
+            if count >= self.neutral_exit_observations:
+                logger.info("Pending %s order at %.2f cancelled: signal neutralized", side, pending["entry"])
+                self._pending = None
+                return
+        elif pending.get("neutral_observations"):
+            pending["neutral_observations"] = 0
 
         # Cancel if the signal flips against the pending order.
         new_side = "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else None
@@ -298,17 +323,26 @@ class PaperLedger:
         self._closed.append(trade)
         self._open = None
 
-    def _status(self):
+    def _status(self, last_price: float | None = None):
         with self.lock:
             closed = self._closed
             wins = sum(1 for t in closed if t["pnl"] > 0)
             losses = sum(1 for t in closed if t["pnl"] <= 0)
             gross_profit = sum(t["pnl"] for t in closed if t["pnl"] > 0)
             gross_loss = -sum(t["pnl"] for t in closed if t["pnl"] < 0)
+            unrealized = None
+            if self._open is not None and last_price is not None:
+                if self._open["side"] == "long":
+                    unrealized = (float(last_price) - self._open["entry"]) * self._open["size"]
+                elif self._open["side"] == "short":
+                    unrealized = (self._open["entry"] - float(last_price)) * self._open["size"]
+                unrealized = round(unrealized, 2)
             return {
                 "equity": round(self._equity, 2),
                 "open_position": self._open,
                 "pending_order": self._pending,
+                "open_unrealized_pnl": unrealized,
+                "mark_to_market_equity": round(self._equity + unrealized, 2) if unrealized is not None else round(self._equity, 2),
                 "closed_trades": len(closed),
                 "wins": wins,
                 "losses": losses,

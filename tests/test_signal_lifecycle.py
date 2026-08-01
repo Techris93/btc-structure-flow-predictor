@@ -268,3 +268,21 @@ def test_signal_flip_emits_one_invalidation_event():
 
     assert state["active"] is None
     assert [event["event_type"] for event in events] == ["setup_invalidated"]
+
+
+def test_signal_neutralized_emits_one_invalidation_event():
+    engine = SignalLifecycle()
+    state, _ = activate(engine)
+    paper = {"newly_closed": [{"exit_reason": "signal_neutralized"}]}
+
+    state, events = engine.evaluate(
+        state,
+        prediction(bias="neutral", entry=None, stop=None, target=None, position_size=None),
+        paper,
+        OBSERVED + pd.Timedelta(minutes=5),
+    )
+
+    assert state["active"] is None
+    assert [event["event_type"] for event in events] == ["setup_invalidated"]
+    assert events[0]["reason"] == "signal_neutralized"
+    assert events[0]["body"] == "Bullish · Signal neutralized"

@@ -100,7 +100,10 @@ if not secret_path.exists():
     secret_path.write_bytes(os.urandom(32)); os.chmod(secret_path, 0o600)
 _push_secret = secret_path.read_bytes()
 trade_store = TradeStore(data_dir / "live_trades.sqlite3", max_rows=int(os.getenv("TRADE_STORE_MAX_ROWS", "80000")))
-paper_ledger = PaperLedger(os.getenv("PAPER_LEDGER_PATH", str(data_dir / "paper_ledger.json")))
+paper_ledger = PaperLedger(
+    os.getenv("PAPER_LEDGER_PATH", str(data_dir / "paper_ledger.json")),
+    neutral_exit_observations=max(1, int(os.getenv("NEUTRAL_EXIT_OBSERVATIONS", "3"))),
+)
 signal_lifecycle = SignalLifecycle(
     confirm_observations=SIGNAL_CONFIRM_OBSERVATIONS,
     invalidation_observations=SIGNAL_INVALIDATION_OBSERVATIONS,
