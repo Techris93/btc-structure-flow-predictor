@@ -27,8 +27,6 @@ services:
       # browser/PWA endpoint is retained at a time.
       - key: PUSH_SINGLE_INSTALLATION
         value: "1"
-      - key: PUSH_MAX_SUBSCRIPTIONS
-        value: "1"
       - key: SIGNAL_CONFIRM_OBSERVATIONS
         value: "2"
       - key: SIGNAL_INVALIDATION_OBSERVATIONS
