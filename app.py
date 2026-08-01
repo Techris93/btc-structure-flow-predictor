@@ -65,7 +65,9 @@ PUSH_ALLOWED_HOST_SUFFIXES = tuple(
     ).split(",")
     if item.strip()
 )
-PUSH_MAX_SUBSCRIPTIONS = max(1, int(os.getenv("PUSH_MAX_SUBSCRIPTIONS", "32")))
+# The predictor is a single-installation research terminal. Keep the safe
+# one-endpoint default even when a deployment omits its environment settings.
+PUSH_MAX_SUBSCRIPTIONS = max(1, int(os.getenv("PUSH_MAX_SUBSCRIPTIONS", "1")))
 PUSH_SINGLE_INSTALLATION = os.getenv("PUSH_SINGLE_INSTALLATION", "1").lower() in (
     "1", "true", "yes", "on"
 )
