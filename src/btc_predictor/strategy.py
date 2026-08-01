@@ -101,10 +101,23 @@ class Predictor:
         signal_decay = float(np.exp(-delta_t_minutes / tau))
 
         active_targets=[q for q in zones if q.is_active(now) and q.zone_id!=z.zone_id]
+        # Pick the nearest opposing zone that already satisfies min_rr; if none
+        # qualifies, project the target at min_rr*risk (or 2 ATR, whichever is
+        # farther) instead of taking a nearby micro-level that kills the R:R.
         if bias=="bullish":
-            stop=min(sweep["extreme"]-.5*a,price-self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price]; target=min(options or [price+2*a]); rr=(target-price)/(price-stop)
+            stop=min(sweep["extreme"]-.5*a,price-self.atr_mult*a); risk=price-stop
+            options=sorted(q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price)
+            target=next((t for t in options if risk>0 and (t-price)/risk>=self.min_rr), None)
+            if target is None:
+                target=max(price+self.min_rr*risk,price+2*a) if risk>0 else price+2*a
+            rr=(target-price)/risk if risk>0 else 0.0
         else:
-            stop=max(sweep["extreme"]+.5*a,price+self.atr_mult*a); options=[q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price]; target=max(options or [price-2*a]); rr=(price-target)/(stop-price)
+            stop=max(sweep["extreme"]+.5*a,price+self.atr_mult*a); risk=stop-price
+            options=sorted((q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price),reverse=True)
+            target=next((t for t in options if risk>0 and (price-t)/risk>=self.min_rr), None)
+            if target is None:
+                target=min(price-self.min_rr*risk,price-2*a) if risk>0 else price-2*a
+            rr=(price-target)/risk if risk>0 else 0.0
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
         base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
         if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
