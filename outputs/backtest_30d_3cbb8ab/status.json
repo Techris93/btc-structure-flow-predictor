@@ -1,0 +1,1 @@
+{"status":"stopped","phase":"backtesting","variant":"reactive","bars_processed":39001,"total_bars":57600,"closed_trades":63,"run_hash":"e9b55edac31e0f691112a3961dc71c65588bb8b68cb4c9618fb35caead376fbd","checkpoint_preserved":true,"stop_reason":"stopped_by_user"}

@@ -1,0 +1,46 @@
+{
+  "config": "regime_rulebook",
+  "stats": {
+    "initial_equity": 100000,
+    "final_equity": 98161.13019247862,
+    "trades": 84,
+    "wins": 35,
+    "losses": 49,
+    "win_rate": 0.4166666666666667,
+    "gross_profit": 9481.087199239362,
+    "gross_loss": 11319.957006760686,
+    "profit_factor": 0.83755505374949,
+    "net_pnl": -1838.869807521376,
+    "maximum_drawdown": 4558.459095241502,
+    "average_r": -0.08801650773556007,
+    "average_hold_minutes": 567.7619047619048,
+    "same_bar_collisions": 0,
+    "same_bar_policy": "conservative",
+    "open_position": null,
+    "rejection_counts": {
+      "regime_range": 58256,
+      "funding_disagrees": 19325,
+      "sweep_not_confirmed": 4505,
+      "no_projected_zone": 92,
+      "costs_exceed_edge": 1441,
+      "insufficient_reward_risk": 109,
+      "orderflow_not_confirmed": 36,
+      "stop_too_wide": 129,
+      "stop_too_tight": 1,
+      "negative_expectancy": 15,
+      "duplicate_setup": 303,
+      "limit_expired": 2
+    },
+    "candidate_rejection_counts": {
+      "market:insufficient_reward_risk": 109,
+      "limit:costs_exceed_edge": 531,
+      "market:costs_exceed_edge": 526,
+      "limit:insufficient_reward_risk": 168,
+      "limit:negative_expectancy": 81,
+      "market:stop_too_wide": 129,
+      "market:stop_too_tight": 1,
+      "market:negative_expectancy": 15
+    },
+    "causality": "close-time decision; next-open fill; trades < decision time"
+  }
+}

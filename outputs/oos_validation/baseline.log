@@ -1,0 +1,82 @@
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:64: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "updated_at": pd.Timestamp.utcnow().isoformat(),
+/Users/chrixchange/Documents/Codex/2026-07-19/i/scripts/oos_validation.py:84: Pandas4Warning: Timestamp.utcnow is deprecated and will be removed in a future version. Use Timestamp.now('UTC') instead.
+  "stats": stats, "completed_at": pd.Timestamp.utcnow().isoformat(),
+{
+  "config": "baseline",
+  "stats": {
+    "initial_equity": 100000,
+    "final_equity": 98303.10620025205,
+    "trades": 17,
+    "wins": 5,
+    "losses": 12,
+    "win_rate": 0.29411764705882354,
+    "gross_profit": 2058.880861997397,
+    "gross_loss": 3755.77466174537,
+    "profit_factor": 0.5481907322524513,
+    "net_pnl": -1696.8937997479516,
+    "maximum_drawdown": 2940.5980757577927,
+    "average_r": -0.4043214672491069,
+    "average_hold_minutes": 249.1764705882353,
+    "same_bar_collisions": 0,
+    "same_bar_policy": "conservative",
+    "open_position": null,
+    "rejection_counts": {
+      "sweep_not_confirmed": 11577,
+      "insufficient_reward_risk": 669,
+      "stop_too_wide": 343,
+      "duplicate_setup": 259,
+      "limit_expired": 18,
+      "pending_superseded": 5,
+      "orderflow_not_confirmed": 85,
+      "costs_exceed_edge": 881,
+      "negative_expectancy": 47,
+      "no_projected_zone": 27
+    },
+    "candidate_rejection_counts": {
+      "market:insufficient_reward_risk": 669,
+      "limit:negative_expectancy": 549,
+      "limit:insufficient_reward_risk": 1027,
+      "market:stop_too_wide": 343,
+      "market:costs_exceed_edge": 881,
+      "market:negative_expectancy": 47,
+      "limit:costs_exceed_edge": 318,
+      "limit:stop_too_wide": 46
+    },
+    "causality": "close-time decision; next-open fill; trades < decision time"
+  }
+}

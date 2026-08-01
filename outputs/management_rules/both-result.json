@@ -1,0 +1,38 @@
+{
+  "status": "complete",
+  "config": "both",
+  "rule_params": {
+    "abort_if_below_r": 0.5,
+    "abort_after_minutes": 480.0,
+    "breakeven_trail_r": 0.8
+  },
+  "decision_start": "2026-06-28 00:00:00+00:00",
+  "stats": {
+    "initial_equity": 100000,
+    "final_equity": 100172.12984628111,
+    "trades": 38,
+    "wins": 12,
+    "losses": 26,
+    "win_rate": 0.3157894736842105,
+    "gross_profit": 3825.908011369439,
+    "gross_loss": 3653.778165088337,
+    "profit_factor": 1.0471100976862235,
+    "net_pnl": 172.12984628111008,
+    "maximum_drawdown": 1571.5843575951149,
+    "average_r": 0.019227222340813012,
+    "average_hold_minutes": 349.42105263157896,
+    "same_bar_collisions": 0,
+    "same_bar_policy": "conservative",
+    "open_position": null,
+    "rejection_counts": {
+      "regime_range": 21650,
+      "funding_disagrees": 5535,
+      "reversal_disabled": 1351,
+      "duplicate_setup": 542,
+      "costs_exceed_edge": 805
+    },
+    "candidate_rejection_counts": {},
+    "causality": "close-time decision; next-open fill; trades < decision time"
+  },
+  "completed_at": "2026-07-28T15:34:41.755701+00:00"
+}
