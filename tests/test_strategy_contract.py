@@ -144,3 +144,131 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
     assert status["closed_trades"] == 4
     assert status["last_closed"]["exit_reason"] == "superseded_by_new_setup"
     assert ledger._open is not None and ledger._open["zone"] == "zone2"
+
+
+def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
+    """A re-emitted signal for the same setup keeps its original trade."""
+    ledger = PaperLedger(tmp_path / "ledger.json")
+    base = dict(
+        bias="bearish",
+        stop=65200.0,
+        target=64500.0,
+        position_size=1.0,
+        zone="zone1",
+        sweep_time="2026-07-25 09:58:00+00:00",
+    )
+    pred1 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-07-25 10:00", tz="UTC"),
+        entry=65000.0,
+        **base,
+    )
+    ledger.update(pred1)
+    assert ledger._open is not None and ledger._open["entry"] == 65000.0
+
+    # Same setup re-emitted each minute with drifting prices: no churn.
+    for minute in (1, 2, 3):
+        pred = PredictorOutput(
+            timestamp=pd.Timestamp(f"2026-07-25 10:0{minute}", tz="UTC"),
+            entry=65000.0 - 10 * minute,
+            **base,
+        )
+        status = ledger.update(pred)
+        assert status["closed_trades"] == 3
+        assert ledger._open is not None and ledger._open["entry"] == 65000.0
+
+    # A new sweep on the same zone is a genuinely new setup.
+    pred_new_sweep = PredictorOutput(
+        timestamp=pd.Timestamp("2026-07-25 10:05", tz="UTC"),
+        entry=64900.0,
+        **{**base, "sweep_time": "2026-07-25 10:03:00+00:00"},
+    )
+    status = ledger.update(pred_new_sweep)
+    assert status["closed_trades"] == 4
+    assert status["last_closed"]["exit_reason"] == "superseded_by_new_setup"
+    assert ledger._open is not None and ledger._open["entry"] == 64900.0
+
+
+def test_deep_sweep_retrace_entry_is_directional_and_recomputes_rr(monkeypatch):
+    idx = pd.date_range("2026-01-01", periods=100, freq="min", tz="UTC")
+    ohlc = pd.DataFrame(
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 10.0},
+        index=idx,
+    )
+    trades = pd.DataFrame({"time": idx, "price": 100.0, "qty": 1.0, "side": "buy"})
+    frames = {"15m": ohlc.iloc[::15], "1h": ohlc.iloc[-40:], "4h": ohlc.iloc[-40:]}
+    sweep_zone = Zone("sweep", "swing", "below", 95, 96, 3, idx[1], idx[2])
+    target_zone = Zone("target", "swing", "above", 120, 121, 1, idx[1], idx[2])
+
+    monkeypatch.setattr(Predictor, "_regime_bias", lambda self, frames: "bullish")
+    monkeypatch.setattr("btc_predictor.strategy.atr", lambda frame: pd.Series(5.0, index=frame.index))
+    monkeypatch.setattr(
+        "btc_predictor.strategy.footprint_confirmation",
+        lambda *args, **kwargs: (True, {"reason": "confirmed", "agreement": True, "score": 0.8}),
+    )
+    monkeypatch.setattr(
+        "btc_predictor.strategy.detect_sweep",
+        lambda *args, **kwargs: {
+            "confirmed": True,
+            "status": "confirmed",
+            "depth_atr": 2.0,
+            "extreme": 90.0,
+            "time": idx[-2],
+            "reclaim_time": idx[-1],
+        },
+    )
+    monkeypatch.setattr("btc_predictor.strategy.build_projected_zones", lambda frame: [sweep_zone, target_zone])
+
+    result = Predictor(retrace_entry_atr=1.2).predict(ohlc, trades, frames=frames)
+
+    assert result.entry_type == "limit"
+    assert result.entry < 100.0
+    assert result.reward_risk >= 1.5
+
+
+def test_pending_retrace_order_waits_for_a_real_limit_touch(tmp_path):
+    t0 = pd.Timestamp("2026-01-01 00:00", tz="UTC")
+    prediction = PredictorOutput(
+        timestamp=t0,
+        bias="bullish",
+        entry=95.0,
+        stop=87.5,
+        target=120.0,
+        position_size=1.0,
+        zone="zone1",
+        sweep_time="2026-01-01 00:00:00+00:00",
+        entry_type="limit",
+    )
+    ledger = PaperLedger(tmp_path / "ledger.json")
+
+    signal_bar = pd.DataFrame(
+        {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0]},
+        index=[t0],
+    )
+    status = ledger.update(prediction, signal_bar)
+    assert status["pending_order"] is not None
+    assert status["open_position"] is None
+
+    no_touch_time = t0 + pd.Timedelta(minutes=1)
+    no_touch = pd.DataFrame(
+        {"open": [100.0], "high": [101.0], "low": [98.0], "close": [100.0]},
+        index=[no_touch_time],
+    )
+    status = ledger.update(
+        PredictorOutput(timestamp=no_touch_time, bias="bullish", zone="zone1", sweep_time=prediction.sweep_time),
+        no_touch,
+    )
+    assert status["pending_order"] is not None
+    assert status["open_position"] is None
+
+    fill_time = t0 + pd.Timedelta(minutes=2)
+    touch = pd.DataFrame(
+        {"open": [100.0], "high": [101.0], "low": [94.0], "close": [95.0]},
+        index=[fill_time],
+    )
+    status = ledger.update(
+        PredictorOutput(timestamp=fill_time, bias="bullish", zone="zone1", sweep_time=prediction.sweep_time),
+        touch,
+    )
+    assert status["pending_order"] is None
+    assert status["open_position"] is not None
+    assert status["open_position"]["entry"] == 95.0

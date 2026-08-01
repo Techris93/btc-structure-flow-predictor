@@ -32,7 +32,13 @@ from btc_predictor.signal_lifecycle import SignalLifecycle
 
 app = Flask(__name__)
 logger = logging.getLogger("btc_predictor")
-predictor = Predictor()
+# Late-entry guard: set RETRACE_ENTRY_ATR (e.g. "1.2") to enter deep sweeps on
+# a RETRACE_PCT pullback limit instead of at market. Empty/unset = disabled.
+_retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "").strip()
+predictor = Predictor(
+    retrace_entry_atr=float(_retrace_atr) if _retrace_atr else None,
+    retrace_pct=float(os.getenv("RETRACE_PCT", "0.5")),
+)
 data_dir = runtime_dir()
 live_lock = threading.Lock()
 push_lock = threading.Lock()

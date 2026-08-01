@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 from .footprint import footprint_confirmation
 from .indicators import atr
@@ -31,9 +35,14 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
+        # Late-entry guard: when a confirmed sweep is deeper than
+        # `retrace_entry_atr` ATR, enter on a `retrace_pct` pullback of the
+        # sweep leg (pending limit) instead of at market. None = disabled
+        # (market entry, original behavior).
+        self.retrace_entry_atr=retrace_entry_atr; self.retrace_pct=float(retrace_pct)
         self._held_bias="neutral"; self.last_regimes={"4h":"neutral","1h":"neutral","15m":"neutral"}
 
     @staticmethod
@@ -118,7 +127,39 @@ class Predictor:
             if target is None:
                 target=min(price-self.min_rr*risk,price-2*a) if risk>0 else price-2*a
             rr=(price-target)/risk if risk>0 else 0.0
+        entry=price; entry_type="market"
+        if self.retrace_entry_atr is not None and sweep.get("depth_atr") is not None and sweep["depth_atr"]>=self.retrace_entry_atr:
+            leg=abs(sweep["extreme"]-price)
+            if leg>0:
+                # A bullish reclaim should retrace down; a bearish reclaim
+                # should retrace up. The limit must remain on the profitable
+                # side of the stop or we fall back to the market geometry.
+                candidate_entry=(price-self.retrace_pct*leg) if bias=="bullish" else (price+self.retrace_pct*leg)
+                candidate_risk=(candidate_entry-stop) if bias=="bullish" else (stop-candidate_entry)
+                if candidate_risk>0 and np.isfinite(candidate_risk):
+                    entry=candidate_entry; entry_type="limit"; risk=candidate_risk
+                    if bias=="bullish":
+                        target=next((t for t in options if (t-entry)/risk>=self.min_rr),max(entry+self.min_rr*risk,entry+2*a))
+                        rr=(target-entry)/risk
+                    else:
+                        target=next((t for t in options if (entry-t)/risk>=self.min_rr),min(entry-self.min_rr*risk,entry-2*a))
+                        rr=(entry-target)/risk
+                else:
+                    log.info("retrace_entry_skipped bias=%s depth_atr=%.2f market=%.2f candidate=%.2f invalid_risk=%.2f",bias,sweep["depth_atr"],price,candidate_entry,candidate_risk)
+
+        skipped=[]
+        for candidate in active_targets:
+            midpoint=float(candidate.midpoint)
+            opposing=(bias=="bullish" and candidate.side=="above" and entry<midpoint<target) or (bias=="bearish" and candidate.side=="below" and target<midpoint<entry)
+            if opposing and risk>0:
+                candidate_rr=((midpoint-entry)/risk) if bias=="bullish" else ((entry-midpoint)/risk)
+                if candidate_rr<self.min_rr:
+                    distance_atr=abs(midpoint-entry)/a if a>0 else None
+                    skipped.append({"kind":candidate.kind,"mid":round(midpoint,2),"dist_atr":round(distance_atr,2) if distance_atr is not None else None})
+        log.info("target_select bias=%s entry=%.2f stop=%.2f target=%.2f rr=%.2f skipped_zones=%s",bias,entry,stop,target,rr,skipped)
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
-        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=price,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
-        if rr<self.min_rr:return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
-        return self._output(now,bias,**base,position_size=equity*self.risk_fraction/abs(price-stop))
+        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=entry,entry_type=entry_type,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
+        if rr<self.min_rr or not np.isfinite(risk) or risk<=0:
+            log.info("insufficient_reward_risk bias=%s entry=%.2f stop=%.2f target=%.2f rr=%.2f min_rr=%.2f skipped_zones=%s",bias,entry,stop,target,rr,self.min_rr,skipped)
+            return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")
+        return self._output(now,bias,**base,position_size=equity*self.risk_fraction/risk)

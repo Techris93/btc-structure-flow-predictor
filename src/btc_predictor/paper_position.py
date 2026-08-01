@@ -65,6 +65,7 @@ class PaperLedger:
         self.store = JsonStore(self.path) if self.path else None
         self.lock = threading.RLock()
         self._open: dict | None = None
+        self._pending: dict | None = None
         self._closed: list[dict] = []
         self._equity = 100_000.0
         self._load()
@@ -75,6 +76,7 @@ class PaperLedger:
                 with self.lock:
                     data = self.store.read({})
                     self._open = data.get("open")
+                    self._pending = data.get("pending")
                     self._closed = list(data.get("closed", []))
                     self._equity = float(data.get("equity", 100_000.0))
             except Exception as exc:
@@ -92,6 +94,7 @@ class PaperLedger:
             with self.lock:
                 self.store.write({
                     "open": self._open,
+                    "pending": self._pending,
                     "closed": self._closed[-5000:],
                     "equity": self._equity,
                 })
@@ -102,6 +105,9 @@ class PaperLedger:
             last_close = None
             if current_ohlc is not None and not current_ohlc.empty:
                 last_close = float(current_ohlc["close"].iloc[-1])
+
+            # 0. Resolve any pending limit order (fill, supersede, or expire)
+            self._update_pending(prediction, current_ohlc)
 
             # 1. Evaluate exits on existing open position
             if self._open is not None and current_ohlc is not None and not current_ohlc.empty:
@@ -116,19 +122,27 @@ class PaperLedger:
                     and prediction.target is not None
                     and prediction.position_size
                 )
-                zone_changed = prediction.zone and prediction.zone != self._open.get("zone")
-                time_changed = (
-                    prediction.timestamp
-                    and pd.Timestamp(prediction.timestamp).isoformat() != self._open.get("entry_time")
-                )
+                # Setup identity = zone + sweep event. The prediction timestamp
+                # advances every 1m candle, so it must NOT be part of the
+                # identity — otherwise every re-emitted signal closes and
+                # re-opens the same trade ("superseded" churn each minute).
+                open_sweep = self._open.get("sweep_time")
+                pred_sweep = str(prediction.sweep_time) if prediction.sweep_time else None
+                same_zone = prediction.zone and prediction.zone == self._open.get("zone")
+                if open_sweep is None:
+                    # Positions persisted before sweep_time was tracked: fall
+                    # back to zone-only identity to avoid a one-off churn.
+                    same_setup = bool(same_zone)
+                else:
+                    same_setup = bool(same_zone) and pred_sweep == open_sweep
                 if current_side != self._open["side"]:
                     self._close(prediction.timestamp, last_close, "signal_flipped")
-                elif is_new_setup and (zone_changed or time_changed):
+                elif is_new_setup and not same_setup:
                     self._close(prediction.timestamp, last_close, "superseded_by_new_setup")
 
             # 3. Enter new position if no position is open and setup is confirmed
-            if self._open is None and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
-                self._open = {
+            if self._open is None and self._pending is None and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
+                order = {
                     "entry_time": pd.Timestamp(prediction.timestamp).isoformat(),
                     "side": "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else "neutral",
                     "entry": float(prediction.entry),
@@ -136,12 +150,21 @@ class PaperLedger:
                     "target": float(prediction.target),
                     "size": float(prediction.position_size),
                     "zone": prediction.zone,
+                    "sweep_time": str(prediction.sweep_time) if prediction.sweep_time else None,
                     "probability_tp_before_sl": prediction.probability_tp_before_sl,
                 }
-
-                # Check exit immediately on entry candle
-                if current_ohlc is not None and not current_ohlc.empty:
-                    self._check_exit(current_ohlc)
+                if getattr(prediction, "entry_type", "market") == "limit":
+                    # Pending retracement order: do not assume a fill. It opens
+                    # only if price trades back to the limit level, and expires
+                    # after `pending_ttl_bars` closed bars without a touch.
+                    order["signal_time"] = order["entry_time"]
+                    order["pending_ttl_bars"] = 240
+                    self._pending = order
+                else:
+                    self._open = order
+                    # Check exit immediately on entry candle
+                    if current_ohlc is not None and not current_ohlc.empty:
+                        self._check_exit(current_ohlc)
 
             self._save()
             status = self._status()
@@ -149,6 +172,64 @@ class PaperLedger:
                 dict(trade) for trade in self._closed[closed_before_update:]
             ]
             return status
+
+    def _update_pending(self, prediction, current_ohlc: pd.DataFrame | None):
+        """Fill, supersede, or expire a pending retracement limit order."""
+        if self._pending is None:
+            return
+        pending = self._pending
+        side = pending["side"]
+
+        # Cancel if the signal flips against the pending order.
+        new_side = "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else None
+        if new_side is not None and new_side != side:
+            logger.info("Pending %s order cancelled: signal flipped to %s", side, prediction.bias)
+            self._pending = None
+            return
+        if (
+            new_side is not None
+            and prediction.entry is not None
+            and prediction.stop is not None
+            and prediction.target is not None
+            and prediction.position_size
+        ):
+            pending_sweep = self._pending.get("sweep_time")
+            prediction_sweep = str(prediction.sweep_time) if prediction.sweep_time else None
+            same_setup = (
+                prediction.zone == self._pending.get("zone")
+                and (pending_sweep is None or prediction_sweep == pending_sweep)
+            )
+            if not same_setup:
+                logger.info("Pending %s order cancelled: superseded by a new setup", side)
+                self._pending = None
+                return
+
+        if current_ohlc is None or current_ohlc.empty:
+            return
+        ohlc_index_utc = pd.to_datetime(current_ohlc.index, utc=True)
+        signal_time = pd.Timestamp(pending.get("signal_time", pending["entry_time"]))
+        future = current_ohlc.loc[ohlc_index_utc > signal_time]
+        limit = pending["entry"]
+        ttl = int(pending.get("pending_ttl_bars", 240))
+
+        for i, (ts, bar) in enumerate(future.iterrows()):
+            if i >= ttl:
+                logger.info("Pending %s order at %.2f expired after %d bars without fill", side, limit, ttl)
+                self._pending = None
+                return
+            touched = float(bar.low) <= limit if side == "long" else float(bar.high) >= limit
+            if touched:
+                # Conservative same-bar rule: if the stop was hit on the fill
+                # bar, the retracement would not have been tradable.
+                stopped = float(bar.low) <= pending["stop"] if side == "long" else float(bar.high) >= pending["stop"]
+                if stopped:
+                    logger.info("Pending %s order at %.2f invalidated: stop hit before fill", side, limit)
+                    self._pending = None
+                    return
+                self._open = dict(pending, entry_time=pd.Timestamp(ts).isoformat())
+                self._pending = None
+                logger.info("Pending %s order filled at %.2f (%s)", side, limit, self._open["entry_time"])
+                return
 
     def _check_exit(self, ohlc: pd.DataFrame):
         if self._open is None:
@@ -227,6 +308,7 @@ class PaperLedger:
             return {
                 "equity": round(self._equity, 2),
                 "open_position": self._open,
+                "pending_order": self._pending,
                 "closed_trades": len(closed),
                 "wins": wins,
                 "losses": losses,
@@ -238,6 +320,7 @@ class PaperLedger:
 
     def close_all(self, exit_price, exit_time, reason="manual"):
         with self.lock:
+            self._pending = None
             if self._open is not None:
                 self._close(exit_time, exit_price, reason)
-                self._save()
+            self._save()

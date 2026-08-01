@@ -82,3 +82,6 @@ class PredictorOutput:
     reclaim_time: str | None = None
     orderflow_reason: str | None = None
     exchange_agreement: bool | None = None
+    # "market" (fill at signal price) or "limit" (pending retracement order);
+    # appended last so positional constructions keep working.
+    entry_type: str = "market"
