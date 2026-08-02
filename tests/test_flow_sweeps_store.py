@@ -63,6 +63,8 @@ def test_trade_store_deduplicates_and_persists(tmp_path):
     assert store.append(row)==1 and store.append(row)==0
     reopened=TradeStore(path); out=reopened.query(now-pd.Timedelta(seconds=1),now+pd.Timedelta(seconds=1))
     assert len(out)==1 and out.iloc[0].exchange=="binance"
+    compact=reopened.query(now-pd.Timedelta(seconds=1),now+pd.Timedelta(seconds=1),include_trade_id=False)
+    assert list(compact.columns)==["price","qty","side","exchange","time"]
     assert reopened.stats()["binance"]["trades"]==1
     reopened.set_collector_status("binance",connected=True,mode="spot_market_data")
     assert reopened.collector_status()["binance"]=={"connected":True,"mode":"spot_market_data"}

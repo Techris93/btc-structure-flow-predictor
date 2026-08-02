@@ -8,7 +8,7 @@ services:
     branch: main
     autoDeploy: true
     buildCommand: pip install .
-    startCommand: gunicorn --workers 1 --threads 4 --timeout 120 --max-requests 200 --max-requests-jitter 40 --bind 0.0.0.0:$PORT app:app
+    startCommand: MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=131072 gunicorn --workers 1 --threads 4 --timeout 120 --max-requests 200 --max-requests-jitter 40 --bind 0.0.0.0:$PORT app:app
     healthCheckPath: /healthz
     disk:
       name: btc-predictor-state
@@ -44,13 +44,13 @@ services:
       - key: LIVE_WATCHDOG_CHECK_SECONDS
         value: "15"
       - key: TRADE_LOOKBACK_MINUTES
-        value: "90"
+        value: "15"
       - key: TRADE_RETENTION_MINUTES
         value: "120"
       - key: TRADE_QUERY_LIMIT
-        value: "60000"
+        value: "20000"
       - key: TRADE_STORE_MAX_ROWS
-        value: "80000"
+        value: "40000"
       - key: MAX_PROJECTED_ZONES
         value: "200"
       - key: MARKET_TYPE

@@ -86,13 +86,11 @@ class TradeStore:
             )
         return self.append_rows(rows)
 
-    def query(self, start, end, limit: int | None = None):
+    def query(self, start, end, limit: int | None = None, include_trade_id: bool = True):
         start_us = int(pd.Timestamp(start).value // 1000)
         end_us = int(pd.Timestamp(end).value // 1000)
-        sql = (
-            "SELECT time_us,price,qty,side,exchange,event_key FROM trades "
-            "WHERE time_us>=? AND time_us<? ORDER BY time_us"
-        )
+        selected = "time_us,price,qty,side,exchange,event_key" if include_trade_id else "time_us,price,qty,side,exchange"
+        sql = f"SELECT {selected} FROM trades WHERE time_us>=? AND time_us<? ORDER BY time_us"
         params = [start_us, end_us]
         if limit is not None:
             sql += " DESC LIMIT ?"
@@ -100,10 +98,16 @@ class TradeStore:
         with self.lock, self._connect() as db:
             rows = db.execute(sql, params).fetchall()
         if not rows:
-            return pd.DataFrame(columns=["time", "price", "qty", "side", "exchange", "trade_id"])
+            columns = ["time", "price", "qty", "side", "exchange"]
+            if include_trade_id:
+                columns.append("trade_id")
+            return pd.DataFrame(columns=columns)
         if limit is not None:
             rows = list(reversed(rows))
-        frame = pd.DataFrame(rows, columns=["time_us", "price", "qty", "side", "exchange", "trade_id"])
+        columns = ["time_us", "price", "qty", "side", "exchange"]
+        if include_trade_id:
+            columns.append("trade_id")
+        frame = pd.DataFrame(rows, columns=columns)
         frame["time"] = pd.to_datetime(frame.pop("time_us"), unit="us", utc=True)
         return frame
 

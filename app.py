@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import fcntl
+import gc
 import hashlib
 import hmac
 import json
@@ -29,6 +31,14 @@ from btc_predictor.strategy import Predictor
 from btc_predictor.trade_store import TradeStore, start_collectors
 from btc_predictor.paper_position import PaperLedger
 from btc_predictor.signal_lifecycle import SignalLifecycle
+
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+    _malloc_trim = _libc.malloc_trim
+    _malloc_trim.argtypes = [ctypes.c_size_t]
+    _malloc_trim.restype = ctypes.c_int
+except (AttributeError, OSError):
+    _malloc_trim = None
 
 app = Flask(__name__)
 logger = logging.getLogger("btc_predictor")
@@ -98,6 +108,12 @@ BIAS_CONFIRM_OBSERVATIONS = max(1, int(os.getenv("BIAS_CONFIRM_OBSERVATIONS", "2
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://btc-structure-flow-predictor.onrender.com"
 ).rstrip("/")
+# The predictor only needs a short, recent trade window for footprint and
+# five-minute exchange-agreement features. Bound both the database result and
+# the retention store so pandas cannot materialize an unbounded working set.
+TRADE_LOOKBACK_MINUTES = max(5, min(15, int(os.getenv("TRADE_LOOKBACK_MINUTES", "15"))))
+TRADE_QUERY_LIMIT = max(5_000, min(20_000, int(os.getenv("TRADE_QUERY_LIMIT", "20_000"))))
+TRADE_STORE_MAX_ROWS = max(10_000, min(40_000, int(os.getenv("TRADE_STORE_MAX_ROWS", "40_000"))))
 
 vapid_path = data_dir / "vapid_private.pem"
 if vapid_path.exists():
@@ -112,7 +128,7 @@ secret_path = data_dir / "push_test_secret"
 if not secret_path.exists():
     secret_path.write_bytes(os.urandom(32)); os.chmod(secret_path, 0o600)
 _push_secret = secret_path.read_bytes()
-trade_store = TradeStore(data_dir / "live_trades.sqlite3", max_rows=int(os.getenv("TRADE_STORE_MAX_ROWS", "80000")))
+trade_store = TradeStore(data_dir / "live_trades.sqlite3", max_rows=TRADE_STORE_MAX_ROWS)
 paper_ledger = PaperLedger(
     os.getenv("PAPER_LEDGER_PATH", str(data_dir / "paper_ledger.json")),
     neutral_exit_observations=max(1, int(os.getenv("NEUTRAL_EXIT_OBSERVATIONS", "3"))),
@@ -1005,6 +1021,27 @@ def _live_poll_interval_seconds():
     return max(20, int(os.getenv("LIVE_POLL_SECONDS", "45")))
 
 
+def _process_rss_mb():
+    """Read current resident memory on Linux without a third-party package."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return round(float(line.split()[1]) / 1024.0, 1)
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _release_transient_memory():
+    """Collect pandas object graphs and return free glibc arenas to the OS."""
+    gc.collect()
+    if _malloc_trim is not None:
+        try:
+            _malloc_trim(0)
+        except Exception:
+            logger.debug("malloc_trim unavailable", exc_info=True)
+
+
 def _live_loop_diagnostics():
     """Return in-memory loop health without acquiring application or DB locks."""
     now = time.monotonic()
@@ -1099,7 +1136,7 @@ def _live_loop():
             # WS stream is dead, so lag never reaches the stale threshold. Each cycle
             # costs ~22 weight (aggTrades 20 + klines 2) ~= 32 weight/min, ~1.3% of the
             # 2,400/min fapi budget.
-            poll_seconds = max(20, int(os.getenv("LIVE_POLL_SECONDS", "45")))
+            poll_seconds = _live_poll_interval_seconds()
             binance_backfill_due = binance_lag is None or binance_lag > poll_seconds
             rest_due = poll_started >= binance_rest_retry_at
             rest_allowed = BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_backfill_due and not binance_ws_fresh)
@@ -1129,7 +1166,14 @@ def _live_loop():
                     binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
                     binance_rest_last_error = f"{type(exc).__name__}: {str(exc)[:160]} (cooldown {cooldown_min}m)"
                     logger.warning("Binance REST trades unavailable (cooldown %sm): %s", cooldown_min, exc)
-            now=ohlc.index[-1]; trades=trade_store.query(now-pd.Timedelta(minutes=int(os.getenv("TRADE_LOOKBACK_MINUTES","90"))), now, limit=int(os.getenv("TRADE_QUERY_LIMIT","60000"))); flow_bars=None
+            now=ohlc.index[-1]
+            trades=trade_store.query(
+                now-pd.Timedelta(minutes=TRADE_LOOKBACK_MINUTES),
+                now,
+                limit=TRADE_QUERY_LIMIT,
+                include_trade_id=False,
+            )
+            flow_bars=None
             recent_trades=trades.loc[trades.time>=now-pd.Timedelta(minutes=2)] if "time" in trades else trades
             available_exchanges=set(recent_trades.exchange.astype(str)) if "exchange" in recent_trades else set()
             sources="+".join(exchange for exchange in ("bybit","binance") if exchange in available_exchanges) or sources
@@ -1219,6 +1263,12 @@ def _live_loop():
             live_loop_last_error_at = error_at.isoformat()
             live_loop_last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
             with live_lock: live_state.update({"status":"degraded","error":str(exc),"updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
+        finally:
+            # Release transient pandas/NumPy object graphs before the next
+            # cycle.  The bounded query above is the primary guard; explicit
+            # collection prevents allocator retention from accumulating across
+            # repeated order-flow transforms.
+            _release_transient_memory()
         time.sleep(_live_poll_interval_seconds())
 
 
@@ -1464,6 +1514,8 @@ def health():
         "binance_rest_on_stale":BINANCE_REST_ON_STALE,
         "collector_stale_seconds":COLLECTOR_STALE_SECONDS,
         "market_feed":state["status"],
+        "process_rss_mb": _process_rss_mb(),
+        "memory_limit_mb": 512,
         "live_loop_owner":live_thread_started,
         "live_thread_alive":bool(live_thread and live_thread.is_alive()),
         "live_loop": _live_loop_diagnostics(),
