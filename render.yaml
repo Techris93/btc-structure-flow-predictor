@@ -8,7 +8,7 @@ services:
     branch: main
     autoDeploy: true
     buildCommand: pip install .
-    startCommand: MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=131072 gunicorn --workers 1 --threads 4 --timeout 120 --max-requests 200 --max-requests-jitter 40 --bind 0.0.0.0:$PORT app:app
+    startCommand: MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=131072 gunicorn --config gunicorn_config.py --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT app:app
     healthCheckPath: /healthz
     disk:
       name: btc-predictor-state

@@ -75,4 +75,4 @@ echo "  - Binance REST: OFF by default (no fapi polling)"
 echo "  - Bybit: linear REST for OHLCV + linear publicTrade WebSocket"
 echo "  - Reconnect backoff avoids 300-connect/5min storms"
 
-exec python -u -c 'import os; from app import app; app.run(host="127.0.0.1", port=int(os.environ.get("PORT","8000")), debug=False, use_reloader=False)'
+exec python -u -c 'import os; from app import app, start_live_boot_supervisor; start_live_boot_supervisor(); app.run(host="127.0.0.1", port=int(os.environ.get("PORT","8000")), debug=False, use_reloader=False)'

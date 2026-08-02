@@ -1361,10 +1361,6 @@ def start_live_boot_supervisor():
     return live_boot_thread
 
 
-if os.getenv("START_LIVE_LOOP_ON_BOOT", "1").lower() in ("1", "true", "yes", "on"):
-    start_live_boot_supervisor()
-
-
 @app.get("/")
 @app.get("/dashboard")
 def index(): return render_template("dashboard.html")
@@ -1861,4 +1857,7 @@ def no_cache(response):
     return response
 
 
-if __name__ == "__main__": app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+if __name__ == "__main__":
+    if os.getenv("START_LIVE_LOOP_ON_BOOT", "1").lower() in ("1", "true", "yes", "on"):
+        start_live_boot_supervisor()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
