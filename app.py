@@ -51,6 +51,19 @@ live_thread = None
 collector_thread = None
 _live_lock_handle = None
 live_boot_thread = None
+# The web process and the market loop share one process by design.  Keep the
+# loop's heartbeat in memory so liveness checks never need to touch SQLite or
+# the durable stores used by the predictor.
+live_loop_started_at = None
+live_loop_last_attempt_at = None
+live_loop_last_completed_at = None
+live_loop_last_error_at = None
+live_loop_last_error = None
+live_loop_last_attempt_monotonic = None
+live_loop_last_completed_monotonic = None
+live_loop_watchdog_alerted = False
+live_loop_watchdog_thread = None
+live_loop_started_monotonic = None
 
 subscription_store = JsonStore(data_dir / "push_subscriptions.json")
 push_delivery_store = JsonStore(data_dir / "push_delivery.json")
@@ -125,6 +138,8 @@ COLLECTOR_STALE_SECONDS = max(30, int(os.getenv("COLLECTOR_STALE_SECONDS", "90")
 # at roughly 22 weight/min, ~1% of the 2,400 weight/min fapi budget.
 BINANCE_REST_ON_STALE = os.getenv("BINANCE_REST_ON_STALE", "1").lower() in ("1", "true", "yes", "on")
 BINANCE_STALE_REST_MINUTES = max(1, int(os.getenv("BINANCE_STALE_REST_MINUTES", "3")))
+LIVE_WATCHDOG_MISSED_POLLS = max(2, int(os.getenv("LIVE_WATCHDOG_MISSED_POLLS", "3")))
+LIVE_WATCHDOG_CHECK_SECONDS = max(5, int(os.getenv("LIVE_WATCHDOG_CHECK_SECONDS", "15")))
 
 
 def _http_get(url, params=None, timeout=10):
@@ -986,8 +1001,68 @@ def _ack_delivery(delivery_id, token, status):
     return True, None
 
 
+def _live_poll_interval_seconds():
+    return max(20, int(os.getenv("LIVE_POLL_SECONDS", "45")))
+
+
+def _live_loop_diagnostics():
+    """Return in-memory loop health without acquiring application or DB locks."""
+    now = time.monotonic()
+    threshold = float(_live_poll_interval_seconds() * LIVE_WATCHDOG_MISSED_POLLS)
+    started_age = None
+    completed_age = None
+    if live_loop_started_at and live_loop_started_monotonic is not None:
+        started_age = round(max(0.0, now - live_loop_started_monotonic), 1)
+    if live_loop_last_completed_monotonic is not None:
+        completed_age = round(max(0.0, now - live_loop_last_completed_monotonic), 1)
+    stale = False
+    if live_loop_started_at:
+        stale = (
+            completed_age is None
+            and started_age is not None
+            and started_age > threshold
+        ) or (completed_age is not None and completed_age > threshold)
+    return {
+        "thread_alive": bool(live_thread and live_thread.is_alive()),
+        "started_at": live_loop_started_at,
+        "last_attempt_at": live_loop_last_attempt_at,
+        "last_completed_at": live_loop_last_completed_at,
+        "last_error_at": live_loop_last_error_at,
+        "last_error": live_loop_last_error,
+        "last_completed_age_seconds": completed_age,
+        "stale": stale,
+        "stale_after_seconds": int(threshold),
+        "watchdog_alerted": bool(live_loop_watchdog_alerted),
+    }
+
+
+def _live_loop_watchdog():
+    """Log stalled-loop alerts without restarting the web process."""
+    global live_loop_watchdog_alerted
+    while True:
+        time.sleep(LIVE_WATCHDOG_CHECK_SECONDS)
+        if not live_thread_started:
+            continue
+        diagnostics = _live_loop_diagnostics()
+        if diagnostics["stale"] and not live_loop_watchdog_alerted:
+            live_loop_watchdog_alerted = True
+            logger.error(
+                "Live predictor watchdog: no completed poll for %ss (last_completed=%s, last_error=%s)",
+                diagnostics["stale_after_seconds"],
+                diagnostics["last_completed_at"],
+                diagnostics["last_error"],
+            )
+        elif not diagnostics["stale"] and live_loop_watchdog_alerted:
+            live_loop_watchdog_alerted = False
+            logger.info("Live predictor watchdog: poll loop recovered")
+
+
 def _live_loop():
     global live_state
+    global live_loop_started_at, live_loop_last_attempt_at
+    global live_loop_last_completed_at, live_loop_last_error_at, live_loop_last_error
+    global live_loop_last_attempt_monotonic, live_loop_last_completed_monotonic
+    global live_loop_started_monotonic
     binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
     flow_bars_cache = None
     binance_rest_last_ok_at = None
@@ -995,6 +1070,11 @@ def _live_loop():
     while True:
         try:
             poll_started = pd.Timestamp.now(tz="UTC")
+            if live_loop_started_at is None:
+                live_loop_started_at = poll_started.isoformat()
+                live_loop_started_monotonic = time.monotonic()
+            live_loop_last_attempt_at = poll_started.isoformat()
+            live_loop_last_attempt_monotonic = time.monotonic()
             with live_lock: live_state.update({"status":"polling","updated_at":poll_started.isoformat()})
             ohlc, recent, frames = _bybit_data(); sources = "bybit"; trade_store.append(recent)
             binance_latest = trade_store.exchange_latest("binance")
@@ -1129,14 +1209,26 @@ def _live_loop():
             }
             live_state_store.write(next_state)
             with live_lock: live_state = next_state
+            live_loop_last_completed_at = now.isoformat()
+            live_loop_last_completed_monotonic = time.monotonic()
+            live_loop_last_error_at = None
+            live_loop_last_error = None
         except Exception as exc:
             logger.exception("Live market poll failed")
+            error_at = pd.Timestamp.now(tz="UTC")
+            live_loop_last_error_at = error_at.isoformat()
+            live_loop_last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
             with live_lock: live_state.update({"status":"degraded","error":str(exc),"updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
-        time.sleep(max(20, int(os.getenv("LIVE_POLL_SECONDS", "45"))))
+        time.sleep(_live_poll_interval_seconds())
 
 
 def start_live_loop():
     global live_thread_started, live_thread, collector_thread, _live_lock_handle
+    global live_loop_watchdog_thread, live_loop_watchdog_alerted
+    global live_loop_started_at, live_loop_started_monotonic
+    global live_loop_last_attempt_at, live_loop_last_completed_at
+    global live_loop_last_error_at, live_loop_last_error
+    global live_loop_last_attempt_monotonic, live_loop_last_completed_monotonic
     with live_start_lock:
         if live_thread_started and live_thread is not None and live_thread.is_alive(): return True
         lock_handle = None
@@ -1149,10 +1241,25 @@ def start_live_loop():
             return False
         try:
             _live_lock_handle = lock_handle
+            live_loop_started_monotonic = time.monotonic()
+            live_loop_started_at = pd.Timestamp.now(tz="UTC").isoformat()
+            live_loop_last_attempt_at = None
+            live_loop_last_completed_at = None
+            live_loop_last_error_at = None
+            live_loop_last_error = None
+            live_loop_last_attempt_monotonic = None
+            live_loop_last_completed_monotonic = None
+            live_loop_watchdog_alerted = False
             collector_thread = start_collectors(trade_store)
             live_thread = threading.Thread(target=_live_loop, name="live-predictor", daemon=True)
             live_thread.start()
             live_thread_started = True
+            live_loop_watchdog_thread = threading.Thread(
+                target=_live_loop_watchdog,
+                name="live-predictor-watchdog",
+                daemon=True,
+            )
+            live_loop_watchdog_thread.start()
             logger.info("Live predictor loop started independently of dashboard traffic")
             return True
         except Exception:
@@ -1318,9 +1425,21 @@ def icon_svg():
 
 
 
+@app.get("/healthz")
+def healthz():
+    """Render liveness probe: no network, disk, database, or application locks."""
+    return jsonify({
+        "status": "ok",
+        "service": "btc-structure-flow-predictor",
+        "process_alive": True,
+    })
+
+
 @app.get("/health")
 def health():
-    start_live_loop()
+    # Detailed diagnostics intentionally remain separate from /healthz.  This
+    # endpoint may inspect stores and collectors, but is never used by Render
+    # to decide whether the process is alive.
     with live_lock: state = dict(live_state)
     collectors = trade_store.collector_status(pd.Timestamp.now(tz="UTC"), COLLECTOR_STALE_SECONDS)
     # Prefer durable store timestamps when collector latest is empty.
@@ -1347,6 +1466,7 @@ def health():
         "market_feed":state["status"],
         "live_loop_owner":live_thread_started,
         "live_thread_alive":bool(live_thread and live_thread.is_alive()),
+        "live_loop": _live_loop_diagnostics(),
         "push":{
             "supported":webpush is not None,
             "single_installation":PUSH_SINGLE_INSTALLATION,

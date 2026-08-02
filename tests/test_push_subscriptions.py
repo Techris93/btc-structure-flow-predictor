@@ -8,6 +8,7 @@ from app import (
 import base64
 import json
 from pathlib import Path
+import time
 import pandas as pd
 
 
@@ -121,6 +122,38 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "Apple accepted" not in dashboard
     assert 'lastDelivery.delivery_type === "test"' not in dashboard
     assert '" · delivered"' not in dashboard
+
+
+def test_healthz_is_a_side_effect_free_liveness_probe(monkeypatch):
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("/healthz must not start loops or inspect stores")
+
+    monkeypatch.setattr(web_app, "start_live_loop", fail_if_called)
+    monkeypatch.setattr(web_app, "trade_store", fail_if_called)
+
+    response = web_app.app.test_client().get("/healthz")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "status": "ok",
+        "service": "btc-structure-flow-predictor",
+        "process_alive": True,
+    }
+
+
+def test_live_loop_diagnostics_detects_a_stalled_poll(monkeypatch):
+    now = time.monotonic()
+    monkeypatch.setenv("LIVE_POLL_SECONDS", "20")
+    monkeypatch.setattr(web_app, "live_loop_started_at", "2026-08-02T00:00:00+00:00")
+    monkeypatch.setattr(web_app, "live_loop_started_monotonic", now - 100)
+    monkeypatch.setattr(web_app, "live_loop_last_completed_monotonic", now - 100)
+    monkeypatch.setattr(web_app, "live_thread", None)
+
+    diagnostics = web_app._live_loop_diagnostics()
+
+    assert diagnostics["stale"] is True
+    assert diagnostics["stale_after_seconds"] == 60
+    assert diagnostics["last_completed_age_seconds"] >= 99
 
 
 def test_latest_delivery_summaries_separate_automatic_and_test(monkeypatch, tmp_path):

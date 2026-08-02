@@ -91,6 +91,8 @@ Local defaults:
 Check health:
 
 ```bash
+curl -s http://127.0.0.1:8000/healthz | python3 -m json.tool
+# Detailed feed, collector, push, and watchdog diagnostics:
 curl -s http://127.0.0.1:8000/health | python3 -m json.tool
 ```
 
