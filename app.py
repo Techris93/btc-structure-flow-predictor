@@ -1338,7 +1338,7 @@ def start_live_boot_supervisor():
     return live_boot_thread
 
 
-if os.getenv("START_LIVE_LOOP_ON_BOOT", "0").lower() in ("1", "true", "yes", "on"):
+if os.getenv("START_LIVE_LOOP_ON_BOOT", "1").lower() in ("1", "true", "yes", "on"):
     start_live_boot_supervisor()
 
 
