@@ -23,7 +23,11 @@ class TradeStore:
     def __init__(self, path, max_rows: int = 120_000):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock = threading.RLock()
+        # WAL allows readers to proceed while a collector commits. Keep
+        # database writes and in-memory feed state on separate locks so busy
+        # trade streams cannot starve predictor/status reads.
+        self.db_write_lock = threading.Lock()
+        self.state_lock = threading.RLock()
         self.max_rows = int(max_rows)
         self._collector_status = {}
         # Recent 1m klines collected from the Binance WebSocket, so footprint
@@ -64,7 +68,7 @@ class TradeStore:
             raw = f"{exchange}|{trade_id or ''}|{ts.value}|{price}|{qty}|{side}"
             key = f"{exchange}:{trade_id}" if trade_id not in (None, "") else hashlib.sha1(raw.encode()).hexdigest()
             prepared.append((key, int(ts.value // 1000), price, qty, side, exchange))
-        with self.lock, self._connect() as db:
+        with self.db_write_lock, self._connect() as db:
             before = db.total_changes
             db.executemany("INSERT OR IGNORE INTO trades VALUES (?,?,?,?,?,?)", prepared)
             return db.total_changes - before
@@ -95,7 +99,7 @@ class TradeStore:
         if limit is not None:
             sql += " DESC LIMIT ?"
             params.append(int(limit))
-        with self.lock, self._connect() as db:
+        with self._connect() as db:
             rows = db.execute(sql, params).fetchall()
         if not rows:
             columns = ["time", "price", "qty", "side", "exchange"]
@@ -113,7 +117,7 @@ class TradeStore:
 
     def prune(self, before=None, max_rows: int | None = None):
         max_rows = self.max_rows if max_rows is None else int(max_rows)
-        with self.lock, self._connect() as db:
+        with self.db_write_lock, self._connect() as db:
             if before is not None:
                 db.execute(
                     "DELETE FROM trades WHERE time_us<?",
@@ -133,7 +137,7 @@ class TradeStore:
                 pass
 
     def stats(self):
-        with self.lock, self._connect() as db:
+        with self._connect() as db:
             rows = db.execute(
                 "SELECT exchange,COUNT(*),MIN(time_us),MAX(time_us) FROM trades GROUP BY exchange"
             ).fetchall()
@@ -147,7 +151,7 @@ class TradeStore:
         }
 
     def set_collector_status(self, name, **values):
-        with self.lock:
+        with self.state_lock:
             self._collector_status[name] = {**self._collector_status.get(name, {}), **values}
 
     def collector_status(self, now=None, stale_after_seconds: int | None = None):
@@ -159,7 +163,7 @@ class TradeStore:
         now = pd.Timestamp(now or pd.Timestamp.now(tz="UTC"))
         if now.tzinfo is None:
             now = now.tz_localize("UTC")
-        with self.lock:
+        with self.state_lock:
             out = {name: dict(values) for name, values in self._collector_status.items()}
         if stale_after_seconds is None:
             return out
@@ -198,7 +202,7 @@ class TradeStore:
         When `closed` is True the candle is finalized into the recent deque.
         """
         exchange = str(exchange)
-        with self.lock:
+        with self.state_lock:
             slot = self._flow_bars.setdefault(exchange, {"current": None, "closed": deque(maxlen=240)})
             if closed:
                 slot["closed"].append(candle)
@@ -212,7 +216,7 @@ class TradeStore:
         Index: close_time (UTC). Columns: open, high, low, close, volume,
         trades, taker_buy_volume. Closed candles only by default.
         """
-        with self.lock:
+        with self.state_lock:
             slot = self._flow_bars.get(exchange) or {"current": None, "closed": deque()}
             candles = list(slot["closed"])
             if include_current and slot["current"] is not None:
@@ -273,7 +277,9 @@ async def _binance(store):
             "btcusdt@aggTrade/btcusdt@kline_1m"
         )
         mode = "spot"
-    buffer = _BufferedAppender(store, flush_every=40, flush_seconds=1.0)
+    # Preserve at-most-one-second latency while reducing SQLite transaction
+    # churn during high-volume bursts.
+    buffer = _BufferedAppender(store, flush_every=200, flush_seconds=1.0)
     base_delay = max(5, int(os.getenv("BINANCE_WS_RECONNECT_SECONDS", "15")))
     max_delay = max(base_delay, int(os.getenv("BINANCE_WS_RECONNECT_MAX_SECONDS", "120")))
     delay = base_delay
@@ -377,7 +383,7 @@ async def _bybit(store):
         else "wss://stream.bybit.com/v5/public/linear"
     )
     mode = market_type if market_type in ("spot", "linear") else "spot"
-    buffer = _BufferedAppender(store, flush_every=40, flush_seconds=1.0)
+    buffer = _BufferedAppender(store, flush_every=200, flush_seconds=1.0)
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:

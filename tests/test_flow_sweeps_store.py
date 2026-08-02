@@ -70,6 +70,23 @@ def test_trade_store_deduplicates_and_persists(tmp_path):
     assert reopened.collector_status()["binance"]=={"connected":True,"mode":"spot_market_data"}
 
 
+def test_trade_store_reads_do_not_wait_for_python_write_lock(tmp_path):
+    store = TradeStore(tmp_path / "concurrent.sqlite3")
+    now = pd.Timestamp("2025-01-01", tz="UTC")
+    store.append_rows([
+        {"time": now, "price": 100.0, "qty": 1.0, "side": "buy", "exchange": "bybit"}
+    ])
+
+    # A collector preparing another write must not block a WAL reader at the
+    # Python layer. This guards the starvation that stopped booted polls.
+    store.db_write_lock.acquire()
+    try:
+        out = store.query(now - pd.Timedelta(seconds=1), now + pd.Timedelta(seconds=1))
+    finally:
+        store.db_write_lock.release()
+    assert len(out) == 1
+
+
 def test_trade_store_enforces_max_rows(tmp_path):
     path=tmp_path/"cap.sqlite3"; store=TradeStore(path, max_rows=5); now=pd.Timestamp("2025-01-01",tz="UTC")
     rows=[{"time":now+pd.Timedelta(seconds=i),"price":100+i,"qty":1,"side":"buy","exchange":"binance","trade_id":str(i)} for i in range(12)]

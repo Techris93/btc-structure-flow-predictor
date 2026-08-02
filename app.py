@@ -74,6 +74,8 @@ live_loop_last_completed_monotonic = None
 live_loop_watchdog_alerted = False
 live_loop_watchdog_thread = None
 live_loop_started_monotonic = None
+live_loop_phase = "not_started"
+live_loop_phase_at = None
 
 subscription_store = JsonStore(data_dir / "push_subscriptions.json")
 push_delivery_store = JsonStore(data_dir / "push_delivery.json")
@@ -1066,11 +1068,20 @@ def _live_loop_diagnostics():
         "last_completed_at": live_loop_last_completed_at,
         "last_error_at": live_loop_last_error_at,
         "last_error": live_loop_last_error,
+        "phase": live_loop_phase,
+        "phase_at": live_loop_phase_at,
         "last_completed_age_seconds": completed_age,
         "stale": stale,
         "stale_after_seconds": int(threshold),
         "watchdog_alerted": bool(live_loop_watchdog_alerted),
     }
+
+
+def _set_live_loop_phase(phase):
+    """Publish the active poll phase without disk or shared-lock access."""
+    global live_loop_phase, live_loop_phase_at
+    live_loop_phase = str(phase)
+    live_loop_phase_at = pd.Timestamp.now(tz="UTC").isoformat()
 
 
 def _live_loop_watchdog():
@@ -1113,7 +1124,9 @@ def _live_loop():
             live_loop_last_attempt_at = poll_started.isoformat()
             live_loop_last_attempt_monotonic = time.monotonic()
             with live_lock: live_state.update({"status":"polling","updated_at":poll_started.isoformat()})
+            _set_live_loop_phase("fetching_bybit")
             ohlc, recent, frames = _bybit_data(); sources = "bybit"; trade_store.append(recent)
+            _set_live_loop_phase("checking_binance")
             binance_latest = trade_store.exchange_latest("binance")
             binance_lag = None
             if binance_latest is not None:
@@ -1167,6 +1180,7 @@ def _live_loop():
                     binance_rest_last_error = f"{type(exc).__name__}: {str(exc)[:160]} (cooldown {cooldown_min}m)"
                     logger.warning("Binance REST trades unavailable (cooldown %sm): %s", cooldown_min, exc)
             now=ohlc.index[-1]
+            _set_live_loop_phase("querying_trades")
             trades=trade_store.query(
                 now-pd.Timedelta(minutes=TRADE_LOOKBACK_MINUTES),
                 now,
@@ -1199,7 +1213,9 @@ def _live_loop():
                     flow_source = None
             else:
                 flow_source = None
+            _set_live_loop_phase("predicting")
             result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
+            _set_live_loop_phase("updating_paper")
             paper_status = paper_ledger.update(result, ohlc)
             notification_now = pd.Timestamp.now(tz="UTC")
             lifecycle_before = signal_lifecycle_store.read(
@@ -1218,6 +1234,7 @@ def _live_loop():
                 _cancel_signal_events(
                     active_before.get("signal_id"), "paper_exit"
                 )
+            _set_live_loop_phase("notifications")
             lifecycle_state, lifecycle_events = signal_lifecycle.evaluate(
                 lifecycle_before, result, paper_status, notification_now
             )
@@ -1227,6 +1244,7 @@ def _live_loop():
             # alerts resume next poll and retain their durable queue position.
             if not definitive_exit:
                 _dispatch_signal_event(notification_now)
+            _set_live_loop_phase("pruning")
             trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
             now = notification_now
             try:
@@ -1257,11 +1275,13 @@ def _live_loop():
             live_loop_last_completed_monotonic = time.monotonic()
             live_loop_last_error_at = None
             live_loop_last_error = None
+            _set_live_loop_phase("sleeping")
         except Exception as exc:
             logger.exception("Live market poll failed")
             error_at = pd.Timestamp.now(tz="UTC")
             live_loop_last_error_at = error_at.isoformat()
             live_loop_last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            _set_live_loop_phase("failed")
             with live_lock: live_state.update({"status":"degraded","error":str(exc),"updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
         finally:
             # Release transient pandas/NumPy object graphs before the next
@@ -1279,6 +1299,7 @@ def start_live_loop():
     global live_loop_last_attempt_at, live_loop_last_completed_at
     global live_loop_last_error_at, live_loop_last_error
     global live_loop_last_attempt_monotonic, live_loop_last_completed_monotonic
+    global live_loop_phase, live_loop_phase_at
     with live_start_lock:
         if live_thread_started and live_thread is not None and live_thread.is_alive(): return True
         lock_handle = None
@@ -1300,6 +1321,8 @@ def start_live_loop():
             live_loop_last_attempt_monotonic = None
             live_loop_last_completed_monotonic = None
             live_loop_watchdog_alerted = False
+            live_loop_phase = "starting_collectors"
+            live_loop_phase_at = pd.Timestamp.now(tz="UTC").isoformat()
             collector_thread = start_collectors(trade_store)
             live_thread = threading.Thread(target=_live_loop, name="live-predictor", daemon=True)
             live_thread.start()
@@ -1555,6 +1578,8 @@ def api_live():
     return jsonify({
         "paper_only": True,
         **state,
+        "live_loop": _live_loop_diagnostics(),
+        "process_rss_mb": _process_rss_mb(),
         "push": {
             "supported": webpush is not None,
             "single_installation": PUSH_SINGLE_INSTALLATION,
