@@ -336,7 +336,7 @@ async def _binance(store):
         # - kline_1m: 1m OHLCV + taker-buy volume, for footprint baselines (no REST needed)
         # - markPrice@1s: heartbeat so liveness never depends on trade frequency
         url = (
-            "wss://fstream.binance.com/stream?streams="
+            "wss://fstream.binance.com/market/stream?streams="
             "btcusdt@aggTrade/btcusdt@kline_1m/btcusdt@markPrice@1s"
         )
         mode = "linear"
