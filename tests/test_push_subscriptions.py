@@ -153,10 +153,12 @@ def test_http_get_maps_quotaguard_to_requests_proxy(monkeypatch):
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("QUOTAGUARDSTATIC_URL", "http://user:secret@proxy.example:9293")
-    monkeypatch.setenv("BINANCE_PROXY_REQUIRED", "1")
     captured = {}
 
     class Response:
+        status_code = 200
+        headers = {"X-MBX-USED-WEIGHT-1M": "22"}
+
         def raise_for_status(self):
             return None
 
@@ -173,7 +175,7 @@ def test_http_get_maps_quotaguard_to_requests_proxy(monkeypatch):
     }
     assert web_app._proxy_diagnostics() == {
         "configured": True,
-        "required": True,
+        "required": False,
         "status": "configured",
         "variable": "QUOTAGUARDSTATIC_URL",
         "provider": "quotaguard",
@@ -181,18 +183,55 @@ def test_http_get_maps_quotaguard_to_requests_proxy(monkeypatch):
     }
 
 
-def test_binance_proxy_is_a_hard_requirement_when_unconfigured(monkeypatch):
+def test_binance_proxy_is_optional_when_unconfigured(monkeypatch):
     for key in ("BINANCE_WS_PROXY_URL", "QUOTAGUARDSTATIC_URL", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("MARKET_TYPE", "linear")
-    monkeypatch.setenv("BINANCE_PROXY_REQUIRED", "1")
+    monkeypatch.setenv("BINANCE_PROXY_REQUIRED", "0")
+    captured = {}
 
-    assert web_app._proxy_diagnostics()["status"] == "missing_required"
-    with pytest.raises(RuntimeError, match="binance_proxy_required_but_not_configured"):
-        web_app._http_get("https://fapi.binance.com/fapi/v1/time")
+    class Response:
+        status_code = 200
+        headers = {"X-MBX-USED-WEIGHT-1M": "1"}
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+
+    assert web_app._proxy_diagnostics()["status"] == "direct"
+    web_app._http_get("https://fapi.binance.com/fapi/v1/time")
+    assert captured["proxies"] is None
 
 
-def test_linear_proxy_requirement_defaults_to_render_only(monkeypatch):
+def test_binance_proxy_does_not_route_bybit_rest(monkeypatch):
+    monkeypatch.setenv(
+        "BINANCE_WS_PROXY_URL", "http://user:secret@proxy.example:9293"
+    )
+    monkeypatch.delenv("BYBIT_REST_PROXY_URL", raising=False)
+    captured = {}
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+    web_app._http_get("https://api.bybit.com/v5/market/time")
+    assert captured["proxies"] is None
+
+
+def test_linear_proxy_requirement_remains_disabled_on_render(monkeypatch):
     for key in (
         "BINANCE_WS_PROXY_URL",
         "QUOTAGUARDSTATIC_URL",
@@ -209,8 +248,8 @@ def test_linear_proxy_requirement_defaults_to_render_only(monkeypatch):
     assert web_app._binance_proxy_required() is False
 
     monkeypatch.setenv("RENDER_SERVICE_ID", "srv-test")
-    assert web_app._binance_proxy_required() is True
-    assert web_app._proxy_diagnostics()["status"] == "missing_required"
+    assert web_app._binance_proxy_required() is False
+    assert web_app._proxy_diagnostics()["status"] == "direct"
 
 
 def test_push_dispatch_diagnostics_distinguish_idle_from_pending(monkeypatch, tmp_path):

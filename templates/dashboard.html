@@ -492,6 +492,8 @@
               <div class="row"><span>Market feed</span><span id="feed">—</span></div>
               <div class="row"><span>Binance feed</span><span id="binancefeed">—</span></div>
               <div class="row"><span>Binance WebSocket</span><span id="binancews">—</span></div>
+              <div class="row"><span>Binance REST</span><span id="binancerest">—</span></div>
+              <div class="row"><span>Binance cached data</span><span id="binancecache">—</span></div>
               <div class="row"><span>Bybit REST</span><span id="bybitrest">—</span></div>
               <div class="row"><span>Proxy route</span><span id="proxyroute">—</span></div>
               <div class="row"><span>Last push</span><span id="lastpush">—</span></div>
@@ -815,8 +817,19 @@
         setText("feed", feed);
         setText("binancefeed", humanize(s.binance_feed_mode));
         const binanceWs = dataHealth.binance_websocket || {};
+        const binanceRest = dataHealth.binance_rest_backfill || {};
+        const binanceCache = dataHealth.binance_cached_data || {};
         const bybitRest = dataHealth.bybit_rest_market || {};
         setText("binancews", humanize(binanceWs.status));
+        setText("binancerest", humanize(binanceRest.status));
+        setText(
+          "binancecache",
+          humanize(binanceCache.status) +
+            (binanceCache.lag_seconds == null
+              ? ""
+              : " · " + fmtNumber(binanceCache.lag_seconds, 0) + "s"),
+          "mono",
+        );
         setText("bybitrest", fmtDate(bybitRest.last_successful_fetch_at), "mono tone-muted");
         const proxy = s.proxy || {};
         setText(

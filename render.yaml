@@ -59,34 +59,41 @@ services:
         value: "200"
       - key: MARKET_TYPE
         value: "linear"
-      # Render's direct Binance futures WebSocket can connect without frames;
-      # require an explicit working proxy instead of silently using direct.
+      # Direct Binance futures is primary. A configured proxy remains optional.
       - key: BINANCE_PROXY_REQUIRED
-        value: "1"
+        value: "0"
       - key: BINANCE_WS_HEARTBEAT_TIMEOUT_SECONDS
         value: "35"
+      - key: BINANCE_WS_RECONNECT_BASE_SECONDS
+        value: "5"
+      - key: BINANCE_WS_RECONNECT_MAX_SECONDS
+        value: "120"
+      - key: BINANCE_WS_RECONNECT_JITTER_MIN
+        value: "0.80"
+      - key: BINANCE_WS_RECONNECT_JITTER_MAX
+        value: "1.20"
       - key: BINANCE_WS_STALE_ALERT_SECONDS
         value: "150"
       - key: PUSH_LAG_ALERT_SECONDS
         value: "300"
       - key: BINANCE_REST_ENABLED
-        value: "0"
-      - key: BINANCE_REST_ON_STALE
         value: "1"
-      - key: BINANCE_STALE_REST_MINUTES
+      - key: BINANCE_REST_STARTUP_BACKFILL
         value: "1"
+      - key: BINANCE_REST_GAP_RECOVERY
+        value: "1"
+      - key: BINANCE_REST_GAP_SECONDS
+        value: "45"
+      - key: BINANCE_REST_ERROR_RETRY_SECONDS
+        value: "60"
+      - key: BINANCE_REST_WEIGHT_CAP
+        value: "1200"
       - key: COLLECTOR_STALE_SECONDS
         value: "150"
-      - key: BINANCE_REST_MINUTES
-        value: "15"
       - key: BINANCE_TRADE_LIMIT
         value: "100"
       - key: BINANCE_FLOW_LIMIT
         value: "60"
-      - key: BINANCE_WS_RECONNECT_SECONDS
-        value: "15"
-      - key: BINANCE_WS_RECONNECT_MAX_SECONDS
-        value: "120"
       - key: BYBIT_WS_RECONNECT_SECONDS
         value: "5"
       - key: MAX_SWING_EQUAL_ZONES

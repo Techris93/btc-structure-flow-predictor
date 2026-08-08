@@ -27,6 +27,13 @@ except ImportError:
     webpush = None
 
 from btc_predictor.persistence import JsonStore, runtime_dir
+from btc_predictor.binance_backfill import BinanceBackfillController
+from btc_predictor.binance_rest import (
+    BinanceRateLimited,
+    BinanceRestConfig,
+    BinanceRestDeferred,
+    BinanceRestLimiter,
+)
 from btc_predictor.strategy import Predictor
 from btc_predictor.trade_store import TradeStore, start_collectors
 from btc_predictor.paper_position import PaperLedger
@@ -156,18 +163,21 @@ signal_lifecycle = SignalLifecycle(
 MARKET_TYPE = os.getenv("MARKET_TYPE", "linear").lower()
 if MARKET_TYPE not in ("spot", "linear"):
     MARKET_TYPE = "linear"
-BINANCE_REST_ENABLED = os.getenv("BINANCE_REST_ENABLED", "0" if MARKET_TYPE == "linear" else "1").lower() in ("1", "true", "yes", "on")
-BINANCE_REST_MINUTES = max(5, int(os.getenv("BINANCE_REST_MINUTES", "15")))
+BINANCE_REST_ENABLED = os.getenv("BINANCE_REST_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+BINANCE_REST_STARTUP_BACKFILL = os.getenv("BINANCE_REST_STARTUP_BACKFILL", "1").lower() in ("1", "true", "yes", "on")
+BINANCE_REST_GAP_RECOVERY = os.getenv("BINANCE_REST_GAP_RECOVERY", os.getenv("BINANCE_REST_ON_STALE", "1")).lower() in ("1", "true", "yes", "on")
+BINANCE_REST_GAP_SECONDS = max(35, int(os.getenv("BINANCE_REST_GAP_SECONDS", "45")))
+BINANCE_REST_ERROR_RETRY_SECONDS = max(5, int(os.getenv("BINANCE_REST_ERROR_RETRY_SECONDS", "60")))
 BINANCE_TRADE_LIMIT = max(50, min(200, int(os.getenv("BINANCE_TRADE_LIMIT", "100"))))
 BINANCE_FLOW_LIMIT = max(30, min(180, int(os.getenv("BINANCE_FLOW_LIMIT", "60"))))
 BINANCE_USER_AGENT = os.getenv("BINANCE_USER_AGENT", "btc-structure-flow-predictor/0.1 (+local-research)")
+BINANCE_REST_WEIGHT_CAP = max(100.0, min(1800.0, float(os.getenv("BINANCE_REST_WEIGHT_CAP", "1200"))))
+BINANCE_REST_429_DEFAULT_COOLDOWN_SECONDS = max(1.0, float(os.getenv("BINANCE_REST_429_DEFAULT_COOLDOWN_SECONDS", "60")))
+BINANCE_REST_418_DEFAULT_COOLDOWN_SECONDS = max(60.0, float(os.getenv("BINANCE_REST_418_DEFAULT_COOLDOWN_SECONDS", "600")))
+BINANCE_AGG_TRADES_WEIGHT = max(1.0, float(os.getenv("BINANCE_AGG_TRADES_WEIGHT", "20")))
+BINANCE_KLINES_WEIGHT = max(1.0, float(os.getenv("BINANCE_KLINES_WEIGHT", "2")))
 COLLECTOR_STALE_SECONDS = max(30, int(os.getenv("COLLECTOR_STALE_SECONDS", "90")))
-# Rare REST backfill only when the WebSocket trade stream is stale. Still off by default
-# for normal operation; set BINANCE_REST_ON_STALE=1 to enable emergency recovery.
-# With WS silently dropped on some hosts, a ~1 min cadence keeps the feed fresh
-# at roughly 22 weight/min, ~1% of the 2,400 weight/min fapi budget.
-BINANCE_REST_ON_STALE = os.getenv("BINANCE_REST_ON_STALE", "1").lower() in ("1", "true", "yes", "on")
-BINANCE_STALE_REST_MINUTES = max(1, int(os.getenv("BINANCE_STALE_REST_MINUTES", "3")))
+BINANCE_REST_ON_STALE = BINANCE_REST_GAP_RECOVERY
 LIVE_WATCHDOG_MISSED_POLLS = max(2, int(os.getenv("LIVE_WATCHDOG_MISSED_POLLS", "3")))
 LIVE_WATCHDOG_CHECK_SECONDS = max(5, int(os.getenv("LIVE_WATCHDOG_CHECK_SECONDS", "15")))
 LIVE_SUMMARY_LOG_SECONDS = max(60, int(os.getenv("LIVE_SUMMARY_LOG_SECONDS", "300")))
@@ -176,6 +186,15 @@ BINANCE_WS_STALE_ALERT_SECONDS = max(
     int(os.getenv("BINANCE_WS_STALE_ALERT_SECONDS", str(COLLECTOR_STALE_SECONDS))),
 )
 PUSH_LAG_ALERT_SECONDS = max(60, int(os.getenv("PUSH_LAG_ALERT_SECONDS", "300")))
+
+binance_rest_limiter = BinanceRestLimiter(
+    BinanceRestConfig(
+        capacity_weight=BINANCE_REST_WEIGHT_CAP,
+        window_seconds=60.0,
+        default_429_cooldown_seconds=BINANCE_REST_429_DEFAULT_COOLDOWN_SECONDS,
+        default_418_cooldown_seconds=BINANCE_REST_418_DEFAULT_COOLDOWN_SECONDS,
+    )
+)
 
 
 def _configured_proxy_url():
@@ -199,21 +218,11 @@ def _configured_proxy_url():
 
 def _proxy_diagnostics():
     key, value = _configured_proxy_url()
-    market_type = os.getenv("MARKET_TYPE", "linear").lower()
-    render_runtime = any(
-        os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
-        or os.getenv(name, "").strip()
-        for name in ("RENDER", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID")
-    )
-    required = os.getenv(
-        "BINANCE_PROXY_REQUIRED",
-        "1" if market_type == "linear" and render_runtime else "0",
-    ).lower() in ("1", "true", "yes", "on")
     if not value:
         return {
             "configured": False,
-            "required": required,
-            "status": "missing_required" if required else "not_configured",
+            "required": False,
+            "status": "direct",
             "variable": None,
             "provider": None,
             "host": None,
@@ -228,7 +237,7 @@ def _proxy_diagnostics():
     )
     return {
         "configured": True,
-        "required": required,
+        "required": False,
         "status": "configured",
         "variable": key,
         "provider": provider,
@@ -237,33 +246,46 @@ def _proxy_diagnostics():
 
 
 def _binance_proxy_required():
-    market_type = os.getenv("MARKET_TYPE", "linear").lower()
-    render_runtime = any(
-        os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
-        or os.getenv(name, "").strip()
-        for name in ("RENDER", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID")
-    )
-    default = "1" if market_type == "linear" and render_runtime else "0"
-    return os.getenv("BINANCE_PROXY_REQUIRED", default).lower() in (
-        "1", "true", "yes", "on"
-    )
+    """Compatibility diagnostic; proxy routing is always optional."""
+    return False
 
 
-def _http_get(url, params=None, timeout=10):
+def _http_get(url, params=None, timeout=10, binance_weight=1.0):
     headers = {"User-Agent": BINANCE_USER_AGENT, "Accept": "application/json"}
-    _, proxy_url = _configured_proxy_url()
     hostname = (urlparse(url).hostname or "").lower()
-    if hostname in {"fapi.binance.com", "fstream.binance.com"} and _binance_proxy_required() and not proxy_url:
-        raise RuntimeError("binance_proxy_required_but_not_configured")
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    response = requests.get(
-        url,
-        params=params or {},
-        headers=headers,
-        timeout=timeout,
-        proxies=proxies,
+    is_binance = hostname == "fapi.binance.com"
+    _, binance_proxy_url = _configured_proxy_url()
+    proxy_url = (
+        binance_proxy_url
+        if is_binance
+        else os.getenv("BYBIT_REST_PROXY_URL", "").strip() or None
     )
-    response.raise_for_status()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    if is_binance:
+        binance_rest_limiter.acquire(binance_weight)
+    try:
+        response = requests.get(
+            url,
+            params=params or {},
+            headers=headers,
+            timeout=timeout,
+            proxies=proxies,
+        )
+    except Exception as exc:
+        if is_binance:
+            binance_rest_limiter.observe_error(exc)
+        raise
+    if is_binance:
+        binance_rest_limiter.observe_response(
+            getattr(response, "status_code", 200),
+            getattr(response, "headers", {}) or {},
+        )
+    try:
+        response.raise_for_status()
+    except Exception as exc:
+        if is_binance:
+            binance_rest_limiter.observe_error(exc)
+        raise
     return response
 
 
@@ -293,7 +315,7 @@ def _binance_trades():
     else:
         url = "https://data-api.binance.vision/api/v3/aggTrades"
         mode = "spot"
-    response = _http_get(url, params={"symbol":"BTCUSDT","limit":BINANCE_TRADE_LIMIT}, timeout=10)
+    response = _http_get(url, params={"symbol":"BTCUSDT","limit":BINANCE_TRADE_LIMIT}, timeout=10, binance_weight=BINANCE_AGG_TRADES_WEIGHT)
     raw = response.json()
     return pd.DataFrame({
         "time":pd.to_datetime([x["T"] for x in raw],unit="ms",utc=True),
@@ -311,7 +333,7 @@ def _binance_flow_bars(limit=None):
         url = "https://fapi.binance.com/fapi/v1/klines"
     else:
         url = "https://data-api.binance.vision/api/v3/klines"
-    response = _http_get(url, params={"symbol":"BTCUSDT","interval":"1m","limit":limit}, timeout=10)
+    response = _http_get(url, params={"symbol":"BTCUSDT","interval":"1m","limit":limit}, timeout=10, binance_weight=BINANCE_KLINES_WEIGHT)
     raw = pd.DataFrame(response.json())
     frame = pd.DataFrame({
         "close_time":pd.to_datetime(pd.to_numeric(raw[6]),unit="ms",utc=True),
@@ -1317,7 +1339,11 @@ def _live_loop():
     global live_loop_last_completed_at, live_loop_last_error_at, live_loop_last_error
     global live_loop_last_attempt_monotonic, live_loop_last_completed_monotonic
     global live_loop_started_monotonic
-    binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
+    backfill_controller = BinanceBackfillController(
+        startup_enabled=BINANCE_REST_ENABLED and BINANCE_REST_STARTUP_BACKFILL,
+        gap_recovery_enabled=BINANCE_REST_ENABLED and BINANCE_REST_GAP_RECOVERY,
+        gap_seconds=BINANCE_REST_GAP_SECONDS,
+    )
     flow_bars_cache = None
     persisted_state = live_state_store.read({})
     def persisted_timestamp(key):
@@ -1328,6 +1354,7 @@ def _live_loop():
             return None
     binance_rest_last_ok_at = persisted_timestamp("binance_rest_last_ok_at")
     binance_rest_last_error = persisted_state.get("binance_rest_last_error")
+    binance_rest_last_reason = persisted_state.get("binance_rest_last_reason")
     binance_flow_last_ok_at = persisted_timestamp("binance_flow_last_ok_at")
     binance_flow_last_error = persisted_state.get("binance_flow_last_error")
     bybit_rest_last_ok_at = persisted_timestamp("bybit_rest_last_ok_at")
@@ -1356,72 +1383,77 @@ def _live_loop():
                     binance_latest = binance_latest.tz_localize("UTC")
                 binance_lag = float((poll_started - binance_latest).total_seconds())
             collectors = trade_store.collector_status(poll_started, COLLECTOR_STALE_SECONDS)
-            binance_ws_last = (collectors.get("binance", {}) or {}).get("last_message_at")
+            binance_collector = collectors.get("binance", {}) or {}
+            binance_ws_last = binance_collector.get("last_message_at")
             binance_ws_fresh = False
             if binance_ws_last:
                 binance_ws_ts = pd.Timestamp(binance_ws_last)
                 if binance_ws_ts.tzinfo is None:
                     binance_ws_ts = binance_ws_ts.tz_localize("UTC")
-                binance_ws_fresh = (poll_started - binance_ws_ts).total_seconds() <= COLLECTOR_STALE_SECONDS
-            binance_stale = binance_lag is None or binance_lag > COLLECTOR_STALE_SECONDS
+                binance_ws_fresh = bool(binance_collector.get("connected")) and (
+                    (poll_started - binance_ws_ts).total_seconds()
+                    <= COLLECTOR_STALE_SECONDS
+                )
             proxy_diagnostics = _proxy_diagnostics()
-            proxy_blocked = bool(proxy_diagnostics.get("required") and not proxy_diagnostics.get("configured"))
-            if proxy_blocked:
-                # Keep historical success timestamps for auditability, but do
-                # not let them make a currently blocked pipeline look healthy.
-                binance_rest_last_error = "proxy_not_configured"
-                binance_flow_last_error = "proxy_not_configured"
-            # Prefer WebSocket collectors. REST is rare:
-            # - always-on only when BINANCE_REST_ENABLED=1
-            # - or emergency stale recovery when BINANCE_REST_ON_STALE=1 and WS is stale
-            # Backfill whenever Binance data is older than one poll interval while the
-            # WS stream is dead, so lag never reaches the stale threshold. Each cycle
-            # costs ~22 weight (aggTrades 20 + klines 2) ~= 32 weight/min, ~1.3% of the
-            # 2,400/min fapi budget.
-            poll_seconds = _live_poll_interval_seconds()
-            binance_backfill_due = binance_lag is None or binance_lag > poll_seconds
-            rest_due = poll_started >= binance_rest_retry_at
-            rest_allowed = (
-                not proxy_blocked
-                and (BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_backfill_due and not binance_ws_fresh))
+            rest_reason = (
+                backfill_controller.decide(poll_started, binance_ws_fresh)
+                if BINANCE_REST_ENABLED
+                else None
             )
             binance_data_path = (
-                "proxy_required"
-                if proxy_blocked
-                else "websocket"
+                "websocket"
                 if binance_ws_fresh
-                else "rest_backfill"
-                if BINANCE_REST_ON_STALE
+                else "cached"
+                if binance_lag is not None and binance_lag <= COLLECTOR_STALE_SECONDS
                 else "stale"
             )
-            if rest_allowed and rest_due:
+            if rest_reason:
                 try:
-                    inserted = trade_store.append(_binance_trades())
+                    backfill_trades = _binance_trades()
+                    backfill_flow = _binance_flow_bars()
+                    inserted = trade_store.append(backfill_trades)
+                    flow_bars_cache = backfill_flow
                     binance_rest_last_ok_at = poll_started
                     binance_rest_last_error = None
-                    # Success path: the always-on cadence applies only to explicit
-                    # BINANCE_REST_ENABLED. Stale recovery runs every poll while data
-                    # is old (~32 weight/min); error cooldowns below are the guard.
-                    cooldown_min = BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else 0
-                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
-                    if inserted:
-                        logger.info("Binance REST backfill inserted %s trades (stale=%s)", inserted, binance_stale)
-                    # Also refresh the flow baseline while we are paying REST weight anyway
-                    # (klines cost weight ~2 for limit<=500; still a tiny share of 2400/min).
-                    try:
-                        flow_bars_cache = _binance_flow_bars()
-                        binance_flow_last_ok_at = poll_started
-                        binance_flow_last_error = None
-                    except Exception as exc:
-                        binance_flow_last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-                        logger.warning("Binance REST flow baseline unavailable: %s", exc)
+                    binance_rest_last_reason = rest_reason
+                    binance_flow_last_ok_at = poll_started
+                    binance_flow_last_error = None
+                    backfill_controller.mark_success(
+                        rest_reason, poll_started, binance_ws_fresh
+                    )
+                    binance_data_path = f"rest_{rest_reason}"
+                    logger.info(
+                        "Binance REST %s backfill completed inserted=%s ws_fresh=%s",
+                        rest_reason,
+                        inserted,
+                        binance_ws_fresh,
+                    )
+                except (BinanceRateLimited, BinanceRestDeferred) as exc:
+                    backfill_controller.mark_failure(
+                        rest_reason,
+                        poll_started,
+                        exc.retry_after_seconds,
+                    )
+                    binance_rest_last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                    logger.warning(
+                        "Binance REST %s deferred for %.3fs: %s",
+                        rest_reason,
+                        exc.retry_after_seconds,
+                        exc,
+                    )
                 except Exception as exc:
-                    base_min = BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else BINANCE_STALE_REST_MINUTES
-                    # Hard back off on explicit rate-limit/ban signals; short retry otherwise.
-                    cooldown_min = 30 if ("418" in str(exc) or "429" in str(exc)) else max(base_min * 4, 5)
-                    binance_rest_retry_at = poll_started + pd.Timedelta(minutes=cooldown_min)
-                    binance_rest_last_error = f"{type(exc).__name__}: {str(exc)[:160]} (cooldown {cooldown_min}m)"
-                    logger.warning("Binance REST trades unavailable (cooldown %sm): %s", cooldown_min, exc)
+                    backfill_controller.mark_failure(
+                        rest_reason,
+                        poll_started,
+                        BINANCE_REST_ERROR_RETRY_SECONDS,
+                    )
+                    binance_rest_last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                    logger.warning(
+                        "Binance REST %s failed; retrying after %ss: %s",
+                        rest_reason,
+                        BINANCE_REST_ERROR_RETRY_SECONDS,
+                        exc,
+                    )
             now=ohlc.index[-1]
             _set_live_loop_phase("querying_trades")
             trades=trade_store.query(
@@ -1521,18 +1553,23 @@ def _live_loop():
                 _retry_unacknowledged_pushes(now)
             except Exception as exc:
                 logger.warning("Web Push acknowledgement retry failed: %s", exc)
-            bybit_pipeline_ok = not (collectors.get("bybit") or {}).get("stale", True)
-            binance_pipeline_ok = (
-                binance_lag is not None
-                and binance_lag <= COLLECTOR_STALE_SECONDS
-                and flow_source is not None
-            )
+            bybit_pipeline_ok = bool((collectors.get("bybit") or {}).get("fresh"))
+            binance_pipeline_ok = binance_ws_fresh and flow_source is not None
             stale_exchanges = []
             if not bybit_pipeline_ok:
                 stale_exchanges.append("bybit")
             if not binance_pipeline_ok:
                 stale_exchanges.append("binance")
             feed_status = "degraded" if stale_exchanges else "live"
+            limiter_status = binance_rest_limiter.snapshot()
+            backfill_status = backfill_controller.snapshot(notification_now)
+            cached_status = (
+                "fresh"
+                if binance_lag is not None and binance_lag <= COLLECTOR_STALE_SECONDS
+                else "stale"
+                if binance_lag is not None
+                else "empty"
+            )
             data_health = {
                 "bybit_rest_market": {
                     "status": "ok" if bybit_rest_last_ok_at else "never_succeeded",
@@ -1545,38 +1582,43 @@ def _live_loop():
                     "last_error": (collectors.get("bybit") or {}).get("error"),
                 },
                 "binance_websocket": {
-                    "status": (
-                        "ok"
-                        if binance_ws_fresh
-                        else "proxy_not_configured"
-                        if (collectors.get("binance") or {}).get("error") == "proxy_not_configured"
-                        else "stale_or_silent"
-                    ),
+                    "status": "ok" if binance_ws_fresh else "stale_or_silent",
                     "last_successful_fetch_at": binance_ws_last,
                     "last_kline_at": (collectors.get("binance") or {}).get("latest_kline_at"),
                     "last_error": (collectors.get("binance") or {}).get("error"),
-                    "proxy_required": (collectors.get("binance") or {}).get("proxy_required", proxy_diagnostics.get("required")),
+                    "transport": (collectors.get("binance") or {}).get("transport", "direct"),
+                    "proxy_required": False,
                     "proxy_configured": (collectors.get("binance") or {}).get("proxy_configured", proxy_diagnostics.get("configured")),
+                    "reconnect_attempt": (collectors.get("binance") or {}).get("reconnect_attempt"),
+                    "reconnect_in_seconds": (collectors.get("binance") or {}).get("reconnect_in_seconds"),
                 },
                 "binance_rest_backfill": {
                     "status": (
-                        "proxy_not_configured"
-                        if proxy_blocked
-                        else "ok"
-                        if binance_rest_last_ok_at and not binance_rest_last_error
+                        "cooldown"
+                        if limiter_status["cooldown"]
                         else "error"
                         if binance_rest_last_error
+                        else "idle"
+                        if binance_rest_last_ok_at and not binance_rest_last_error
                         else "not_used"
                     ),
                     "last_successful_fetch_at": binance_rest_last_ok_at.isoformat() if binance_rest_last_ok_at else None,
                     "last_error": binance_rest_last_error,
+                    "last_reason": binance_rest_last_reason,
+                    "controller": backfill_status,
+                    "rate_limit": limiter_status,
+                },
+                "binance_cached_data": {
+                    "status": cached_status,
+                    "latest_trade_at": binance_latest.isoformat() if binance_latest is not None else None,
+                    "lag_seconds": round(binance_lag, 1) if binance_lag is not None else None,
                 },
                 "binance_flow_baseline": {
-                    "status": "proxy_not_configured" if proxy_blocked else "ok" if flow_source else "unavailable",
+                    "status": "ok" if flow_source else "unavailable",
                     "source": flow_source,
                     "last_successful_fetch_at": flow_baseline_last_ok_at.isoformat() if flow_baseline_last_ok_at else None,
                     "last_rest_fetch_at": binance_flow_last_ok_at.isoformat() if binance_flow_last_ok_at else None,
-                    "last_error": "proxy_not_configured" if proxy_blocked else binance_flow_last_error,
+                    "last_error": binance_flow_last_error,
                 },
                 "orderflow_input": {
                     "status": "ok" if flow_source or raw_flow_feature_bars >= 20 else "warmup",
@@ -1598,6 +1640,7 @@ def _live_loop():
                 "binance_data_path": binance_data_path,
                 "binance_rest_last_ok_at": binance_rest_last_ok_at.isoformat() if binance_rest_last_ok_at else None,
                 "binance_rest_last_error": binance_rest_last_error,
+                "binance_rest_last_reason": binance_rest_last_reason,
                 "binance_flow_last_ok_at": binance_flow_last_ok_at.isoformat() if binance_flow_last_ok_at else None,
                 "binance_flow_last_error": binance_flow_last_error,
                 "bybit_rest_last_ok_at": bybit_rest_last_ok_at.isoformat() if bybit_rest_last_ok_at else None,
