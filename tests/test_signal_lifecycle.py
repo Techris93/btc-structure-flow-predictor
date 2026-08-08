@@ -388,6 +388,27 @@ def test_state_migration_preserves_event_sequence_to_avoid_dedupe_collision():
     assert state["stable_bias"] == "bearish"
 
 
+def test_legacy_open_position_is_adopted_without_notification_or_reentry():
+    engine = SignalLifecycle()
+    position = {
+        "side": "long",
+        "entry_time": "2026-07-28T12:00:00Z",
+        "entry": 65000.0,
+        "stop": 64750.0,
+        "target": 65500.0,
+        "size": .4,
+        "zone": "equal_lows:abc",
+        "sweep_time": "2026-07-28T11:58:00Z",
+    }
+
+    state, signal_id = engine.adopt_open_position(engine.initial_state(), position, OBSERVED)
+
+    assert signal_id is not None
+    assert state["active"]["signal_id"] == signal_id
+    assert state["active"]["adopted"] is True
+    assert state["active"]["snapshot"]["entry"] == 65000.0
+
+
 def test_signal_flip_emits_one_invalidation_event():
     engine = SignalLifecycle()
     state, _ = activate(engine)

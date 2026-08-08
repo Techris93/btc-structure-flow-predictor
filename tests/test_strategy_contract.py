@@ -392,6 +392,28 @@ def test_paper_ledger_lifecycle_neutral_exit_and_unrealized_pnl(tmp_path):
     assert ledger2._open is not None
 
 
+def test_legacy_position_signal_binding_is_persisted_without_close(tmp_path):
+    path = tmp_path / "ledger.json"
+    ledger = PaperLedger(path)
+    pred = PredictorOutput(
+        timestamp=pd.Timestamp("2026-07-25 10:00", tz="UTC"),
+        bias="bullish",
+        entry=65000.0,
+        stop=64750.0,
+        target=65500.0,
+        position_size=.4,
+        zone="zone1",
+    )
+    ledger.update(pred)
+    closed_before = len(ledger._closed)
+
+    assert ledger.bind_active_signal("adopted-signal") is True
+    assert ledger._open["signal_id"] == "adopted-signal"
+    assert len(ledger._closed) == closed_before
+    reloaded = PaperLedger(path)
+    assert reloaded._open["signal_id"] == "adopted-signal"
+
+
 def test_pending_retrace_order_cancels_only_after_lifecycle_neutralization(tmp_path):
     ledger = PaperLedger(tmp_path / "ledger.json", neutral_exit_observations=2)
     t0 = pd.Timestamp("2026-01-01 00:00", tz="UTC")

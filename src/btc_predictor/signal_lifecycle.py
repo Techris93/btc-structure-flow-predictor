@@ -165,6 +165,62 @@ class SignalLifecycle:
         retired.append(signal_id)
         state["retired_signal_ids"] = retired[-100:]
 
+    def adopt_open_position(self, persisted_state, position, observed_at):
+        """Bind a legacy persisted position to lifecycle state without churn."""
+        state = {**self.initial_state(), **(persisted_state or {})}
+        if state.get("version") != self.VERSION:
+            previous = state
+            state = self.initial_state()
+            state["event_sequence"] = int(previous.get("event_sequence") or 0)
+            state["stable_bias"] = previous.get("stable_bias")
+        if state.get("active") or not position:
+            return state, None
+        side = position.get("side")
+        bias = "bullish" if side == "long" else "bearish" if side == "short" else None
+        if bias is None:
+            return state, None
+        snapshot = {
+            "timestamp": _timestamp(position.get("decision_time") or position.get("entry_time")),
+            "bias": bias,
+            "setup_type": "reversal",
+            "zone": position.get("zone"),
+            "zone_kind": None,
+            "sweep_status": "confirmed",
+            "sweep_time": _timestamp(position.get("sweep_time")),
+            "reclaim_time": _timestamp(position.get("reclaim_time")),
+            "orderflow_confirmation": True,
+            "orderflow_reason": "legacy_position_adopted",
+            "entry": position.get("entry"),
+            "stop": position.get("stop"),
+            "target": position.get("target"),
+            "reward_risk": None,
+            "probability_tp_before_sl": position.get("probability_tp_before_sl"),
+            "position_size": position.get("size"),
+            "no_trade_reason": None,
+            "regime_4h": None,
+            "regime_1h": None,
+            "setup_15m": None,
+            "orderflow_score": None,
+            "setup_atr": position.get("setup_atr"),
+            "entry_type": "limit" if position.get("signal_time") else "market",
+        }
+        signal_id = position.get("signal_id") or self.signal_id(snapshot)
+        if signal_id is None:
+            encoded = json.dumps({"side": side, "zone": position.get("zone"), "entry_time": position.get("entry_time")}, sort_keys=True)
+            signal_id = hashlib.sha256(encoded.encode()).hexdigest()[:20]
+        now = pd.Timestamp(observed_at).isoformat()
+        state["active"] = {
+            "signal_id": signal_id,
+            "activated_at": position.get("confirmed_at") or position.get("entry_time") or now,
+            "last_seen_at": now,
+            "last_decision_at": snapshot.get("timestamp"),
+            "snapshot": snapshot,
+            "adopted": True,
+        }
+        state["stable_bias"] = state.get("stable_bias") or bias
+        state["updated_at"] = now
+        return state, signal_id
+
     @staticmethod
     def _classify_terminal(snapshot):
         sweep = str(snapshot.get("sweep_status") or "")

@@ -173,6 +173,20 @@ class PaperLedger:
         # lifecycle terminal event to resolve them instead of leaving limbo.
         return position.get("signal_id") in (None, signal_id)
 
+    def bind_active_signal(self, signal_id):
+        """Persist lifecycle identity onto a legacy open or pending order."""
+        if not signal_id:
+            return False
+        with self.lock:
+            position = self._open or self._pending
+            if position is None:
+                return False
+            if position.get("signal_id") not in (None, signal_id):
+                return False
+            position["signal_id"] = signal_id
+            self._save()
+            return True
+
     def _place_confirmed(self, event):
         snapshot = dict(event.get("snapshot") or {})
         required = (snapshot.get("entry"), snapshot.get("stop"), snapshot.get("target"), snapshot.get("position_size"))

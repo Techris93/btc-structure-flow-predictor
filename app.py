@@ -1297,6 +1297,16 @@ def _live_loop():
             lifecycle_before = signal_lifecycle_store.read(
                 SignalLifecycle.initial_state()
             )
+            legacy_position = (
+                market_paper_status.get("open_position")
+                or market_paper_status.get("pending_order")
+            )
+            lifecycle_before, adopted_signal_id = signal_lifecycle.adopt_open_position(
+                lifecycle_before, legacy_position, notification_now
+            )
+            if adopted_signal_id:
+                paper_ledger.bind_active_signal(adopted_signal_id)
+                logger.info("Adopted legacy paper position into lifecycle signal_id=%s", adopted_signal_id)
             active_before = lifecycle_before.get("active") or {}
             definitive_exit = any(
                 str(trade.get("exit_reason") or "").lower() in ("target", "stop")
