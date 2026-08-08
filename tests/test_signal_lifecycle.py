@@ -31,6 +31,8 @@ def prediction(**updates):
         regime_4h="bullish",
         regime_1h="bullish",
         setup_15m="bullish",
+        orderflow_score=0.8,
+        setup_atr=250.0,
     )
     return replace(base, **updates)
 
@@ -39,9 +41,8 @@ def activate(engine, setup=None):
     setup = setup or prediction()
     state, first = engine.evaluate(engine.initial_state(), setup, {}, OBSERVED)
     assert first == []
-    state, events = engine.evaluate(
-        state, setup, {}, OBSERVED + pd.Timedelta(seconds=45)
-    )
+    next_bar = replace(setup, timestamp=pd.Timestamp(setup.timestamp) + pd.Timedelta(minutes=1))
+    state, events = engine.evaluate(state, next_bar, {}, OBSERVED + pd.Timedelta(minutes=1, seconds=30))
     assert [event["event_type"] for event in events] == ["setup_confirmed"]
     return state, events[0]
 
@@ -68,7 +69,7 @@ def test_signal_identity_ignores_volatile_trade_levels_and_scores():
     )
 
 
-def test_candidate_requires_two_current_candle_observations_and_notifies_once():
+def test_candidate_counts_unique_closed_bars_and_notifies_once():
     engine = SignalLifecycle(confirm_observations=2)
     state, events = engine.evaluate(engine.initial_state(), prediction(), {}, OBSERVED)
     assert events == []
@@ -76,6 +77,15 @@ def test_candidate_requires_two_current_candle_observations_and_notifies_once():
 
     state, events = engine.evaluate(
         state, prediction(entry=65005.0), {}, OBSERVED + pd.Timedelta(seconds=20)
+    )
+    assert events == []
+    assert state["candidate"]["observations"] == 1
+
+    state, events = engine.evaluate(
+        state,
+        prediction(timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=1), entry=65005.0),
+        {},
+        OBSERVED + pd.Timedelta(minutes=1, seconds=20),
     )
     assert [event["event_type"] for event in events] == ["setup_confirmed"]
     signal_id = state["active"]["signal_id"]
@@ -87,17 +97,18 @@ def test_candidate_requires_two_current_candle_observations_and_notifies_once():
     assert state["active"]["signal_id"] == signal_id
 
 
-def test_completed_one_minute_candle_can_confirm_on_first_observation():
+def test_old_completed_candle_cannot_bypass_confirmation():
     engine = SignalLifecycle(confirm_observations=2)
     completed = prediction(timestamp=OBSERVED.floor("min") - pd.Timedelta(minutes=1))
 
     state, events = engine.evaluate(engine.initial_state(), completed, {}, OBSERVED)
 
-    assert state["active"] is not None
-    assert [event["event_type"] for event in events] == ["setup_confirmed"]
+    assert state["active"] is None
+    assert events == []
+    assert state["candidate"]["observations"] == 1
 
 
-def test_active_setup_uses_three_observation_invalidation_hysteresis():
+def test_same_bias_scanner_drift_does_not_invalidate_active_setup():
     engine = SignalLifecycle(invalidation_observations=3)
     state, _ = activate(engine)
     unconfirmed = prediction(
@@ -110,18 +121,97 @@ def test_active_setup_uses_three_observation_invalidation_hysteresis():
         no_trade_reason="orderflow_not_confirmed",
     )
 
-    for offset in (2, 3):
+    for offset in (2, 3, 4, 5):
         state, events = engine.evaluate(
-            state, unconfirmed, {}, OBSERVED + pd.Timedelta(minutes=offset)
+            state,
+            replace(unconfirmed, timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=offset)),
+            {},
+            OBSERVED + pd.Timedelta(minutes=offset, seconds=30),
         )
         assert events == []
         assert state["active"] is not None
+    assert state["missing_observations"] == 0
 
-    state, events = engine.evaluate(
-        state, unconfirmed, {}, OBSERVED + pd.Timedelta(minutes=4)
+
+def test_neutral_invalidation_counts_unique_closed_bars_only():
+    engine = SignalLifecycle(invalidation_observations=3)
+    state, _ = activate(engine)
+    neutral = prediction(
+        timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=2),
+        bias="neutral",
+        setup_type=None,
+        zone=None,
+        sweep_status="none",
+        sweep_time=None,
+        reclaim_time=None,
+        orderflow_confirmation=False,
+        entry=None,
+        stop=None,
+        target=None,
+        position_size=None,
+        no_trade_reason="timeframe_conflict",
     )
+    state, events = engine.evaluate(state, neutral, {}, OBSERVED + pd.Timedelta(minutes=2, seconds=5))
+    assert events == [] and state["missing_observations"] == 1
+    state, events = engine.evaluate(state, neutral, {}, OBSERVED + pd.Timedelta(minutes=2, seconds=50))
+    assert events == [] and state["missing_observations"] == 1
+    for minute in (3, 4):
+        state, events = engine.evaluate(
+            state,
+            replace(neutral, timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=minute)),
+            {},
+            OBSERVED + pd.Timedelta(minutes=minute, seconds=30),
+        )
     assert [event["event_type"] for event in events] == ["setup_invalidated"]
-    assert state["active"] is None
+    assert events[0]["reason"] == "signal_neutralized"
+
+
+def test_nearby_different_zone_cannot_replace_active_setup():
+    engine = SignalLifecycle(confirm_observations=2, replacement_distance_atr=.25)
+    state, _ = activate(engine)
+    nearby = prediction(
+        timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=2),
+        zone="vwap_lower:nearby",
+        sweep_time="2026-07-28T12:01:00Z",
+        entry=65020.0,
+        reward_risk=3.0,
+        probability_tp_before_sl=.8,
+    )
+    for minute in (2, 3, 4):
+        state, events = engine.evaluate(
+            state,
+            replace(nearby, timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=minute)),
+            {},
+            OBSERVED + pd.Timedelta(minutes=minute, seconds=30),
+        )
+        assert events == []
+    assert state["active"]["snapshot"]["zone"] == "equal_lows:abc"
+    assert state["candidate"] is None
+
+
+def test_material_better_replacement_requires_two_unique_bars():
+    engine = SignalLifecycle(confirm_observations=2, replacement_distance_atr=.25)
+    state, _ = activate(engine)
+    replacement = prediction(
+        timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=2),
+        zone="previous_day_low:far",
+        sweep_time="2026-07-28T12:01:00Z",
+        entry=65100.0,
+        reward_risk=3.0,
+        probability_tp_before_sl=.8,
+    )
+    state, events = engine.evaluate(state, replacement, {}, OBSERVED + pd.Timedelta(minutes=2, seconds=30))
+    assert events == []
+    state, events = engine.evaluate(state, replacement, {}, OBSERVED + pd.Timedelta(minutes=2, seconds=50))
+    assert events == []
+    state, events = engine.evaluate(
+        state,
+        replace(replacement, timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=3)),
+        {},
+        OBSERVED + pd.Timedelta(minutes=3, seconds=30),
+    )
+    assert [event["event_type"] for event in events] == ["setup_confirmed"]
+    assert events[0]["replaced_signal_id"] is not None
 
 
 def test_recovery_before_threshold_resets_invalidation_counter():
@@ -136,10 +226,16 @@ def test_recovery_before_threshold_resets_invalidation_counter():
         no_trade_reason="orderflow_not_confirmed",
     )
     state, _ = engine.evaluate(
-        state, unavailable, {}, OBSERVED + pd.Timedelta(minutes=2)
+        state,
+        replace(unavailable, timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=2), bias="neutral"),
+        {},
+        OBSERVED + pd.Timedelta(minutes=2, seconds=30),
     )
     state, events = engine.evaluate(
-        state, prediction(entry=65015.0), {}, OBSERVED + pd.Timedelta(minutes=3)
+        state,
+        prediction(timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=3), entry=65015.0),
+        {},
+        OBSERVED + pd.Timedelta(minutes=3, seconds=30),
     )
 
     assert events == []
@@ -151,6 +247,7 @@ def test_expired_reason_uses_expired_terminal_event():
     engine = SignalLifecycle(invalidation_observations=1)
     state, _ = activate(engine)
     expired = prediction(
+        timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=2),
         sweep_status="expired",
         entry=None,
         stop=None,
@@ -194,16 +291,25 @@ def test_bias_reversal_requires_two_non_neutral_observations():
     assert events == []
     assert state["stable_bias"] == "bullish"
     state, events = engine.evaluate(
-        state, bearish, {}, OBSERVED + pd.Timedelta(minutes=1)
+        state,
+        replace(bearish, timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=1)),
+        {},
+        OBSERVED + pd.Timedelta(minutes=1),
     )
     assert events == []
     state, events = engine.evaluate(
-        state, bearish, {}, OBSERVED + pd.Timedelta(minutes=2)
+        state,
+        replace(bearish, timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=2)),
+        {},
+        OBSERVED + pd.Timedelta(minutes=2),
     )
     assert [event["event_type"] for event in events] == ["bias_reversal"]
     assert state["stable_bias"] == "bearish"
     state, events = engine.evaluate(
-        state, bearish, {}, OBSERVED + pd.Timedelta(minutes=3)
+        state,
+        replace(bearish, timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=3)),
+        {},
+        OBSERVED + pd.Timedelta(minutes=3),
     )
     assert events == []
 
@@ -229,7 +335,10 @@ def test_opposite_confirmed_setup_combines_reversal_into_one_event():
     )
     assert events == []
     state, events = engine.evaluate(
-        state, bearish, {}, OBSERVED + pd.Timedelta(minutes=3, seconds=45)
+        state,
+        replace(bearish, timestamp=pd.Timestamp(bearish.timestamp) + pd.Timedelta(minutes=1)),
+        {},
+        OBSERVED + pd.Timedelta(minutes=4, seconds=45),
     )
 
     assert [event["event_type"] for event in events] == ["setup_confirmed"]
@@ -252,6 +361,31 @@ def test_tp_or_sl_closure_clears_lifecycle_without_duplicate_terminal_event():
     assert setup_event["event_type"] == "setup_confirmed"
     assert state["active"] is None
     assert events == []
+
+    # The same completed setup cannot immediately re-enter after its terminal
+    # market outcome. A fresh sweep episode must create a new signal identity.
+    for minute in (6, 7, 8):
+        state, events = engine.evaluate(
+            state,
+            prediction(timestamp=OBSERVED.floor("min") + pd.Timedelta(minutes=minute)),
+            {},
+            OBSERVED + pd.Timedelta(minutes=minute, seconds=30),
+        )
+        assert events == []
+        assert state["candidate"] is None
+
+
+def test_state_migration_preserves_event_sequence_to_avoid_dedupe_collision():
+    engine = SignalLifecycle()
+    old = SignalLifecycle.initial_state()
+    old.update({"version": 1, "event_sequence": 41, "stable_bias": "bearish"})
+
+    state, events = engine.evaluate(old, prediction(), {}, OBSERVED)
+
+    assert events == []
+    assert state["version"] == SignalLifecycle.VERSION
+    assert state["event_sequence"] == 41
+    assert state["stable_bias"] == "bearish"
 
 
 def test_signal_flip_emits_one_invalidation_event():

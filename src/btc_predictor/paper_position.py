@@ -102,133 +102,133 @@ class PaperLedger:
                     "equity": self._equity,
                 })
 
-    def update(self, prediction, current_ohlc: pd.DataFrame | None = None):
+    def update_market(self, current_ohlc: pd.DataFrame | None = None):
+        """Apply market facts only: pending fills/expiry and TP/SL exits."""
         with self.lock:
             closed_before_update = len(self._closed)
             last_close = None
             if current_ohlc is not None and not current_ohlc.empty:
                 last_close = float(current_ohlc["close"].iloc[-1])
-
-            # 0. Resolve any pending limit order (fill, supersede, or expire)
-            self._update_pending(prediction, current_ohlc)
-
-            # 1. Evaluate exits on existing open position
+            self._update_pending_market(current_ohlc)
             if self._open is not None and current_ohlc is not None and not current_ohlc.empty:
                 self._check_exit(current_ohlc)
-
-            # 2a. Neutral-exit: the structure thesis is dead after a sustained
-            # neutral state. A brief flicker remains within the grace period.
-            if self._open is not None and prediction.bias == "neutral":
-                count = int(self._open.get("neutral_observations") or 0) + 1
-                self._open["neutral_observations"] = count
-                if count >= self.neutral_exit_observations:
-                    self._close(prediction.timestamp, last_close, "signal_neutralized")
-            elif self._open is not None and self._open.get("neutral_observations"):
-                self._open["neutral_observations"] = 0
-
-            # 2b. Check for signal flip or superseded position if still open
-            if self._open is not None and prediction.bias != "neutral":
-                current_side = "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else None
-                is_new_setup = (
-                    prediction.entry is not None
-                    and prediction.stop is not None
-                    and prediction.target is not None
-                    and prediction.position_size
-                )
-                # Setup identity = zone + sweep event. The prediction timestamp
-                # advances every 1m candle, so it must NOT be part of the
-                # identity — otherwise every re-emitted signal closes and
-                # re-opens the same trade ("superseded" churn each minute).
-                open_sweep = self._open.get("sweep_time")
-                pred_sweep = str(prediction.sweep_time) if prediction.sweep_time else None
-                same_zone = prediction.zone and prediction.zone == self._open.get("zone")
-                if open_sweep is None:
-                    # Positions persisted before sweep_time was tracked: fall
-                    # back to zone-only identity to avoid a one-off churn.
-                    same_setup = bool(same_zone)
-                else:
-                    same_setup = bool(same_zone) and pred_sweep == open_sweep
-                if current_side != self._open["side"]:
-                    self._close(prediction.timestamp, last_close, "signal_flipped")
-                elif is_new_setup and not same_setup:
-                    self._close(prediction.timestamp, last_close, "superseded_by_new_setup")
-
-            # 3. Enter new position if no position is open and setup is confirmed
-            if self._open is None and self._pending is None and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
-                order = {
-                    "entry_time": pd.Timestamp(prediction.timestamp).isoformat(),
-                    "side": "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else "neutral",
-                    "entry": float(prediction.entry),
-                    "stop": float(prediction.stop),
-                    "target": float(prediction.target),
-                    "size": float(prediction.position_size),
-                    "zone": prediction.zone,
-                    "sweep_time": str(prediction.sweep_time) if prediction.sweep_time else None,
-                    "probability_tp_before_sl": prediction.probability_tp_before_sl,
-                }
-                if getattr(prediction, "entry_type", "market") == "limit":
-                    # Pending retracement order: do not assume a fill. It opens
-                    # only if price trades back to the limit level, and expires
-                    # after `pending_ttl_bars` closed bars without a touch.
-                    order["signal_time"] = order["entry_time"]
-                    order["pending_ttl_bars"] = 240
-                    self._pending = order
-                else:
-                    self._open = order
-                    # Check exit immediately on entry candle
-                    if current_ohlc is not None and not current_ohlc.empty:
-                        self._check_exit(current_ohlc)
-
             self._save()
             status = self._status(last_close)
-            status["newly_closed"] = [
-                dict(trade) for trade in self._closed[closed_before_update:]
-            ]
+            status["newly_closed"] = [dict(trade) for trade in self._closed[closed_before_update:]]
             return status
 
-    def _update_pending(self, prediction, current_ohlc: pd.DataFrame | None):
-        """Fill, supersede, or expire a pending retracement limit order."""
+    def apply_lifecycle(self, events, current_ohlc: pd.DataFrame | None = None):
+        """Execute only durable lifecycle decisions, never raw predictions."""
+        with self.lock:
+            closed_before_update = len(self._closed)
+            last_close = None
+            if current_ohlc is not None and not current_ohlc.empty:
+                last_close = float(current_ohlc["close"].iloc[-1])
+            for event in events or []:
+                event_type = str(event.get("event_type") or "")
+                signal_id = event.get("signal_id")
+                if event_type == "setup_confirmed":
+                    existing = self._open or self._pending
+                    if existing and existing.get("signal_id") == signal_id:
+                        continue
+                    snapshot = event.get("snapshot") or {}
+                    expected_side = "long" if snapshot.get("bias") == "bullish" else "short"
+                    if (
+                        existing
+                        and existing.get("signal_id") is None
+                        and existing.get("side") == expected_side
+                        and existing.get("zone") == snapshot.get("zone")
+                    ):
+                        # One-time migration for a position created before the
+                        # lifecycle became execution authority. Adopt it without
+                        # fabricating a close/reopen on deployment.
+                        existing.update({
+                            "signal_id": signal_id,
+                            "lifecycle_event_id": event.get("event_id"),
+                            "confirmed_at": event.get("created_at"),
+                            "decision_time": snapshot.get("timestamp"),
+                            "reclaim_time": snapshot.get("reclaim_time"),
+                            "setup_atr": snapshot.get("setup_atr"),
+                        })
+                        continue
+                    if self._open is not None:
+                        self._close(event.get("created_at"), last_close, "superseded_by_confirmed_setup")
+                    if self._pending is not None:
+                        self._pending = None
+                    self._place_confirmed(event)
+                elif event_type in ("setup_invalidated", "setup_expired"):
+                    reason = str(event.get("reason") or event_type)
+                    if self._open is not None and self._matches_signal(self._open, signal_id):
+                        self._close(event.get("created_at"), last_close, reason)
+                    if self._pending is not None and self._matches_signal(self._pending, signal_id):
+                        self._pending = None
+            self._save()
+            status = self._status(last_close)
+            status["newly_closed"] = [dict(trade) for trade in self._closed[closed_before_update:]]
+            return status
+
+    @staticmethod
+    def _matches_signal(position, signal_id):
+        # Legacy persisted positions have no signal_id. Allow their first
+        # lifecycle terminal event to resolve them instead of leaving limbo.
+        return position.get("signal_id") in (None, signal_id)
+
+    def _place_confirmed(self, event):
+        snapshot = dict(event.get("snapshot") or {})
+        required = (snapshot.get("entry"), snapshot.get("stop"), snapshot.get("target"), snapshot.get("position_size"))
+        if not all(value is not None for value in required) or float(snapshot.get("position_size") or 0) <= 0:
+            logger.error("Refusing malformed setup_confirmed event %s", event.get("event_id"))
+            return
+        order = {
+            "signal_id": event.get("signal_id"),
+            "lifecycle_event_id": event.get("event_id"),
+            "confirmed_at": event.get("created_at"),
+            "decision_time": snapshot.get("timestamp"),
+            "entry_time": snapshot.get("timestamp"),
+            "side": "long" if snapshot.get("bias") == "bullish" else "short",
+            "entry": float(snapshot["entry"]),
+            "stop": float(snapshot["stop"]),
+            "target": float(snapshot["target"]),
+            "size": float(snapshot["position_size"]),
+            "zone": snapshot.get("zone"),
+            "sweep_time": snapshot.get("sweep_time"),
+            "reclaim_time": snapshot.get("reclaim_time"),
+            "setup_atr": snapshot.get("setup_atr"),
+            "probability_tp_before_sl": snapshot.get("probability_tp_before_sl"),
+        }
+        if snapshot.get("entry_type", "market") == "limit":
+            order["signal_time"] = order["entry_time"]
+            order["pending_ttl_bars"] = 240
+            self._pending = order
+        else:
+            self._open = order
+
+    def update(self, prediction, current_ohlc: pd.DataFrame | None = None):
+        """Compatibility helper for isolated research/tests.
+
+        It can seed one position but deliberately cannot replace or invalidate
+        an existing trade from a raw predictor output. Production uses
+        update_market() + apply_lifecycle().
+        """
+        market = self.update_market(current_ohlc)
+        if self._open is None and self._pending is None and prediction.entry is not None and prediction.stop is not None and prediction.target is not None and prediction.position_size:
+            snapshot = {
+                key: getattr(prediction, key, None)
+                for key in ("timestamp", "bias", "entry", "stop", "target", "position_size", "zone", "sweep_time", "reclaim_time", "setup_atr", "probability_tp_before_sl", "entry_type")
+            }
+            snapshot["timestamp"] = pd.Timestamp(snapshot["timestamp"]).isoformat()
+            event = {"event_id": "compatibility-entry", "event_type": "setup_confirmed", "signal_id": None, "created_at": snapshot["timestamp"], "snapshot": snapshot}
+            decision = self.apply_lifecycle([event], current_ohlc)
+            decision["newly_closed"] = list(market.get("newly_closed") or []) + list(decision.get("newly_closed") or [])
+            return decision
+        return market
+
+    def _update_pending_market(self, current_ohlc: pd.DataFrame | None):
+        """Fill or expire a confirmed pending retracement limit order."""
         if self._pending is None:
             return
         pending = self._pending
         side = pending["side"]
-
-        # Cancel on sustained neutral: a pending limit order must not survive
-        # after the structure thesis has been neutralized.
-        if prediction.bias == "neutral":
-            count = int(pending.get("neutral_observations") or 0) + 1
-            pending["neutral_observations"] = count
-            if count >= self.neutral_exit_observations:
-                logger.info("Pending %s order at %.2f cancelled: signal neutralized", side, pending["entry"])
-                self._pending = None
-                return
-        elif pending.get("neutral_observations"):
-            pending["neutral_observations"] = 0
-
-        # Cancel if the signal flips against the pending order.
-        new_side = "long" if prediction.bias == "bullish" else "short" if prediction.bias == "bearish" else None
-        if new_side is not None and new_side != side:
-            logger.info("Pending %s order cancelled: signal flipped to %s", side, prediction.bias)
-            self._pending = None
-            return
-        if (
-            new_side is not None
-            and prediction.entry is not None
-            and prediction.stop is not None
-            and prediction.target is not None
-            and prediction.position_size
-        ):
-            pending_sweep = self._pending.get("sweep_time")
-            prediction_sweep = str(prediction.sweep_time) if prediction.sweep_time else None
-            same_setup = (
-                prediction.zone == self._pending.get("zone")
-                and (pending_sweep is None or prediction_sweep == pending_sweep)
-            )
-            if not same_setup:
-                logger.info("Pending %s order cancelled: superseded by a new setup", side)
-                self._pending = None
-                return
-
         if current_ohlc is None or current_ohlc.empty:
             return
         ohlc_index_utc = pd.to_datetime(current_ohlc.index, utc=True)
@@ -264,7 +264,9 @@ class PaperLedger:
         target = self._open["target"]
         entry_time = pd.Timestamp(self._open["entry_time"])
         ohlc_index_utc = pd.to_datetime(ohlc.index, utc=True)
-        future = ohlc.loc[ohlc_index_utc >= entry_time]
+        # A market signal is known only after its decision candle closes. Do
+        # not let that already-completed candle retrospectively hit TP or SL.
+        future = ohlc.loc[ohlc_index_utc > entry_time]
 
         if future.empty and not ohlc.empty and ohlc_index_utc[0] > entry_time:
             future = ohlc
@@ -319,6 +321,13 @@ class PaperLedger:
             "r_multiple": float(r),
             "exit_reason": reason,
             "zone": self._open.get("zone"),
+            "signal_id": self._open.get("signal_id"),
+            "lifecycle_event_id": self._open.get("lifecycle_event_id"),
+            "confirmed_at": self._open.get("confirmed_at"),
+            "decision_time": self._open.get("decision_time"),
+            "sweep_time": self._open.get("sweep_time"),
+            "reclaim_time": self._open.get("reclaim_time"),
+            "setup_atr": self._open.get("setup_atr"),
         }
         self._closed.append(trade)
         self._open = None

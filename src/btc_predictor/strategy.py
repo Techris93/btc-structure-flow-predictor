@@ -14,30 +14,60 @@ from .structure import structure_events
 from .zones import build_projected_zones
 
 
-def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,reclaim_bars=15):
-    """Find a recent ATR-bounded breach followed by a causal reclaim within N closed 1m bars."""
-    recent=ohlc.tail(reclaim_bars+1); breaches=[]
+def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,reclaim_bars=15,rearm_bars=3,rearm_atr=.5):
+    """Find a causal sweep episode from closed 1m bars.
+
+    The episode identity is its *first* breach, not whichever later candle
+    happens to make the deepest extreme. A deeper low/high updates geometry
+    without manufacturing a new setup. A new episode is possible only after
+    a reclaim has remained at least ``rearm_atr`` away for ``rearm_bars``
+    completed bars.
+    """
+    recent=ohlc.tail(reclaim_bars+1)
+    episodes=[]; episode=None; clear_bars=0
     for ts,bar in recent.iterrows():
         breached=bar.low<zone.low if direction=="bullish" else bar.high>zone.high
-        if not breached: continue
-        depth=(zone.low-float(bar.low))/setup_atr if direction=="bullish" else (float(bar.high)-zone.high)/setup_atr
-        breaches.append((ts,depth,float(bar.low if direction=="bullish" else bar.high)))
-    if not breaches:return {"status":"none","confirmed":False}
-    breach_time,depth,extreme=max(breaches,key=lambda item:item[1])
+        if breached:
+            depth=(zone.low-float(bar.low))/setup_atr if direction=="bullish" else (float(bar.high)-zone.high)/setup_atr
+            extreme=float(bar.low if direction=="bullish" else bar.high)
+            if episode is None:
+                episode={"time":ts,"depth_atr":depth,"extreme":extreme,"reclaim_time":None}
+            elif depth>episode["depth_atr"]:
+                episode["depth_atr"]=depth; episode["extreme"]=extreme
+            # A candle may breach intrabar and reclaim on its close. Preserve
+            # that causal close as the first reclaim instead of waiting for a
+            # later bar that never breached.
+            reclaimed=float(bar.close)>zone.high if direction=="bullish" else float(bar.close)<zone.low
+            if reclaimed and episode["reclaim_time"] is None:
+                episode["reclaim_time"]=ts
+            clear_bars=0
+            continue
+        if episode is None:
+            continue
+        reclaimed=float(bar.close)>zone.high if direction=="bullish" else float(bar.close)<zone.low
+        if reclaimed and episode["reclaim_time"] is None:
+            episode["reclaim_time"]=ts
+        away=(float(bar.close)>=zone.high+rearm_atr*setup_atr) if direction=="bullish" else (float(bar.close)<=zone.low-rearm_atr*setup_atr)
+        clear_bars=clear_bars+1 if episode["reclaim_time"] is not None and away else 0
+        if clear_bars>=max(1,int(rearm_bars)):
+            episodes.append(episode); episode=None; clear_bars=0
+    if episode is not None: episodes.append(episode)
+    if not episodes:return {"status":"none","confirmed":False}
+    selected=episodes[-1]
+    breach_time=selected["time"]; depth=selected["depth_atr"]; extreme=selected["extreme"]
     if depth>max_depth:return {"status":"excessive_excursion","confirmed":False,"time":breach_time,"depth_atr":depth,"extreme":extreme}
     if depth<min_depth:return {"status":"shallow_excursion","confirmed":False,"time":breach_time,"depth_atr":depth,"extreme":extreme}
-    after=ohlc.loc[ohlc.index>=breach_time].head(reclaim_bars+1)
-    reclaimed=(after.close>zone.high) if direction=="bullish" else (after.close<zone.low)
-    if not reclaimed.any():return {"status":"waiting_reclaim","confirmed":False,"time":breach_time,"depth_atr":depth,"extreme":extreme}
-    reclaim_time=reclaimed[reclaimed].index[0]
-    if reclaim_time<ohlc.index[-reclaim_bars-1] or reclaim_time>ohlc.index[-1]:return {"status":"expired_reclaim","confirmed":False}
+    reclaim_time=selected.get("reclaim_time")
+    if reclaim_time is None:return {"status":"waiting_reclaim","confirmed":False,"time":breach_time,"depth_atr":depth,"extreme":extreme}
+    if reclaim_time<recent.index[0] or reclaim_time>recent.index[-1]:return {"status":"expired_reclaim","confirmed":False}
     return {"status":"confirmed","confirmed":True,"time":breach_time,"reclaim_time":reclaim_time,"depth_atr":depth,"extreme":extreme}
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5,sweep_rearm_bars=3,sweep_rearm_atr=.5):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
+        self.sweep_rearm_bars=max(1,int(sweep_rearm_bars)); self.sweep_rearm_atr=max(0.0,float(sweep_rearm_atr))
         # Late-entry guard: when a confirmed sweep is deeper than
         # `retrace_entry_atr` ATR, enter on a `retrace_pct` pullback of the
         # sweep leg (pending limit) instead of at market. None = disabled
@@ -92,7 +122,7 @@ class Predictor:
         if bias=="neutral" or not np.isfinite(a):return self._output(now,bias,no_trade_reason="timeframe_conflict" if self.last_regimes["4h"]!=self.last_regimes["1h"] else "neutral_or_unready_structure")
         zones=build_projected_zones(setup); directional=[z for z in zones if z.is_active(now) and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above"))]
         if not directional:return self._output(now,bias,no_trade_reason="no_projected_zone")
-        evaluated=[(z,detect_sweep(o,z,bias,a,*self.sweep_atr,self.reclaim_bars)) for z in directional]
+        evaluated=[(z,detect_sweep(o,z,bias,a,*self.sweep_atr,self.reclaim_bars,self.sweep_rearm_bars,self.sweep_rearm_atr)) for z in directional]
         confirmed=[pair for pair in evaluated if pair[1].get("confirmed")]
         if not confirmed:
             waiting=[p for p in evaluated if p[1].get("status")=="waiting_reclaim"]
@@ -159,7 +189,7 @@ class Predictor:
                     skipped.append({"kind":candidate.kind,"mid":round(midpoint,2),"dist_atr":round(distance_atr,2) if distance_atr is not None else None})
         log.info("target_select bias=%s entry=%.2f stop=%.2f target=%.2f rr=%.2f skipped_zones=%s",bias,entry,stop,target,rr,skipped)
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
-        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],orderflow_evaluation_status="evaluated",sweep_evaluation_status="evaluated",orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,exchange_agreement=flow.get("agreement"),entry=entry,entry_type=entry_type,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
+        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],orderflow_evaluation_status="evaluated",sweep_evaluation_status="evaluated",orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,exchange_agreement=flow.get("agreement"),entry=entry,entry_type=entry_type,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob,setup_atr=a)
         if rr<self.min_rr or not np.isfinite(risk) or risk<=0:
             log.info("insufficient_reward_risk bias=%s entry=%.2f stop=%.2f target=%.2f rr=%.2f min_rr=%.2f skipped_zones=%s",bias,entry,stop,target,rr,self.min_rr,skipped)
             return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")

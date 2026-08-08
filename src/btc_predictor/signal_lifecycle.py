@@ -30,16 +30,18 @@ def _human(value):
 class SignalLifecycle:
     """Pure, durable notification lifecycle for predictor outputs.
 
-    This controls notifications only. It does not change predictor decisions,
-    paper fills, stops, targets, or position accounting.
+    This is the single authority for setup activation, replacement and
+    invalidation. Callers may use its emitted events for notifications and
+    paper execution, keeping both state machines synchronized.
     """
 
-    VERSION = 1
+    VERSION = 2
 
-    def __init__(self, confirm_observations=2, invalidation_observations=3, bias_observations=2):
+    def __init__(self, confirm_observations=2, invalidation_observations=3, bias_observations=2, replacement_distance_atr=.25):
         self.confirm_observations = max(1, int(confirm_observations))
         self.invalidation_observations = max(1, int(invalidation_observations))
         self.bias_observations = max(1, int(bias_observations))
+        self.replacement_distance_atr = max(0.0, float(replacement_distance_atr))
 
     @staticmethod
     def initial_state():
@@ -48,10 +50,13 @@ class SignalLifecycle:
             "candidate": None,
             "active": None,
             "missing_observations": 0,
+            "last_missing_decision_at": None,
             "stable_bias": None,
             "bias_candidate": None,
             "bias_observations": 0,
+            "last_bias_decision_at": None,
             "event_sequence": 0,
+            "retired_signal_ids": [],
             "updated_at": None,
         }
 
@@ -78,6 +83,9 @@ class SignalLifecycle:
             "regime_4h",
             "regime_1h",
             "setup_15m",
+            "orderflow_score",
+            "setup_atr",
+            "entry_type",
         )
         snapshot = {field: _value(prediction, field) for field in fields}
         for field in ("timestamp", "sweep_time", "reclaim_time"):
@@ -113,13 +121,49 @@ class SignalLifecycle:
         return hashlib.sha256(encoded.encode()).hexdigest()[:20]
 
     @staticmethod
-    def _completed_candle(snapshot, observed_at):
+    def _new_decision(previous, snapshot):
+        """True only once per completed decision candle."""
         decision_at = snapshot.get("timestamp")
-        if not decision_at:
+        return bool(decision_at and decision_at != previous)
+
+    @staticmethod
+    def _expectancy(snapshot):
+        probability = snapshot.get("probability_tp_before_sl")
+        reward_risk = snapshot.get("reward_risk")
+        if probability is None or reward_risk is None:
+            return None
+        probability = float(probability)
+        return probability * float(reward_risk) - (1.0 - probability)
+
+    def _material_replacement(self, active, snapshot):
+        """Reject same-direction scanner drift while allowing real episodes."""
+        current = (active or {}).get("snapshot") or {}
+        if not current:
+            return True
+        if snapshot.get("bias") != current.get("bias"):
+            return True
+        # A different identity on the same zone is a new, explicitly rearmed
+        # sweep episode; detect_sweep guarantees that rearm condition.
+        if snapshot.get("zone") == current.get("zone"):
+            return True
+        entry = snapshot.get("entry")
+        current_entry = current.get("entry")
+        setup_atr = snapshot.get("setup_atr") or current.get("setup_atr")
+        if entry is None or current_entry is None or not setup_atr:
             return False
-        decision_at = pd.Timestamp(decision_at)
-        observed_at = pd.Timestamp(observed_at)
-        return decision_at < observed_at.floor("min")
+        separated = abs(float(entry) - float(current_entry)) >= self.replacement_distance_atr * float(setup_atr)
+        candidate_edge = self._expectancy(snapshot)
+        current_edge = self._expectancy(current)
+        improved = candidate_edge is not None and (current_edge is None or candidate_edge > current_edge)
+        return bool(separated and improved)
+
+    @staticmethod
+    def _retire(state, signal_id):
+        if not signal_id:
+            return
+        retired = [item for item in state.get("retired_signal_ids") or [] if item != signal_id]
+        retired.append(signal_id)
+        state["retired_signal_ids"] = retired[-100:]
 
     @staticmethod
     def _classify_terminal(snapshot):
@@ -167,7 +211,11 @@ class SignalLifecycle:
     def evaluate(self, persisted_state, prediction, paper_status, observed_at):
         state = {**self.initial_state(), **(persisted_state or {})}
         if state.get("version") != self.VERSION:
+            previous = state
             state = self.initial_state()
+            # Never reuse durable event IDs after a schema migration.
+            state["event_sequence"] = int(previous.get("event_sequence") or 0)
+            state["stable_bias"] = previous.get("stable_bias")
         events = []
         snapshot = self.snapshot(prediction)
         signal_id = self.signal_id(snapshot)
@@ -180,6 +228,7 @@ class SignalLifecycle:
             if not active:
                 continue
             if reason in ("target", "stop"):
+                self._retire(state, active.get("signal_id"))
                 active = None
                 state["active"] = None
                 state["missing_observations"] = 0
@@ -194,16 +243,30 @@ class SignalLifecycle:
                     reason=reason,
                     snapshot=active.get("snapshot"),
                 ))
+                self._retire(state, active.get("signal_id"))
                 active = None
                 state["active"] = None
                 state["missing_observations"] = 0
 
-        # Candidate confirmation: two observations, or one already-completed 1m candle.
+        # Candidate confirmation counts unique completed decision bars, never
+        # repeated 45-second polls of the same timestamp.
+        if actionable and signal_id in set(state.get("retired_signal_ids") or []):
+            actionable = False
+            signal_id = None
+            state["candidate"] = None
+        if actionable:
+            if active and active.get("signal_id") != signal_id and not self._material_replacement(active, snapshot):
+                actionable = False
+                signal_id = None
+                state["candidate"] = None
+
         if actionable:
             candidate = state.get("candidate")
             if candidate and candidate.get("signal_id") == signal_id:
-                candidate["observations"] = int(candidate.get("observations") or 0) + 1
-                candidate["snapshot"] = snapshot
+                if self._new_decision(candidate.get("last_decision_at"), snapshot):
+                    candidate["observations"] = int(candidate.get("observations") or 0) + 1
+                    candidate["snapshot"] = snapshot
+                    candidate["last_decision_at"] = snapshot.get("timestamp")
                 candidate["last_seen_at"] = pd.Timestamp(observed_at).isoformat()
             else:
                 candidate = {
@@ -211,17 +274,17 @@ class SignalLifecycle:
                     "observations": 1,
                     "first_seen_at": pd.Timestamp(observed_at).isoformat(),
                     "last_seen_at": pd.Timestamp(observed_at).isoformat(),
+                    "last_decision_at": snapshot.get("timestamp"),
                     "snapshot": snapshot,
                 }
             state["candidate"] = candidate
-            confirmed = (
-                candidate["observations"] >= self.confirm_observations
-                or self._completed_candle(snapshot, observed_at)
-            )
+            confirmed = candidate["observations"] >= self.confirm_observations
             if active and active.get("signal_id") == signal_id:
                 active["last_seen_at"] = pd.Timestamp(observed_at).isoformat()
+                active["last_decision_at"] = snapshot.get("timestamp")
                 state["active"] = active
                 state["missing_observations"] = 0
+                state["last_missing_decision_at"] = None
                 state["candidate"] = None
             elif confirmed:
                 previous_bias = state.get("stable_bias")
@@ -230,6 +293,7 @@ class SignalLifecycle:
                     and snapshot.get("bias") != previous_bias
                 )
                 replaced_signal_id = active.get("signal_id") if active else None
+                self._retire(state, replaced_signal_id)
                 events.append(self._setup_event(
                     state,
                     candidate,
@@ -241,20 +305,36 @@ class SignalLifecycle:
                     "signal_id": signal_id,
                     "activated_at": pd.Timestamp(observed_at).isoformat(),
                     "last_seen_at": pd.Timestamp(observed_at).isoformat(),
+                    "last_decision_at": snapshot.get("timestamp"),
                     "snapshot": snapshot,
                 }
                 active = state["active"]
                 state["candidate"] = None
                 state["missing_observations"] = 0
+                state["last_missing_decision_at"] = None
                 state["stable_bias"] = snapshot.get("bias")
                 state["bias_candidate"] = None
                 state["bias_observations"] = 0
         else:
             state["candidate"] = None
             if active:
-                state["missing_observations"] = int(state.get("missing_observations") or 0) + 1
-                if state["missing_observations"] >= self.invalidation_observations:
+                active_bias = (active.get("snapshot") or {}).get("bias")
+                bias = snapshot.get("bias")
+                reason = str(snapshot.get("no_trade_reason") or snapshot.get("sweep_status") or "")
+                explicit_expiry = "expired" in reason
+                structural_exit = bias == "neutral" or (bias in ("bullish", "bearish") and bias != active_bias)
+                should_count = explicit_expiry or structural_exit
+                if should_count and self._new_decision(state.get("last_missing_decision_at"), snapshot):
+                    state["missing_observations"] = int(state.get("missing_observations") or 0) + 1
+                    state["last_missing_decision_at"] = snapshot.get("timestamp")
+                elif not should_count:
+                    # A scanner choosing another zone, or temporary footprint /
+                    # sweep loss, does not kill an already confirmed thesis.
+                    state["missing_observations"] = 0
+                    state["last_missing_decision_at"] = None
+                if should_count and state["missing_observations"] >= self.invalidation_observations:
                     event_type = self._classify_terminal(snapshot)
+                    terminal_reason = "signal_flipped" if bias in ("bullish", "bearish") and bias != active_bias else ("signal_neutralized" if bias == "neutral" else reason)
                     events.append(self._event(
                         state,
                         event_type,
@@ -263,14 +343,16 @@ class SignalLifecycle:
                         title=("BTC setup expired" if event_type == "setup_expired" else "BTC setup invalidated"),
                         body=(
                             f"{str(active['snapshot'].get('bias')).capitalize()} · "
-                            f"{_human(snapshot.get('no_trade_reason') or snapshot.get('sweep_status'))}"
+                            f"{_human(terminal_reason)}"
                         ),
-                        reason=snapshot.get("no_trade_reason") or snapshot.get("sweep_status"),
+                        reason=terminal_reason,
                         snapshot=active.get("snapshot"),
                     ))
+                    self._retire(state, active.get("signal_id"))
                     state["active"] = None
                     active = None
                     state["missing_observations"] = 0
+                    state["last_missing_decision_at"] = None
 
         # Bias reversals are notified only after the predictor's non-neutral bias
         # persists. A setup-confirmed event above already carries the reversal.
@@ -278,11 +360,15 @@ class SignalLifecycle:
         if state.get("stable_bias") is None and bias in ("bullish", "bearish"):
             state["stable_bias"] = bias
         elif bias in ("bullish", "bearish") and bias != state.get("stable_bias"):
+            is_new_bias_bar = self._new_decision(state.get("last_bias_decision_at"), snapshot)
             if state.get("bias_candidate") == bias:
-                state["bias_observations"] = int(state.get("bias_observations") or 0) + 1
+                if is_new_bias_bar:
+                    state["bias_observations"] = int(state.get("bias_observations") or 0) + 1
             else:
                 state["bias_candidate"] = bias
                 state["bias_observations"] = 1
+            if is_new_bias_bar:
+                state["last_bias_decision_at"] = snapshot.get("timestamp")
             setup_already_announced = any(
                 event.get("event_type") == "setup_confirmed" and event.get("bias_reversal")
                 for event in events
@@ -302,9 +388,11 @@ class SignalLifecycle:
                 state["stable_bias"] = bias
                 state["bias_candidate"] = None
                 state["bias_observations"] = 0
+                state["last_bias_decision_at"] = None
         elif bias == state.get("stable_bias"):
             state["bias_candidate"] = None
             state["bias_observations"] = 0
+            state["last_bias_decision_at"] = None
 
         state["updated_at"] = pd.Timestamp(observed_at).isoformat()
         return state, events

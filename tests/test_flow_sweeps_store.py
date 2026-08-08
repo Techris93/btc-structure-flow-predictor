@@ -20,6 +20,48 @@ def test_sweep_is_atr_bounded_and_can_reclaim_over_multiple_bars():
     assert not detect_sweep(x,z,"bullish",1,.05,1,3)["confirmed"]
 
 
+def test_continuous_deeper_breach_keeps_original_sweep_identity():
+    idx = pd.date_range("2026-01-01", periods=4, freq="min", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "open": [98.0] * 4,
+            "high": [99.0] * 4,
+            "low": [95.0, 94.0, 93.0, 98.0],
+            "close": [95.5, 95.0, 98.0, 99.0],
+            "volume": 1.0,
+        },
+        index=idx,
+    )
+    zone = Zone("stable", "swing", "below", 96, 97, 1, idx[0], idx[0])
+
+    result = detect_sweep(frame, zone, "bullish", 10, reclaim_bars=15)
+
+    assert result["confirmed"] is True
+    assert result["time"] == idx[0]
+    assert result["extreme"] == 93.0
+    assert result["reclaim_time"] == idx[2]
+
+
+def test_sweep_identity_rearms_only_after_three_clear_bars_and_atr_distance():
+    idx = pd.date_range("2026-01-01", periods=6, freq="min", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "open": [98.0] * 6,
+            "high": [99.0, 104.0, 104.0, 104.0, 99.0, 99.0],
+            "low": [94.0, 98.0, 98.0, 98.0, 93.0, 98.0],
+            "close": [98.0, 103.0, 103.0, 103.0, 98.0, 99.0],
+            "volume": 1.0,
+        },
+        index=idx,
+    )
+    zone = Zone("rearmed", "swing", "below", 96, 97, 1, idx[0], idx[0])
+
+    result = detect_sweep(frame, zone, "bullish", 10, reclaim_bars=15, rearm_bars=3, rearm_atr=.5)
+
+    assert result["confirmed"] is True
+    assert result["time"] == idx[4]
+
+
 def test_orderflow_reversals_are_symmetric_and_exchange_agreement_is_required():
     idx=pd.date_range("2025-01-01",periods=3,freq="min",tz="UTC")
     trades=[]

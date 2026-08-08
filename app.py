@@ -54,6 +54,8 @@ _retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "").strip()
 predictor = Predictor(
     retrace_entry_atr=float(_retrace_atr) if _retrace_atr else None,
     retrace_pct=float(os.getenv("RETRACE_PCT", "0.5")),
+    sweep_rearm_bars=max(1, int(os.getenv("SWEEP_REARM_BARS", "3"))),
+    sweep_rearm_atr=max(0.0, float(os.getenv("SWEEP_REARM_ATR", "0.5"))),
 )
 data_dir = runtime_dir()
 live_lock = threading.Lock()
@@ -113,6 +115,7 @@ PUSH_STATE_COOLDOWN_SECONDS = max(0, int(os.getenv("PUSH_COOLDOWN_SECONDS", "60"
 SIGNAL_CONFIRM_OBSERVATIONS = max(1, int(os.getenv("SIGNAL_CONFIRM_OBSERVATIONS", "2")))
 SIGNAL_INVALIDATION_OBSERVATIONS = max(1, int(os.getenv("SIGNAL_INVALIDATION_OBSERVATIONS", "3")))
 BIAS_CONFIRM_OBSERVATIONS = max(1, int(os.getenv("BIAS_CONFIRM_OBSERVATIONS", "2")))
+SIGNAL_REPLACEMENT_DISTANCE_ATR = max(0.0, float(os.getenv("SIGNAL_REPLACEMENT_DISTANCE_ATR", "0.25")))
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://btc-structure-flow-predictor.onrender.com"
 ).rstrip("/")
@@ -145,6 +148,7 @@ signal_lifecycle = SignalLifecycle(
     confirm_observations=SIGNAL_CONFIRM_OBSERVATIONS,
     invalidation_observations=SIGNAL_INVALIDATION_OBSERVATIONS,
     bias_observations=BIAS_CONFIRM_OBSERVATIONS,
+    replacement_distance_atr=SIGNAL_REPLACEMENT_DISTANCE_ATR,
 )
 
 MARKET_TYPE = os.getenv("MARKET_TYPE", "linear").lower()
@@ -1286,7 +1290,9 @@ def _live_loop():
                 flow_source=flow_source or "recent_trades_fallback",
             )
             _set_live_loop_phase("updating_paper")
-            paper_status = paper_ledger.update(result, ohlc)
+            # Apply market facts first. Raw predictions are never allowed to
+            # open, invalidate or supersede a paper position.
+            market_paper_status = paper_ledger.update_market(ohlc)
             notification_now = pd.Timestamp.now(tz="UTC")
             lifecycle_before = signal_lifecycle_store.read(
                 SignalLifecycle.initial_state()
@@ -1294,21 +1300,31 @@ def _live_loop():
             active_before = lifecycle_before.get("active") or {}
             definitive_exit = any(
                 str(trade.get("exit_reason") or "").lower() in ("target", "stop")
-                for trade in (paper_status.get("newly_closed") or [])
+                for trade in (market_paper_status.get("newly_closed") or [])
             )
-            try:
-                _notify_paper_exits(paper_status.get("newly_closed") or [])
-            except Exception:
-                logger.exception("Paper exit notification dispatch failed")
             if definitive_exit:
                 _cancel_signal_events(
                     active_before.get("signal_id"), "paper_exit"
                 )
             _set_live_loop_phase("notifications")
             lifecycle_state, lifecycle_events = signal_lifecycle.evaluate(
-                lifecycle_before, result, paper_status, notification_now
+                lifecycle_before, result, market_paper_status, notification_now
             )
+            decision_paper_status = paper_ledger.apply_lifecycle(lifecycle_events, ohlc)
+            # Persist lifecycle after idempotent ledger application. If the
+            # process dies between these writes, replaying the event cannot
+            # duplicate an entry or close; the inverse order could strand an
+            # active lifecycle with no corresponding paper position.
             signal_lifecycle_store.write(lifecycle_state)
+            paper_status = decision_paper_status
+            paper_status["newly_closed"] = (
+                list(market_paper_status.get("newly_closed") or [])
+                + list(decision_paper_status.get("newly_closed") or [])
+            )
+            try:
+                _notify_paper_exits(paper_status.get("newly_closed") or [])
+            except Exception:
+                logger.exception("Paper exit notification dispatch failed")
             _enqueue_signal_events(lifecycle_events)
             # TP/SL is always the only alert dispatched in its poll. Lifecycle
             # alerts resume next poll and retain their durable queue position.

@@ -93,3 +93,6 @@ class PredictorOutput:
     orderflow_threshold: float | None = None
     orderflow_bars: int | None = None
     orderflow_source: str | None = None
+    # Decision-time setup ATR. Lifecycle replacement checks use this to
+    # distinguish a materially different setup from harmless price drift.
+    setup_atr: float | None = None

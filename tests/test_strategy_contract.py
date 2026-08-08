@@ -5,6 +5,18 @@ from btc_predictor.strategy import Predictor
 
 from btc_predictor.paper_position import PaperLedger
 
+
+def confirmed_event(prediction, signal_id="signal-1", created_at=None):
+    snapshot = dict(prediction.__dict__)
+    snapshot["timestamp"] = pd.Timestamp(prediction.timestamp).isoformat()
+    return {
+        "event_id": f"confirmed-{signal_id}",
+        "event_type": "setup_confirmed",
+        "signal_id": signal_id,
+        "created_at": pd.Timestamp(created_at or prediction.timestamp).isoformat(),
+        "snapshot": snapshot,
+    }
+
 def test_strategy_uses_setup_atr_checks_all_zones_and_leaves_probability_uncalibrated(monkeypatch):
     idx=pd.date_range("2025-01-01",periods=100,freq="min",tz="UTC")
     o=pd.DataFrame({"open":100.,"high":101.,"low":99.,"close":100.,"volume":10.},index=idx)
@@ -82,8 +94,16 @@ def test_paper_ledger_keeps_position_when_bias_remains_on_same_side():
     ledger.update(PredictorOutput(timestamp=pd.Timestamp("2025-01-01 00:01",tz="UTC"),bias="bullish"))
     assert ledger._open is not None
     assert ledger._closed == []
-    # Bearish flips the position
+    # A raw bearish output cannot flip the position; lifecycle owns exits.
     ledger.update(PredictorOutput(timestamp=pd.Timestamp("2025-01-01 00:02",tz="UTC"),bias="bearish"))
+    assert ledger._open is not None
+    invalidated = {
+        "event_type": "setup_invalidated",
+        "signal_id": "signal-1",
+        "created_at": "2025-01-01T00:02:00+00:00",
+        "reason": "signal_flipped",
+    }
+    ledger.apply_lifecycle([invalidated])
     assert ledger._open is None
     assert len(ledger._closed) == 1
     assert ledger._closed[0]["exit_reason"] == "signal_flipped"
@@ -150,7 +170,7 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
         position_size=1.0,
         zone="zone1",
     )
-    ledger.update(pred1)
+    ledger.apply_lifecycle([confirmed_event(pred1, "signal-1")])
     assert ledger._open is not None and ledger._open["zone"] == "zone1"
 
     # Test superseded by a new setup on a different zone
@@ -167,9 +187,13 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
         {"open": [64900.0], "high": [64950.0], "low": [64850.0], "close": [64900.0], "volume": [1.0]},
         index=pd.DatetimeIndex([pd.Timestamp("2026-07-25 10:15", tz="UTC")]),
     )
+    # Raw output is inert; only a confirmed replacement may supersede.
     status = ledger.update(pred2, ohlc)
+    assert status["closed_trades"] == 3
+    assert ledger._open is not None and ledger._open["zone"] == "zone1"
+    status = ledger.apply_lifecycle([confirmed_event(pred2, "signal-2")], ohlc)
     assert status["closed_trades"] == 4
-    assert status["last_closed"]["exit_reason"] == "superseded_by_new_setup"
+    assert status["last_closed"]["exit_reason"] == "superseded_by_confirmed_setup"
     assert ledger._open is not None and ledger._open["zone"] == "zone2"
 
 
@@ -189,7 +213,7 @@ def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
         entry=65000.0,
         **base,
     )
-    ledger.update(pred1)
+    ledger.apply_lifecycle([confirmed_event(pred1, "signal-1")])
     assert ledger._open is not None and ledger._open["entry"] == 65000.0
 
     # Same setup re-emitted each minute with drifting prices: no churn.
@@ -203,15 +227,18 @@ def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
         assert status["closed_trades"] == 3
         assert ledger._open is not None and ledger._open["entry"] == 65000.0
 
-    # A new sweep on the same zone is a genuinely new setup.
+    # A raw new sweep remains inert until lifecycle confirmation.
     pred_new_sweep = PredictorOutput(
         timestamp=pd.Timestamp("2026-07-25 10:05", tz="UTC"),
         entry=64900.0,
         **{**base, "sweep_time": "2026-07-25 10:03:00+00:00"},
     )
     status = ledger.update(pred_new_sweep)
+    assert status["closed_trades"] == 3
+    assert ledger._open is not None and ledger._open["entry"] == 65000.0
+    status = ledger.apply_lifecycle([confirmed_event(pred_new_sweep, "signal-2")])
     assert status["closed_trades"] == 4
-    assert status["last_closed"]["exit_reason"] == "superseded_by_new_setup"
+    assert status["last_closed"]["exit_reason"] == "superseded_by_confirmed_setup"
     assert ledger._open is not None and ledger._open["entry"] == 64900.0
 
 
@@ -301,8 +328,8 @@ def test_pending_retrace_order_waits_for_a_real_limit_touch(tmp_path):
     assert status["open_position"]["entry"] == 95.0
 
 
-def test_paper_ledger_neutral_exit_and_unrealized_pnl(tmp_path):
-    """Neutral grace closes a dead thesis and reports mark-to-market P&L."""
+def test_paper_ledger_lifecycle_neutral_exit_and_unrealized_pnl(tmp_path):
+    """Lifecycle neutralization closes a dead thesis; raw neutral is inert."""
     ledger = PaperLedger(tmp_path / "ledger.json", neutral_exit_observations=3)
     pred_open = PredictorOutput(
         timestamp=pd.Timestamp("2026-07-25 10:00", tz="UTC"),
@@ -314,7 +341,7 @@ def test_paper_ledger_neutral_exit_and_unrealized_pnl(tmp_path):
         zone="zone1",
         sweep_time="2026-07-25 09:58:00+00:00",
     )
-    ledger.update(pred_open)
+    ledger.apply_lifecycle([confirmed_event(pred_open, "signal-1")])
 
     ohlc = pd.DataFrame(
         {"open": [64900.0], "high": [64950.0], "low": [64850.0], "close": [64900.0], "volume": [1.0]},
@@ -331,15 +358,21 @@ def test_paper_ledger_neutral_exit_and_unrealized_pnl(tmp_path):
     assert status["mark_to_market_equity"] == round(status["equity"] + 100.0, 2)
 
     ledger.update(neutral(2), ohlc)
+    ledger.update(neutral(3), ohlc)
     assert ledger._open is not None
-    status = ledger.update(neutral(3), ohlc)
+    status = ledger.apply_lifecycle([{
+        "event_type": "setup_invalidated",
+        "signal_id": "signal-1",
+        "created_at": "2026-07-25T10:03:00+00:00",
+        "reason": "signal_neutralized",
+    }], ohlc)
     assert ledger._open is None
     assert status["last_closed"]["exit_reason"] == "signal_neutralized"
     assert status["last_closed"]["exit"] == 64900.0
 
     # A directional re-confirmation resets the neutral grace counter.
     ledger2 = PaperLedger(tmp_path / "ledger2.json", neutral_exit_observations=3)
-    ledger2.update(pred_open)
+    ledger2.apply_lifecycle([confirmed_event(pred_open, "signal-1")])
     ledger2.update(neutral(1), ohlc)
     ledger2.update(
         PredictorOutput(
@@ -359,7 +392,7 @@ def test_paper_ledger_neutral_exit_and_unrealized_pnl(tmp_path):
     assert ledger2._open is not None
 
 
-def test_pending_retrace_order_cancels_after_sustained_neutral(tmp_path):
+def test_pending_retrace_order_cancels_only_after_lifecycle_neutralization(tmp_path):
     ledger = PaperLedger(tmp_path / "ledger.json", neutral_exit_observations=2)
     t0 = pd.Timestamp("2026-01-01 00:00", tz="UTC")
     pending = PredictorOutput(
@@ -373,7 +406,14 @@ def test_pending_retrace_order_cancels_after_sustained_neutral(tmp_path):
         sweep_time="2026-01-01 00:00:00+00:00",
         entry_type="limit",
     )
-    ledger.update(pending)
+    ledger.apply_lifecycle([confirmed_event(pending, "signal-1")])
     ledger.update(PredictorOutput(timestamp=t0 + pd.Timedelta(minutes=1), bias="neutral"))
     status = ledger.update(PredictorOutput(timestamp=t0 + pd.Timedelta(minutes=2), bias="neutral"))
+    assert status["pending_order"] is not None
+    status = ledger.apply_lifecycle([{
+        "event_type": "setup_invalidated",
+        "signal_id": "signal-1",
+        "created_at": (t0 + pd.Timedelta(minutes=2)).isoformat(),
+        "reason": "signal_neutralized",
+    }])
     assert status["pending_order"] is None
