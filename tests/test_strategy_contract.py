@@ -23,6 +23,33 @@ def test_strategy_uses_setup_atr_checks_all_zones_and_leaves_probability_uncalib
     assert result.zone == "swept"
     assert result.stop <= result.entry - 1.5*5
     assert result.probability_tp_before_sl is not None and 0 <= result.probability_tp_before_sl <= 1
+    assert result.sweep_evaluation_status == "evaluated"
+    assert result.orderflow_evaluation_status == "evaluated"
+
+
+def test_predictor_marks_orderflow_not_evaluated_until_sweep_confirms(monkeypatch):
+    idx = pd.date_range("2025-01-01", periods=100, freq="min", tz="UTC")
+    ohlc = pd.DataFrame(
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 10.0},
+        index=idx,
+    )
+    trades = pd.DataFrame({"time": idx, "price": 100.0, "qty": 1.0, "side": "buy"})
+    frames = {"15m": ohlc.iloc[::15], "1h": ohlc.iloc[-40:], "4h": ohlc.iloc[-40:]}
+    zone = Zone("waiting", "swing", "below", 95, 96, 2, idx[1], idx[2])
+    monkeypatch.setattr(Predictor, "_regime_bias", lambda self, frames: "bullish")
+    monkeypatch.setattr("btc_predictor.strategy.build_projected_zones", lambda frame: [zone])
+    monkeypatch.setattr("btc_predictor.strategy.atr", lambda frame: pd.Series(5.0, index=frame.index))
+    monkeypatch.setattr(
+        "btc_predictor.strategy.detect_sweep",
+        lambda *args, **kwargs: {"confirmed": False, "status": "none"},
+    )
+
+    result = Predictor().predict(ohlc, trades, frames=frames, flow_source="rest_backfill")
+
+    assert result.sweep_evaluation_status == "evaluated"
+    assert result.orderflow_evaluation_status == "not_evaluated"
+    assert result.orderflow_confirmation is False
+    assert result.orderflow_reason == "awaiting_confirmed_sweep"
 
 
 def test_predictor_requires_15m_alignment_with_higher_timeframes(monkeypatch):

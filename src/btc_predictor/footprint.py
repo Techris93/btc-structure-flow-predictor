@@ -74,7 +74,7 @@ def cross_exchange_agreement(trades: pd.DataFrame, start, end, direction: str, m
 def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_time, window=100, min_score: float = 0.40):
     features=flow_features_from_bars(flow_bars,window) if flow_bars is not None and not flow_bars.empty else orderflow_features(trades,window=window)
     features=features.loc[features.index<=pd.Timestamp(decision_time)]
-    if len(features)<20: return False,{"reason":"flow_warmup","bars":len(features),"score":0.0}
+    if len(features)<20: return False,{"reason":"flow_warmup","bars":len(features),"score":0.0,"threshold":min_score}
     recent=features.loc[features.index>=pd.Timestamp(sweep_time)-pd.Timedelta(minutes=2)]
     if recent.empty:
         recent=features.tail(5)
@@ -128,7 +128,7 @@ def footprint_confirmation(trades, flow_bars, direction, sweep_time, decision_ti
     )
     confirmed = score >= min_score
     reason = "confirmed" if confirmed else "score_below_threshold"
-    return confirmed, {"reason": reason, "score": round(score, 3), "threshold": min_score,
+    return confirmed, {"reason": reason, "score": round(score, 3), "threshold": min_score, "bars": len(features),
                        "extreme": round(extreme,3), "reversal": round(reversal,3),
                        "stalled_response": round(stalled,3), "kyle_absorption": round(kyle_abs_score, 3),
                        "agreement": round(agreement,3), "imbalance": round(imbalance,3),

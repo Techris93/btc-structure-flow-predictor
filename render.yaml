@@ -44,7 +44,11 @@ services:
       - key: LIVE_WATCHDOG_CHECK_SECONDS
         value: "15"
       - key: TRADE_LOOKBACK_MINUTES
-        value: "15"
+        value: "30"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LIVE_SUMMARY_LOG_SECONDS
+        value: "300"
       - key: TRADE_RETENTION_MINUTES
         value: "120"
       - key: TRADE_QUERY_LIMIT

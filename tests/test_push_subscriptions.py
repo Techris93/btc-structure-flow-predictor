@@ -122,6 +122,59 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert "Apple accepted" not in dashboard
     assert 'lastDelivery.delivery_type === "test"' not in dashboard
     assert '" · delivered"' not in dashboard
+    assert '"Not evaluated"' in dashboard
+    assert 'id="flowlastsuccess"' in dashboard
+
+
+def test_rest_flow_cache_is_selected_without_trade_stale_coupling():
+    now = pd.Timestamp("2026-08-08 12:00", tz="UTC")
+    index = pd.date_range(end=now, periods=60, freq="min")
+    rest = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 10.0,
+            "trades": 5,
+            "taker_buy_volume": 6.0,
+        },
+        index=index,
+    )
+
+    bars, source = web_app._select_flow_baseline(pd.DataFrame(), rest, now)
+
+    assert source == "rest_backfill"
+    assert len(bars) == 60
+
+
+def test_http_get_maps_quotaguard_to_requests_proxy(monkeypatch):
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("QUOTAGUARDSTATIC_URL", "http://user:secret@proxy.example:9293")
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+    web_app._http_get("https://fapi.binance.com/fapi/v1/time")
+
+    assert captured["proxies"] == {
+        "http": "http://user:secret@proxy.example:9293",
+        "https": "http://user:secret@proxy.example:9293",
+    }
+    assert web_app._proxy_diagnostics() == {
+        "configured": True,
+        "variable": "QUOTAGUARDSTATIC_URL",
+        "provider": "quotaguard",
+        "host": "proxy.example",
+    }
 
 
 def test_healthz_is_a_side_effect_free_liveness_probe(monkeypatch):

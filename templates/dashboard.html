@@ -470,13 +470,18 @@
               <div class="row"><span>Zone</span><span id="zonekind">—</span></div>
               <div class="row"><span>Zone ID</span><span id="zone" class="mono">—</span></div>
               <div class="row"><span>Sweep</span><span id="sweep">—</span></div>
+              <div class="row"><span>Sweep evaluation</span><span id="sweepeval">—</span></div>
               <div class="row"><span>Sweep depth</span><span id="sweepdepth">—</span></div>
             </section>
 
             <section class="section">
               <h2>Order flow</h2>
               <div class="row"><span>Footprint</span><span id="flow">—</span></div>
+              <div class="row"><span>Evaluation</span><span id="floweval">—</span></div>
               <div class="row"><span>Flow reason</span><span id="flowreason">—</span></div>
+              <div class="row"><span>Flow score</span><span id="flowscore">—</span></div>
+              <div class="row"><span>Flow data</span><span id="flowsource">—</span></div>
+              <div class="row"><span>Flow last success</span><span id="flowlastsuccess">—</span></div>
               <div class="row"><span>Reward / risk</span><span id="rr">—</span></div>
               <div class="row"><span>Position size</span><span id="size">—</span></div>
               <div class="row"><span>Prob. TP before SL</span><span id="prob">—</span></div>
@@ -486,6 +491,9 @@
               <h2>Feed</h2>
               <div class="row"><span>Market feed</span><span id="feed">—</span></div>
               <div class="row"><span>Binance feed</span><span id="binancefeed">—</span></div>
+              <div class="row"><span>Binance WebSocket</span><span id="binancews">—</span></div>
+              <div class="row"><span>Bybit REST</span><span id="bybitrest">—</span></div>
+              <div class="row"><span>Proxy route</span><span id="proxyroute">—</span></div>
               <div class="row"><span>Last push</span><span id="lastpush">—</span></div>
             </section>
 
@@ -761,18 +769,34 @@
         setText("zonekind", zoneKind(x.zone_kind, x.zone));
         setText("zone", zoneIdOnly(x.zone), "mono tone-muted");
         setText("sweep", humanize(x.sweep_status));
+        setText("sweepeval", humanize(x.sweep_evaluation_status));
         setText(
           "sweepdepth",
           x.sweep_depth_atr == null ? "—" : fmtNumber(x.sweep_depth_atr, 2) + " ATR",
           "mono",
         );
 
-        setText(
-          "flow",
-          x.orderflow_confirmation ? "Confirmed" : "Unconfirmed",
-          x.orderflow_confirmation ? "tone-bullish" : "tone-neutral",
-        );
+        const flowEvaluated = x.orderflow_evaluation_status === "evaluated";
+        const flowLabel = !flowEvaluated
+          ? "Not evaluated"
+          : x.orderflow_confirmation
+            ? "Confirmed"
+            : "Unconfirmed";
+        setText("flow", flowLabel, x.orderflow_confirmation ? "tone-bullish" : "tone-neutral");
+        setText("floweval", humanize(x.orderflow_evaluation_status));
         setText("flowreason", humanize(x.orderflow_reason));
+        setText(
+          "flowscore",
+          x.orderflow_score == null
+            ? "—"
+            : fmtNumber(x.orderflow_score, 3) +
+                (x.orderflow_threshold == null ? "" : " / " + fmtNumber(x.orderflow_threshold, 2)),
+          "mono",
+        );
+        setText("flowsource", humanize(x.orderflow_source));
+        const dataHealth = s.data_health || {};
+        const flowHealth = dataHealth.orderflow_input || {};
+        setText("flowlastsuccess", fmtDate(flowHealth.last_successful_fetch_at), "mono tone-muted");
         setText("rr", x.reward_risk == null ? "—" : fmtNumber(x.reward_risk, 2) + "R", "mono");
         setText(
           "size",
@@ -788,6 +812,12 @@
         const feed = humanize(feedStatus) + (s.source ? " · " + sourceLabel(s.source) : "");
         setText("feed", feed);
         setText("binancefeed", humanize(s.binance_feed_mode));
+        const binanceWs = dataHealth.binance_websocket || {};
+        const bybitRest = dataHealth.bybit_rest_market || {};
+        setText("binancews", humanize(binanceWs.status));
+        setText("bybitrest", fmtDate(bybitRest.last_successful_fetch_at), "mono tone-muted");
+        const proxy = s.proxy || {};
+        setText("proxyroute", proxy.configured ? titleCaseWords(proxy.provider || "Configured") : "Direct");
         const push = s.push || {};
         const lastDelivery = push.last_automatic_delivery || {};
         if (lastDelivery.attempted_at) {

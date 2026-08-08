@@ -83,7 +83,7 @@ class Predictor:
     def _output(self,now,bias,**kwargs):
         return PredictorOutput(now,bias,regime_4h=self.last_regimes["4h"],regime_1h=self.last_regimes["1h"],setup_15m=self.last_regimes["15m"],**kwargs)
 
-    def predict(self,ohlc,trades,equity=100_000,frames=None,flow_bars=None):
+    def predict(self,ohlc,trades,equity=100_000,frames=None,flow_bars=None,flow_source=None):
         if len(ohlc)<80 or trades.empty:return PredictorOutput(ohlc.index[-1],"neutral",no_trade_reason="insufficient_history")
         o=ohlc.copy(); o.index=pd.to_datetime(o.index,utc=True); t=trades.copy(); t["time"]=pd.to_datetime(t.time,utc=True)
         frames=frames or {}; setup=frames.get("15m",o)
@@ -97,11 +97,12 @@ class Predictor:
         if not confirmed:
             waiting=[p for p in evaluated if p[1].get("status")=="waiting_reclaim"]
             z,sweep=max(waiting or evaluated,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
-            return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,no_trade_reason="sweep_not_confirmed")
+            return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,sweep_evaluation_status="evaluated",orderflow_evaluation_status="not_evaluated",orderflow_reason="awaiting_confirmed_sweep",orderflow_source=flow_source,no_trade_reason="sweep_not_confirmed")
         z,sweep=max(confirmed,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
         usable=t.loc[t.time<now]
         confirm,flow=footprint_confirmation(usable,flow_bars,bias,sweep["time"],now)
-        if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement",0.0)>0.5,no_trade_reason="orderflow_not_confirmed")
+        flow_diagnostics=dict(sweep_evaluation_status="evaluated",orderflow_evaluation_status="evaluated",orderflow_reason=flow["reason"],orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,exchange_agreement=flow.get("agreement",0.0)>0.5)
+        if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,**flow_diagnostics,no_trade_reason="orderflow_not_confirmed")
         
         # Exponential state decay calculation
         reclaim_time = pd.Timestamp(sweep.get("reclaim_time", now))
@@ -158,7 +159,7 @@ class Predictor:
                     skipped.append({"kind":candidate.kind,"mid":round(midpoint,2),"dist_atr":round(distance_atr,2) if distance_atr is not None else None})
         log.info("target_select bias=%s entry=%.2f stop=%.2f target=%.2f rr=%.2f skipped_zones=%s",bias,entry,stop,target,rr,skipped)
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
-        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],exchange_agreement=flow.get("agreement"),entry=entry,entry_type=entry_type,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
+        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],orderflow_evaluation_status="evaluated",sweep_evaluation_status="evaluated",orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,exchange_agreement=flow.get("agreement"),entry=entry,entry_type=entry_type,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob)
         if rr<self.min_rr or not np.isfinite(risk) or risk<=0:
             log.info("insufficient_reward_risk bias=%s entry=%.2f stop=%.2f target=%.2f rr=%.2f min_rr=%.2f skipped_zones=%s",bias,entry,stop,target,rr,self.min_rr,skipped)
             return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")

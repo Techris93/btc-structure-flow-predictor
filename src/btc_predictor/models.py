@@ -85,3 +85,11 @@ class PredictorOutput:
     # "market" (fill at signal price) or "limit" (pending retracement order);
     # appended last so positional constructions keep working.
     entry_type: str = "market"
+    # Stage diagnostics distinguish "not evaluated" from a genuine failed
+    # confirmation. These remain appended for positional compatibility.
+    sweep_evaluation_status: str = "not_evaluated"
+    orderflow_evaluation_status: str = "not_evaluated"
+    orderflow_score: float | None = None
+    orderflow_threshold: float | None = None
+    orderflow_bars: int | None = None
+    orderflow_source: str | None = None

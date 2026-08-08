@@ -42,6 +42,12 @@ except (AttributeError, OSError):
 
 app = Flask(__name__)
 logger = logging.getLogger("btc_predictor")
+_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger.setLevel(_log_level)
 # Late-entry guard: set RETRACE_ENTRY_ATR (e.g. "1.2") to enter deep sweeps on
 # a RETRACE_PCT pullback limit instead of at market. Empty/unset = disabled.
 _retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "").strip()
@@ -113,7 +119,7 @@ PUBLIC_BASE_URL = os.getenv(
 # The predictor only needs a short, recent trade window for footprint and
 # five-minute exchange-agreement features. Bound both the database result and
 # the retention store so pandas cannot materialize an unbounded working set.
-TRADE_LOOKBACK_MINUTES = max(5, min(15, int(os.getenv("TRADE_LOOKBACK_MINUTES", "15"))))
+TRADE_LOOKBACK_MINUTES = max(20, min(30, int(os.getenv("TRADE_LOOKBACK_MINUTES", "30"))))
 TRADE_QUERY_LIMIT = max(5_000, min(20_000, int(os.getenv("TRADE_QUERY_LIMIT", "20_000"))))
 TRADE_STORE_MAX_ROWS = max(10_000, min(40_000, int(os.getenv("TRADE_STORE_MAX_ROWS", "40_000"))))
 
@@ -158,11 +164,42 @@ BINANCE_REST_ON_STALE = os.getenv("BINANCE_REST_ON_STALE", "1").lower() in ("1",
 BINANCE_STALE_REST_MINUTES = max(1, int(os.getenv("BINANCE_STALE_REST_MINUTES", "3")))
 LIVE_WATCHDOG_MISSED_POLLS = max(2, int(os.getenv("LIVE_WATCHDOG_MISSED_POLLS", "3")))
 LIVE_WATCHDOG_CHECK_SECONDS = max(5, int(os.getenv("LIVE_WATCHDOG_CHECK_SECONDS", "15")))
+LIVE_SUMMARY_LOG_SECONDS = max(60, int(os.getenv("LIVE_SUMMARY_LOG_SECONDS", "300")))
+
+
+def _configured_proxy_url():
+    """Return the explicitly configured outbound proxy, if any.
+
+    QuotaGuard's variable isn't one Requests automatically recognizes, so it
+    must be mapped explicitly. Standard proxy variables remain supported.
+    """
+    for key in ("QUOTAGUARDSTATIC_URL", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+        value = os.getenv(key, "").strip()
+        if value:
+            return key, value
+    return None, None
+
+
+def _proxy_diagnostics():
+    key, value = _configured_proxy_url()
+    if not value:
+        return {"configured": False, "variable": None, "provider": None, "host": None}
+    host = urlparse(value).hostname
+    provider = "quotaguard" if key == "QUOTAGUARDSTATIC_URL" else "generic"
+    return {"configured": True, "variable": key, "provider": provider, "host": host}
 
 
 def _http_get(url, params=None, timeout=10):
     headers = {"User-Agent": BINANCE_USER_AGENT, "Accept": "application/json"}
-    response = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
+    _, proxy_url = _configured_proxy_url()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    response = requests.get(
+        url,
+        params=params or {},
+        headers=headers,
+        timeout=timeout,
+        proxies=proxies,
+    )
     response.raise_for_status()
     return response
 
@@ -1044,6 +1081,16 @@ def _release_transient_memory():
             logger.debug("malloc_trim unavailable", exc_info=True)
 
 
+def _select_flow_baseline(ws_flow, rest_flow, decision_time):
+    """Choose a fresh flow baseline independently of raw-trade freshness."""
+    decision_time = pd.Timestamp(decision_time)
+    if ws_flow is not None and len(ws_flow) >= 2 and ws_flow.index[-1] >= decision_time - pd.Timedelta(minutes=3):
+        return ws_flow.loc[ws_flow.index <= decision_time], "websocket"
+    if rest_flow is not None and not rest_flow.empty and rest_flow.index[-1] >= decision_time - pd.Timedelta(minutes=2):
+        return rest_flow.loc[rest_flow.index <= decision_time], "rest_backfill"
+    return None, None
+
+
 def _live_loop_diagnostics():
     """Return in-memory loop health without acquiring application or DB locks."""
     now = time.monotonic()
@@ -1113,8 +1160,22 @@ def _live_loop():
     global live_loop_started_monotonic
     binance_rest_retry_at = pd.Timestamp(0, tz="UTC")
     flow_bars_cache = None
-    binance_rest_last_ok_at = None
-    binance_rest_last_error = None
+    persisted_state = live_state_store.read({})
+    def persisted_timestamp(key):
+        value = persisted_state.get(key)
+        try:
+            return pd.Timestamp(value) if value else None
+        except (TypeError, ValueError):
+            return None
+    binance_rest_last_ok_at = persisted_timestamp("binance_rest_last_ok_at")
+    binance_rest_last_error = persisted_state.get("binance_rest_last_error")
+    binance_flow_last_ok_at = persisted_timestamp("binance_flow_last_ok_at")
+    binance_flow_last_error = persisted_state.get("binance_flow_last_error")
+    bybit_rest_last_ok_at = persisted_timestamp("bybit_rest_last_ok_at")
+    bybit_rest_last_error = persisted_state.get("bybit_rest_last_error")
+    flow_baseline_last_ok_at = persisted_timestamp("flow_baseline_last_ok_at")
+    orderflow_input_last_ok_at = persisted_timestamp("orderflow_input_last_ok_at")
+    last_summary_log_at = pd.Timestamp(0, tz="UTC")
     while True:
         try:
             poll_started = pd.Timestamp.now(tz="UTC")
@@ -1126,6 +1187,8 @@ def _live_loop():
             with live_lock: live_state.update({"status":"polling","updated_at":poll_started.isoformat()})
             _set_live_loop_phase("fetching_bybit")
             ohlc, recent, frames = _bybit_data(); sources = "bybit"; trade_store.append(recent)
+            bybit_rest_last_ok_at = poll_started
+            bybit_rest_last_error = None
             _set_live_loop_phase("checking_binance")
             binance_latest = trade_store.exchange_latest("binance")
             binance_lag = None
@@ -1170,7 +1233,10 @@ def _live_loop():
                     # (klines cost weight ~2 for limit<=500; still a tiny share of 2400/min).
                     try:
                         flow_bars_cache = _binance_flow_bars()
+                        binance_flow_last_ok_at = poll_started
+                        binance_flow_last_error = None
                     except Exception as exc:
+                        binance_flow_last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
                         logger.warning("Binance REST flow baseline unavailable: %s", exc)
                 except Exception as exc:
                     base_min = BINANCE_REST_MINUTES if BINANCE_REST_ENABLED else BINANCE_STALE_REST_MINUTES
@@ -1187,34 +1253,38 @@ def _live_loop():
                 limit=TRADE_QUERY_LIMIT,
                 include_trade_id=False,
             )
+            raw_flow_feature_bars = (
+                int(pd.to_datetime(trades.time, utc=True).dt.ceil("1min").nunique())
+                if not trades.empty and "time" in trades
+                else 0
+            )
             flow_bars=None
             recent_trades=trades.loc[trades.time>=now-pd.Timedelta(minutes=2)] if "time" in trades else trades
             available_exchanges=set(recent_trades.exchange.astype(str)) if "exchange" in recent_trades else set()
             sources="+".join(exchange for exchange in ("bybit","binance") if exchange in available_exchanges) or sources
-            # Prefer durable store timestamps when collector latest is empty/stale.
             store_stats = trade_store.stats()
-            for exchange, values in trade_store.collector_status().items():
-                store_latest = (store_stats.get(exchange) or {}).get("latest")
-                if store_latest and (not values.get("latest") or str(store_latest) > str(values.get("latest"))):
-                    trade_store.set_collector_status(exchange, latest=store_latest)
             collectors = trade_store.collector_status(poll_started, COLLECTOR_STALE_SECONDS)
             # Flow baseline: prefer WebSocket-derived Binance 1m klines (aggTrade
             # deltas + kline taker-buy volume arrive on the same connection).
             # REST klines remain an explicit fallback only.
             ws_flow = trade_store.flow_bars_df("binance", limit=180)
-            if len(ws_flow) >= 2 and ws_flow.index[-1] >= now - pd.Timedelta(minutes=3):
-                flow_bars = ws_flow.loc[ws_flow.index <= now]
-                flow_source = "websocket"
-            elif (BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_stale)) and flow_bars_cache is not None and not flow_bars_cache.empty:
-                if flow_bars_cache is not None and not flow_bars_cache.empty and flow_bars_cache.index[-1] >= now - pd.Timedelta(minutes=2):
-                    flow_bars = flow_bars_cache.loc[flow_bars_cache.index <= now]
-                    flow_source = "rest_backfill"
-                else:
-                    flow_source = None
-            else:
-                flow_source = None
+            # A successfully fetched REST flow cache remains valid regardless
+            # of the separate raw-trade freshness test. The old coupling
+            # discarded valid bars on most polls.
+            flow_bars, flow_source = _select_flow_baseline(ws_flow, flow_bars_cache, now)
+            if flow_source:
+                flow_baseline_last_ok_at = poll_started
+            if flow_source or raw_flow_feature_bars >= 20:
+                orderflow_input_last_ok_at = poll_started
             _set_live_loop_phase("predicting")
-            result = predictor.predict(ohlc, trades, 100_000, frames=frames, flow_bars=flow_bars)
+            result = predictor.predict(
+                ohlc,
+                trades,
+                100_000,
+                frames=frames,
+                flow_bars=flow_bars,
+                flow_source=flow_source or "recent_trades_fallback",
+            )
             _set_live_loop_phase("updating_paper")
             paper_status = paper_ledger.update(result, ohlc)
             notification_now = pd.Timestamp.now(tz="UTC")
@@ -1251,8 +1321,56 @@ def _live_loop():
                 _retry_unacknowledged_pushes(now)
             except Exception as exc:
                 logger.warning("Web Push acknowledgement retry failed: %s", exc)
-            stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
+            bybit_pipeline_ok = not (collectors.get("bybit") or {}).get("stale", True)
+            binance_pipeline_ok = (
+                binance_lag is not None
+                and binance_lag <= COLLECTOR_STALE_SECONDS
+                and flow_source is not None
+            )
+            stale_exchanges = []
+            if not bybit_pipeline_ok:
+                stale_exchanges.append("bybit")
+            if not binance_pipeline_ok:
+                stale_exchanges.append("binance")
             feed_status = "degraded" if stale_exchanges else "live"
+            data_health = {
+                "bybit_rest_market": {
+                    "status": "ok" if bybit_rest_last_ok_at else "never_succeeded",
+                    "last_successful_fetch_at": bybit_rest_last_ok_at.isoformat() if bybit_rest_last_ok_at else None,
+                    "last_error": bybit_rest_last_error,
+                },
+                "bybit_websocket_trades": {
+                    "status": "ok" if bybit_pipeline_ok else "stale",
+                    "last_successful_fetch_at": (collectors.get("bybit") or {}).get("last_message_at"),
+                    "last_error": (collectors.get("bybit") or {}).get("error"),
+                },
+                "binance_websocket": {
+                    "status": "ok" if binance_ws_fresh else "stale_or_silent",
+                    "last_successful_fetch_at": binance_ws_last,
+                    "last_kline_at": (collectors.get("binance") or {}).get("latest_kline_at"),
+                    "last_error": (collectors.get("binance") or {}).get("error"),
+                },
+                "binance_rest_backfill": {
+                    "status": "ok" if binance_rest_last_ok_at and not binance_rest_last_error else ("error" if binance_rest_last_error else "not_used"),
+                    "last_successful_fetch_at": binance_rest_last_ok_at.isoformat() if binance_rest_last_ok_at else None,
+                    "last_error": binance_rest_last_error,
+                },
+                "binance_flow_baseline": {
+                    "status": "ok" if flow_source else "unavailable",
+                    "source": flow_source,
+                    "last_successful_fetch_at": flow_baseline_last_ok_at.isoformat() if flow_baseline_last_ok_at else None,
+                    "last_rest_fetch_at": binance_flow_last_ok_at.isoformat() if binance_flow_last_ok_at else None,
+                    "last_error": binance_flow_last_error,
+                },
+                "orderflow_input": {
+                    "status": "ok" if flow_source or raw_flow_feature_bars >= 20 else "warmup",
+                    "source": flow_source or "recent_trades_fallback",
+                    "feature_bars": len(flow_bars) if flow_bars is not None else raw_flow_feature_bars,
+                    "minimum_feature_bars": 20,
+                    "last_successful_fetch_at": orderflow_input_last_ok_at.isoformat() if orderflow_input_last_ok_at else None,
+                    "last_error": None,
+                },
+            }
             next_state = {
                 "status": feed_status,
                 "source": sources,
@@ -1264,6 +1382,14 @@ def _live_loop():
                 "binance_data_path": binance_data_path,
                 "binance_rest_last_ok_at": binance_rest_last_ok_at.isoformat() if binance_rest_last_ok_at else None,
                 "binance_rest_last_error": binance_rest_last_error,
+                "binance_flow_last_ok_at": binance_flow_last_ok_at.isoformat() if binance_flow_last_ok_at else None,
+                "binance_flow_last_error": binance_flow_last_error,
+                "bybit_rest_last_ok_at": bybit_rest_last_ok_at.isoformat() if bybit_rest_last_ok_at else None,
+                "bybit_rest_last_error": bybit_rest_last_error,
+                "flow_baseline_last_ok_at": flow_baseline_last_ok_at.isoformat() if flow_baseline_last_ok_at else None,
+                "orderflow_input_last_ok_at": orderflow_input_last_ok_at.isoformat() if orderflow_input_last_ok_at else None,
+                "data_health": data_health,
+                "proxy": _proxy_diagnostics(),
                 "collectors": collectors,
                 "stale_exchanges": stale_exchanges,
                 "updated_at": now.isoformat(),
@@ -1276,11 +1402,29 @@ def _live_loop():
             live_loop_last_error_at = None
             live_loop_last_error = None
             _set_live_loop_phase("sleeping")
+            if (now - last_summary_log_at).total_seconds() >= LIVE_SUMMARY_LOG_SECONDS:
+                logger.info(
+                    "live_poll_complete feed=%s source=%s flow_source=%s bias=%s reason=%s sweep=%s flow_eval=%s flow_score=%s binance_path=%s proxy=%s rss_mb=%s",
+                    feed_status,
+                    sources,
+                    flow_source,
+                    result.bias,
+                    result.no_trade_reason,
+                    result.sweep_status,
+                    result.orderflow_evaluation_status,
+                    result.orderflow_score,
+                    binance_data_path,
+                    _proxy_diagnostics().get("provider") or "direct",
+                    _process_rss_mb(),
+                )
+                last_summary_log_at = now
         except Exception as exc:
             logger.exception("Live market poll failed")
             error_at = pd.Timestamp.now(tz="UTC")
             live_loop_last_error_at = error_at.isoformat()
             live_loop_last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if live_loop_phase == "fetching_bybit":
+                bybit_rest_last_error = live_loop_last_error
             _set_live_loop_phase("failed")
             with live_lock: live_state.update({"status":"degraded","error":str(exc),"updated_at":pd.Timestamp.now(tz="UTC").isoformat()})
         finally:
@@ -1511,15 +1655,11 @@ def health():
     # to decide whether the process is alive.
     with live_lock: state = dict(live_state)
     collectors = trade_store.collector_status(pd.Timestamp.now(tz="UTC"), COLLECTOR_STALE_SECONDS)
-    # Prefer durable store timestamps when collector latest is empty.
     store_stats = trade_store.stats()
-    for exchange, values in collectors.items():
-        if not values.get("latest"):
-            store_latest = (store_stats.get(exchange) or {}).get("latest")
-            if store_latest:
-                trade_store.set_collector_status(exchange, latest=store_latest)
-    collectors = trade_store.collector_status(pd.Timestamp.now(tz="UTC"), COLLECTOR_STALE_SECONDS)
-    stale_exchanges = [name for name, values in collectors.items() if values.get("stale")]
+    # `collectors` describes WebSocket health only. Durable REST-backfilled
+    # timestamps remain in `trade_store`; never merge them into the collector
+    # object or a silent socket will look healthy.
+    stale_exchanges = list(state.get("stale_exchanges") or [])
     last_automatic_delivery = _latest_delivery_summary("automatic")
     last_test_delivery = _latest_delivery_summary("test")
     last_notification_decision = _latest_push_decision()
@@ -1538,6 +1678,8 @@ def health():
         "live_loop_owner":live_thread_started,
         "live_thread_alive":bool(live_thread and live_thread.is_alive()),
         "live_loop": _live_loop_diagnostics(),
+        "data_health": state.get("data_health") or {},
+        "proxy": state.get("proxy") or _proxy_diagnostics(),
         "push":{
             "supported":webpush is not None,
             "single_installation":PUSH_SINGLE_INSTALLATION,

@@ -17,6 +17,15 @@ import pandas as pd
 logger = logging.getLogger("btc_predictor.trade_store")
 
 
+def _configured_ws_proxy():
+    """Map QuotaGuard and standard proxy variables to websockets explicitly."""
+    for key in ("QUOTAGUARDSTATIC_URL", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return None
+
+
 class TradeStore:
     """Small durable rolling store shared by REST bootstrap and WebSocket collectors."""
 
@@ -285,7 +294,13 @@ async def _binance(store):
     delay = base_delay
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=30,
+                open_timeout=10,
+                proxy=_configured_ws_proxy() or True,
+            ) as ws:
                 store.set_collector_status("binance", connected=True, mode=mode, error=None)
                 delay = base_delay  # reset after a healthy connect
                 while True:
@@ -386,7 +401,12 @@ async def _bybit(store):
     buffer = _BufferedAppender(store, flush_every=200, flush_seconds=1.0)
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=30,
+                proxy=_configured_ws_proxy() or True,
+            ) as ws:
                 store.set_collector_status("bybit", connected=True, mode=mode, error=None)
                 await ws.send(json.dumps({"op": "subscribe", "args": ["publicTrade.BTCUSDT"]}))
                 async for message in ws:
