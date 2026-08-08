@@ -1366,6 +1366,11 @@ def _live_loop():
             binance_stale = binance_lag is None or binance_lag > COLLECTOR_STALE_SECONDS
             proxy_diagnostics = _proxy_diagnostics()
             proxy_blocked = bool(proxy_diagnostics.get("required") and not proxy_diagnostics.get("configured"))
+            if proxy_blocked:
+                # Keep historical success timestamps for auditability, but do
+                # not let them make a currently blocked pipeline look healthy.
+                binance_rest_last_error = "proxy_not_configured"
+                binance_flow_last_error = "proxy_not_configured"
             # Prefer WebSocket collectors. REST is rare:
             # - always-on only when BINANCE_REST_ENABLED=1
             # - or emergency stale recovery when BINANCE_REST_ON_STALE=1 and WS is stale
@@ -1554,16 +1559,24 @@ def _live_loop():
                     "proxy_configured": (collectors.get("binance") or {}).get("proxy_configured", proxy_diagnostics.get("configured")),
                 },
                 "binance_rest_backfill": {
-                    "status": "ok" if binance_rest_last_ok_at and not binance_rest_last_error else ("error" if binance_rest_last_error else "not_used"),
+                    "status": (
+                        "proxy_not_configured"
+                        if proxy_blocked
+                        else "ok"
+                        if binance_rest_last_ok_at and not binance_rest_last_error
+                        else "error"
+                        if binance_rest_last_error
+                        else "not_used"
+                    ),
                     "last_successful_fetch_at": binance_rest_last_ok_at.isoformat() if binance_rest_last_ok_at else None,
                     "last_error": binance_rest_last_error,
                 },
                 "binance_flow_baseline": {
-                    "status": "ok" if flow_source else "unavailable",
+                    "status": "proxy_not_configured" if proxy_blocked else "ok" if flow_source else "unavailable",
                     "source": flow_source,
                     "last_successful_fetch_at": flow_baseline_last_ok_at.isoformat() if flow_baseline_last_ok_at else None,
                     "last_rest_fetch_at": binance_flow_last_ok_at.isoformat() if binance_flow_last_ok_at else None,
-                    "last_error": binance_flow_last_error,
+                    "last_error": "proxy_not_configured" if proxy_blocked else binance_flow_last_error,
                 },
                 "orderflow_input": {
                     "status": "ok" if flow_source or raw_flow_feature_bars >= 20 else "warmup",
