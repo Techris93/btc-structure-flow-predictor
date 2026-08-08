@@ -84,6 +84,8 @@ live_loop_watchdog_thread = None
 live_loop_started_monotonic = None
 live_loop_phase = "not_started"
 live_loop_phase_at = None
+binance_pipeline_alerted = False
+push_dispatch_alerted = False
 
 subscription_store = JsonStore(data_dir / "push_subscriptions.json")
 push_delivery_store = JsonStore(data_dir / "push_delivery.json")
@@ -169,6 +171,11 @@ BINANCE_STALE_REST_MINUTES = max(1, int(os.getenv("BINANCE_STALE_REST_MINUTES", 
 LIVE_WATCHDOG_MISSED_POLLS = max(2, int(os.getenv("LIVE_WATCHDOG_MISSED_POLLS", "3")))
 LIVE_WATCHDOG_CHECK_SECONDS = max(5, int(os.getenv("LIVE_WATCHDOG_CHECK_SECONDS", "15")))
 LIVE_SUMMARY_LOG_SECONDS = max(60, int(os.getenv("LIVE_SUMMARY_LOG_SECONDS", "300")))
+BINANCE_WS_STALE_ALERT_SECONDS = max(
+    COLLECTOR_STALE_SECONDS,
+    int(os.getenv("BINANCE_WS_STALE_ALERT_SECONDS", str(COLLECTOR_STALE_SECONDS))),
+)
+PUSH_LAG_ALERT_SECONDS = max(60, int(os.getenv("PUSH_LAG_ALERT_SECONDS", "300")))
 
 
 def _configured_proxy_url():
@@ -177,7 +184,13 @@ def _configured_proxy_url():
     QuotaGuard's variable isn't one Requests automatically recognizes, so it
     must be mapped explicitly. Standard proxy variables remain supported.
     """
-    for key in ("QUOTAGUARDSTATIC_URL", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+    for key in (
+        "BINANCE_WS_PROXY_URL",
+        "QUOTAGUARDSTATIC_URL",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+    ):
         value = os.getenv(key, "").strip()
         if value:
             return key, value
@@ -186,16 +199,62 @@ def _configured_proxy_url():
 
 def _proxy_diagnostics():
     key, value = _configured_proxy_url()
+    market_type = os.getenv("MARKET_TYPE", "linear").lower()
+    render_runtime = any(
+        os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+        or os.getenv(name, "").strip()
+        for name in ("RENDER", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID")
+    )
+    required = os.getenv(
+        "BINANCE_PROXY_REQUIRED",
+        "1" if market_type == "linear" and render_runtime else "0",
+    ).lower() in ("1", "true", "yes", "on")
     if not value:
-        return {"configured": False, "variable": None, "provider": None, "host": None}
+        return {
+            "configured": False,
+            "required": required,
+            "status": "missing_required" if required else "not_configured",
+            "variable": None,
+            "provider": None,
+            "host": None,
+        }
     host = urlparse(value).hostname
-    provider = "quotaguard" if key == "QUOTAGUARDSTATIC_URL" else "generic"
-    return {"configured": True, "variable": key, "provider": provider, "host": host}
+    provider = (
+        "quotaguard"
+        if key == "QUOTAGUARDSTATIC_URL"
+        else "binance_proxy"
+        if key == "BINANCE_WS_PROXY_URL"
+        else "generic"
+    )
+    return {
+        "configured": True,
+        "required": required,
+        "status": "configured",
+        "variable": key,
+        "provider": provider,
+        "host": host,
+    }
+
+
+def _binance_proxy_required():
+    market_type = os.getenv("MARKET_TYPE", "linear").lower()
+    render_runtime = any(
+        os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+        or os.getenv(name, "").strip()
+        for name in ("RENDER", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID")
+    )
+    default = "1" if market_type == "linear" and render_runtime else "0"
+    return os.getenv("BINANCE_PROXY_REQUIRED", default).lower() in (
+        "1", "true", "yes", "on"
+    )
 
 
 def _http_get(url, params=None, timeout=10):
     headers = {"User-Agent": BINANCE_USER_AGENT, "Accept": "application/json"}
     _, proxy_url = _configured_proxy_url()
+    hostname = (urlparse(url).hostname or "").lower()
+    if hostname in {"fapi.binance.com", "fstream.binance.com"} and _binance_proxy_required() and not proxy_url:
+        raise RuntimeError("binance_proxy_required_but_not_configured")
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     response = requests.get(
         url,
@@ -488,6 +547,22 @@ def _latest_delivery_summary(delivery_type):
         **counts,
         "sent": counts["accepted"],
         "subscriptions": counts["attempted"],
+        "accepted_at": max(
+            (event.get("accepted_at") for event in batch if event.get("accepted_at")),
+            default=None,
+        ),
+        "received_at": max(
+            (event.get("received_at") for event in batch if event.get("received_at")),
+            default=None,
+        ),
+        "notification_created_at": max(
+            (
+                event.get("notification_created_at")
+                for event in batch
+                if event.get("notification_created_at")
+            ),
+            default=None,
+        ),
         "error": errors[-1] if errors else None,
     }
 
@@ -687,6 +762,86 @@ def _signal_lifecycle_status():
         "invalidation_observations": SIGNAL_INVALIDATION_OBSERVATIONS,
         "bias_confirmation_observations": BIAS_CONFIRM_OBSERVATIONS,
     }
+
+
+def _push_dispatch_diagnostics(now=None):
+    """Distinguish an idle event queue from a stalled push dispatcher."""
+    now = pd.Timestamp(now or _utcnow())
+    queue = _signal_queue_state()
+    pending = list(queue.get("pending") or [])
+    oldest = None
+    for item in pending:
+        created = item.get("created_at")
+        if not created:
+            continue
+        try:
+            timestamp = pd.Timestamp(created)
+        except (TypeError, ValueError):
+            continue
+        oldest = timestamp if oldest is None or timestamp < oldest else oldest
+    pending_age = (
+        max(0.0, (now - oldest).total_seconds()) if oldest is not None else None
+    )
+    delivery = _latest_delivery_summary("automatic")
+    decision = _latest_push_decision()
+    if pending:
+        status = "lagging" if pending_age is not None and pending_age >= PUSH_LAG_ALERT_SECONDS else "pending"
+    elif delivery:
+        status = "idle_no_pending_event"
+    else:
+        status = "never_attempted"
+    return {
+        "status": status,
+        "pending_events": len(pending),
+        "oldest_pending_at": oldest.isoformat() if oldest is not None else None,
+        "pending_age_seconds": round(pending_age, 1) if pending_age is not None else None,
+        "last_event_at": decision.get("observed_at"),
+        "last_decision_status": decision.get("status"),
+        "last_attempt_at": delivery.get("attempted_at"),
+        "last_accepted_at": delivery.get("accepted_at"),
+        "last_received_at": delivery.get("received_at"),
+        "last_notification_created_at": delivery.get("notification_created_at"),
+        "lag_alert_threshold_seconds": PUSH_LAG_ALERT_SECONDS,
+    }
+
+
+def _pipeline_watchdog(collectors, now):
+    """Surface Binance and push stalls as transition-based error logs."""
+    global binance_pipeline_alerted, push_dispatch_alerted
+    binance = (collectors or {}).get("binance") or {}
+    lag_seconds = binance.get("lag_seconds")
+    binance_stale = (
+        bool(binance.get("stale"))
+        or lag_seconds is None
+        or float(lag_seconds) > BINANCE_WS_STALE_ALERT_SECONDS
+    )
+    if binance_stale and not binance_pipeline_alerted:
+        binance_pipeline_alerted = True
+        logger.error(
+            "Binance pipeline alert: stale_or_silent lag=%ss error=%s proxy_required=%s proxy_configured=%s",
+            binance.get("lag_seconds"),
+            binance.get("error"),
+            binance.get("proxy_required"),
+            binance.get("proxy_configured"),
+        )
+    elif not binance_stale and binance_pipeline_alerted:
+        binance_pipeline_alerted = False
+        logger.info("Binance pipeline alert cleared: heartbeat recovered")
+
+    push = _push_dispatch_diagnostics(now)
+    push_lagging = push["status"] == "lagging"
+    if push_lagging and not push_dispatch_alerted:
+        push_dispatch_alerted = True
+        logger.error(
+            "Push dispatcher alert: pending event age=%ss threshold=%ss decision=%s",
+            push.get("pending_age_seconds"),
+            PUSH_LAG_ALERT_SECONDS,
+            push.get("last_decision_status"),
+        )
+    elif not push_lagging and push_dispatch_alerted:
+        push_dispatch_alerted = False
+        logger.info("Push dispatcher alert cleared: queue is no longer lagging")
+    return push
 
 
 def _paper_exit_event_id(trade):
@@ -1209,6 +1364,8 @@ def _live_loop():
                     binance_ws_ts = binance_ws_ts.tz_localize("UTC")
                 binance_ws_fresh = (poll_started - binance_ws_ts).total_seconds() <= COLLECTOR_STALE_SECONDS
             binance_stale = binance_lag is None or binance_lag > COLLECTOR_STALE_SECONDS
+            proxy_diagnostics = _proxy_diagnostics()
+            proxy_blocked = bool(proxy_diagnostics.get("required") and not proxy_diagnostics.get("configured"))
             # Prefer WebSocket collectors. REST is rare:
             # - always-on only when BINANCE_REST_ENABLED=1
             # - or emergency stale recovery when BINANCE_REST_ON_STALE=1 and WS is stale
@@ -1219,8 +1376,19 @@ def _live_loop():
             poll_seconds = _live_poll_interval_seconds()
             binance_backfill_due = binance_lag is None or binance_lag > poll_seconds
             rest_due = poll_started >= binance_rest_retry_at
-            rest_allowed = BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_backfill_due and not binance_ws_fresh)
-            binance_data_path = "websocket" if binance_ws_fresh else ("rest_backfill" if BINANCE_REST_ON_STALE else "stale")
+            rest_allowed = (
+                not proxy_blocked
+                and (BINANCE_REST_ENABLED or (BINANCE_REST_ON_STALE and binance_backfill_due and not binance_ws_fresh))
+            )
+            binance_data_path = (
+                "proxy_required"
+                if proxy_blocked
+                else "websocket"
+                if binance_ws_fresh
+                else "rest_backfill"
+                if BINANCE_REST_ON_STALE
+                else "stale"
+            )
             if rest_allowed and rest_due:
                 try:
                     inserted = trade_store.append(_binance_trades())
@@ -1340,6 +1508,7 @@ def _live_loop():
             # alerts resume next poll and retain their durable queue position.
             if not definitive_exit:
                 _dispatch_signal_event(notification_now)
+            push_dispatch_diagnostics = _pipeline_watchdog(collectors, notification_now)
             _set_live_loop_phase("pruning")
             trade_store.prune(now-pd.Timedelta(minutes=int(os.getenv("TRADE_RETENTION_MINUTES","120"))))
             now = notification_now
@@ -1371,10 +1540,18 @@ def _live_loop():
                     "last_error": (collectors.get("bybit") or {}).get("error"),
                 },
                 "binance_websocket": {
-                    "status": "ok" if binance_ws_fresh else "stale_or_silent",
+                    "status": (
+                        "ok"
+                        if binance_ws_fresh
+                        else "proxy_not_configured"
+                        if (collectors.get("binance") or {}).get("error") == "proxy_not_configured"
+                        else "stale_or_silent"
+                    ),
                     "last_successful_fetch_at": binance_ws_last,
                     "last_kline_at": (collectors.get("binance") or {}).get("latest_kline_at"),
                     "last_error": (collectors.get("binance") or {}).get("error"),
+                    "proxy_required": (collectors.get("binance") or {}).get("proxy_required", proxy_diagnostics.get("required")),
+                    "proxy_configured": (collectors.get("binance") or {}).get("proxy_configured", proxy_diagnostics.get("configured")),
                 },
                 "binance_rest_backfill": {
                     "status": "ok" if binance_rest_last_ok_at and not binance_rest_last_error else ("error" if binance_rest_last_error else "not_used"),
@@ -1415,7 +1592,8 @@ def _live_loop():
                 "flow_baseline_last_ok_at": flow_baseline_last_ok_at.isoformat() if flow_baseline_last_ok_at else None,
                 "orderflow_input_last_ok_at": orderflow_input_last_ok_at.isoformat() if orderflow_input_last_ok_at else None,
                 "data_health": data_health,
-                "proxy": _proxy_diagnostics(),
+                "proxy": proxy_diagnostics,
+                "push_dispatch": push_dispatch_diagnostics,
                 "collectors": collectors,
                 "stale_exchanges": stale_exchanges,
                 "updated_at": now.isoformat(),
@@ -1440,7 +1618,7 @@ def _live_loop():
                     result.orderflow_evaluation_status,
                     result.orderflow_score,
                     binance_data_path,
-                    _proxy_diagnostics().get("provider") or "direct",
+                    proxy_diagnostics.get("status") or "unknown",
                     _process_rss_mb(),
                 )
                 last_summary_log_at = now
@@ -1689,6 +1867,7 @@ def health():
     last_automatic_delivery = _latest_delivery_summary("automatic")
     last_test_delivery = _latest_delivery_summary("test")
     last_notification_decision = _latest_push_decision()
+    push_dispatch = _push_dispatch_diagnostics()
     push_counts = _subscription_counts()
     return jsonify({
         "status": "degraded" if stale_exchanges else "ok",
@@ -1721,6 +1900,7 @@ def health():
             "last_automatic_delivery":last_automatic_delivery,
             "last_test_delivery":last_test_delivery,
             "last_notification_decision":last_notification_decision,
+            "dispatch": push_dispatch,
         },
         "trade_store":store_stats,
         "collectors":collectors,
@@ -1738,6 +1918,7 @@ def api_live():
     last_automatic_delivery = _latest_delivery_summary("automatic")
     last_test_delivery = _latest_delivery_summary("test")
     last_notification_decision = _latest_push_decision()
+    push_dispatch = _push_dispatch_diagnostics()
     push_counts = _subscription_counts()
     return jsonify({
         "paper_only": True,
@@ -1757,6 +1938,7 @@ def api_live():
             "last_automatic_delivery": last_automatic_delivery,
             "last_test_delivery": last_test_delivery,
             "last_notification_decision": last_notification_decision,
+            "dispatch": push_dispatch,
         },
     })
 

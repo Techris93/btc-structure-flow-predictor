@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import time
 import pandas as pd
+import pytest
 
 
 def _encoded(value):
@@ -152,6 +153,7 @@ def test_http_get_maps_quotaguard_to_requests_proxy(monkeypatch):
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("QUOTAGUARDSTATIC_URL", "http://user:secret@proxy.example:9293")
+    monkeypatch.setenv("BINANCE_PROXY_REQUIRED", "1")
     captured = {}
 
     class Response:
@@ -171,10 +173,69 @@ def test_http_get_maps_quotaguard_to_requests_proxy(monkeypatch):
     }
     assert web_app._proxy_diagnostics() == {
         "configured": True,
+        "required": True,
+        "status": "configured",
         "variable": "QUOTAGUARDSTATIC_URL",
         "provider": "quotaguard",
         "host": "proxy.example",
     }
+
+
+def test_binance_proxy_is_a_hard_requirement_when_unconfigured(monkeypatch):
+    for key in ("BINANCE_WS_PROXY_URL", "QUOTAGUARDSTATIC_URL", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MARKET_TYPE", "linear")
+    monkeypatch.setenv("BINANCE_PROXY_REQUIRED", "1")
+
+    assert web_app._proxy_diagnostics()["status"] == "missing_required"
+    with pytest.raises(RuntimeError, match="binance_proxy_required_but_not_configured"):
+        web_app._http_get("https://fapi.binance.com/fapi/v1/time")
+
+
+def test_linear_proxy_requirement_defaults_to_render_only(monkeypatch):
+    for key in (
+        "BINANCE_WS_PROXY_URL",
+        "QUOTAGUARDSTATIC_URL",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "BINANCE_PROXY_REQUIRED",
+        "RENDER",
+        "RENDER_SERVICE_ID",
+        "RENDER_INSTANCE_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MARKET_TYPE", "linear")
+    assert web_app._binance_proxy_required() is False
+
+    monkeypatch.setenv("RENDER_SERVICE_ID", "srv-test")
+    assert web_app._binance_proxy_required() is True
+    assert web_app._proxy_diagnostics()["status"] == "missing_required"
+
+
+def test_push_dispatch_diagnostics_distinguish_idle_from_pending(monkeypatch, tmp_path):
+    queue_store = web_app.JsonStore(tmp_path / "queue.json")
+    decision_store = web_app.JsonStore(tmp_path / "decisions.json")
+    delivery_store = web_app.JsonStore(tmp_path / "deliveries.json")
+    monkeypatch.setattr(web_app, "signal_event_queue_store", queue_store)
+    monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
+    monkeypatch.setattr(web_app, "push_delivery_events_store", delivery_store)
+
+    idle = web_app._push_dispatch_diagnostics(pd.Timestamp("2026-08-08T12:00:00Z"))
+    assert idle["status"] == "never_attempted"
+    queue_store.write({"pending": [], "notified_ids": [], "last_generic_push_at": None})
+    delivery_store.write([{
+        "delivery_id": "d1",
+        "batch_id": "b1",
+        "delivery_type": "automatic",
+        "created_at": "2026-08-08T11:59:00Z",
+        "accepted_at": "2026-08-08T11:59:01Z",
+    }])
+    idle = web_app._push_dispatch_diagnostics(pd.Timestamp("2026-08-08T12:00:00Z"))
+    assert idle["status"] == "idle_no_pending_event"
+    queue_store.write({"pending": [{"event_id": "old", "created_at": "2026-08-08T11:50:00Z"}]})
+    lagging = web_app._push_dispatch_diagnostics(pd.Timestamp("2026-08-08T12:06:00Z"))
+    assert lagging["status"] == "lagging"
 
 
 def test_healthz_is_a_side_effect_free_liveness_probe(monkeypatch):

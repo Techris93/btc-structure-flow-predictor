@@ -59,6 +59,16 @@ services:
         value: "200"
       - key: MARKET_TYPE
         value: "linear"
+      # Render's direct Binance futures WebSocket can connect without frames;
+      # require an explicit working proxy instead of silently using direct.
+      - key: BINANCE_PROXY_REQUIRED
+        value: "1"
+      - key: BINANCE_WS_HEARTBEAT_TIMEOUT_SECONDS
+        value: "35"
+      - key: BINANCE_WS_STALE_ALERT_SECONDS
+        value: "150"
+      - key: PUSH_LAG_ALERT_SECONDS
+        value: "300"
       - key: BINANCE_REST_ENABLED
         value: "0"
       - key: BINANCE_REST_ON_STALE

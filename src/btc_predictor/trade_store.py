@@ -18,12 +18,38 @@ logger = logging.getLogger("btc_predictor.trade_store")
 
 
 def _configured_ws_proxy():
-    """Map QuotaGuard and standard proxy variables to websockets explicitly."""
-    for key in ("QUOTAGUARDSTATIC_URL", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+    """Return the explicit Binance WebSocket proxy, if configured."""
+    for key in (
+        "BINANCE_WS_PROXY_URL",
+        "QUOTAGUARDSTATIC_URL",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+    ):
         value = os.getenv(key, "").strip()
         if value:
             return value
     return None
+
+
+def _binance_proxy_required(market_type: str) -> bool:
+    """Require a proxy for linear Binance on Render unless overridden.
+
+    Local development must remain usable with direct Binance futures access,
+    while the known Render egress path must fail closed when no working proxy
+    is supplied.  The explicit environment variable always wins; the runtime
+    markers are only a safe default when a Render blueprint hasn't propagated
+    the non-secret setting yet.
+    """
+    render_runtime = any(
+        os.getenv(key, "").strip().lower() in ("1", "true", "yes", "on")
+        or os.getenv(key, "").strip()
+        for key in ("RENDER", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID")
+    )
+    default = "1" if market_type == "linear" and render_runtime else "0"
+    return os.getenv("BINANCE_PROXY_REQUIRED", default).lower() in (
+        "1", "true", "yes", "on"
+    )
 
 
 class TradeStore:
@@ -291,26 +317,62 @@ async def _binance(store):
     buffer = _BufferedAppender(store, flush_every=200, flush_seconds=1.0)
     base_delay = max(5, int(os.getenv("BINANCE_WS_RECONNECT_SECONDS", "15")))
     max_delay = max(base_delay, int(os.getenv("BINANCE_WS_RECONNECT_MAX_SECONDS", "120")))
+    heartbeat_timeout = max(10, int(os.getenv("BINANCE_WS_HEARTBEAT_TIMEOUT_SECONDS", "35")))
+    proxy = _configured_ws_proxy()
+    proxy_required = _binance_proxy_required(market_type)
     delay = base_delay
     while True:
+        if market_type == "linear" and proxy_required and not proxy:
+            error = "proxy_not_configured"
+            logger.error(
+                "Binance %s WebSocket blocked: BINANCE_PROXY_REQUIRED=1 but no proxy URL is configured",
+                mode,
+            )
+            store.set_collector_status(
+                "binance",
+                connected=False,
+                mode=mode,
+                proxy_required=True,
+                proxy_configured=False,
+                error=error,
+            )
+            await asyncio.sleep(delay)
+            delay = min(max_delay, max(base_delay, delay * 2))
+            continue
         try:
             async with websockets.connect(
                 url,
                 ping_interval=20,
                 ping_timeout=30,
                 open_timeout=10,
-                proxy=_configured_ws_proxy() or True,
+                proxy=proxy,
             ) as ws:
-                store.set_collector_status("binance", connected=True, mode=mode, error=None)
+                store.set_collector_status(
+                    "binance",
+                    connected=True,
+                    mode=mode,
+                    proxy_required=proxy_required,
+                    proxy_configured=bool(proxy),
+                    error=None,
+                )
                 delay = base_delay  # reset after a healthy connect
                 while True:
                     try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=30)
+                        message = await asyncio.wait_for(ws.recv(), timeout=heartbeat_timeout)
                     except asyncio.TimeoutError:
-                        # Quiet periods should not force a reconnect (that burns the
-                        # 300-connect / 5-min budget). Keep the socket and flush.
                         buffer.flush()
-                        continue
+                        error = f"heartbeat_timeout_no_message_{heartbeat_timeout}s"
+                        logger.error("Binance %s WebSocket stale: %s", mode, error)
+                        store.set_collector_status(
+                            "binance",
+                            connected=False,
+                            mode=mode,
+                            proxy_required=proxy_required,
+                            proxy_configured=bool(proxy),
+                            error=error,
+                        )
+                        await ws.close()
+                        raise TimeoutError(error)
                     received_at = pd.Timestamp.now(tz="UTC")
                     x = json.loads(message)
                     envelope = x.get("data", x) if isinstance(x, dict) else {}
@@ -319,6 +381,8 @@ async def _binance(store):
                         "binance",
                         connected=True,
                         mode=mode,
+                        proxy_required=proxy_required,
+                        proxy_configured=bool(proxy),
                         error=None,
                         last_message_at=received_at.isoformat(),
                     )
@@ -338,6 +402,8 @@ async def _binance(store):
                             "binance",
                             connected=True,
                             mode=mode,
+                            proxy_required=proxy_required,
+                            proxy_configured=bool(proxy),
                             error=None,
                             latest=ts.isoformat(),
                         )
@@ -362,6 +428,8 @@ async def _binance(store):
                             "binance",
                             connected=True,
                             mode=mode,
+                            proxy_required=proxy_required,
+                            proxy_configured=bool(proxy),
                             error=None,
                             latest_kline_at=received_at.isoformat(),
                         )
@@ -370,6 +438,8 @@ async def _binance(store):
                             "binance",
                             connected=True,
                             mode=mode,
+                            proxy_required=proxy_required,
+                            proxy_configured=bool(proxy),
                             error=None,
                             latest_mark_price=float(envelope["p"]),
                             latest_mark_price_at=received_at.isoformat(),
@@ -381,6 +451,8 @@ async def _binance(store):
                 "binance",
                 connected=False,
                 mode=mode,
+                proxy_required=proxy_required,
+                proxy_configured=bool(proxy),
                 error=f"{type(exc).__name__}: {str(exc)[:200]}",
             )
             await asyncio.sleep(delay)
