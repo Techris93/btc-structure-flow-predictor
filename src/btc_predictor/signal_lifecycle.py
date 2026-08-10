@@ -91,6 +91,7 @@ class SignalLifecycle:
             "raw_footprint_threshold",
             "raw_footprint_confirmed",
             "raw_footprint_eligible",
+            "orderflow_fresh_exchanges",
             "flow_gate_mode",
             "flow_state",
             "setup_atr",

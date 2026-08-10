@@ -209,13 +209,21 @@ class PaperLedger:
             "reclaim_time": snapshot.get("reclaim_time"),
             "setup_atr": snapshot.get("setup_atr"),
             "probability_tp_before_sl": snapshot.get("probability_tp_before_sl"),
+            "entry_type": snapshot.get("entry_type", "market"),
         }
         if snapshot.get("entry_type", "market") == "limit":
             order["signal_time"] = order["entry_time"]
             order["pending_ttl_bars"] = 240
             self._pending = order
         else:
-            self._open = order
+            # A close-time signal cannot be filled at that same close without
+            # lookahead. Queue it for the first open strictly after the
+            # immutable decision bar.
+            order["entry_type"] = "market_next_open"
+            order["signal_time"] = order["entry_time"]
+            order["planned_entry"] = order["entry"]
+            order["planned_risk_notional"] = abs(order["entry"]-order["stop"])*order["size"]
+            self._pending = order
 
     def update(self, prediction, current_ohlc: pd.DataFrame | None = None):
         """Compatibility helper for isolated research/tests.
@@ -251,6 +259,36 @@ class PaperLedger:
         limit = pending["entry"]
         ttl = int(pending.get("pending_ttl_bars", 240))
 
+        if pending.get("entry_type") == "market_next_open":
+            if future.empty:
+                return
+            ts,bar=next(iter(future.iterrows()))
+            fill=float(bar.open)
+            risk=(fill-pending["stop"]) if side=="long" else (pending["stop"]-fill)
+            reward=(pending["target"]-fill) if side=="long" else (fill-pending["target"])
+            if risk<=0 or reward<=0:
+                logger.info(
+                    "Pending %s market signal invalidated by next-open gap: fill=%.2f stop=%.2f target=%.2f",
+                    side,fill,pending["stop"],pending["target"],
+                )
+                self._pending=None
+                return
+            planned_risk=float(pending.get("planned_risk_notional") or 0.0)
+            size=planned_risk/risk if planned_risk>0 else pending["size"]
+            self._open=dict(
+                pending,
+                entry=fill,
+                size=float(size),
+                entry_time=pd.Timestamp(ts).isoformat(),
+                filled_at=pd.Timestamp(ts).isoformat(),
+            )
+            self._pending=None
+            logger.info(
+                "Pending %s market signal filled at next open %.2f (%s)",
+                side,fill,self._open["entry_time"],
+            )
+            return
+
         for i, (ts, bar) in enumerate(future.iterrows()):
             if i >= ttl:
                 logger.info("Pending %s order at %.2f expired after %d bars without fill", side, limit, ttl)
@@ -280,7 +318,8 @@ class PaperLedger:
         ohlc_index_utc = pd.to_datetime(ohlc.index, utc=True)
         # A market signal is known only after its decision candle closes. Do
         # not let that already-completed candle retrospectively hit TP or SL.
-        future = ohlc.loc[ohlc_index_utc > entry_time]
+        include_entry_bar=self._open.get("entry_type")=="market_next_open"
+        future = ohlc.loc[ohlc_index_utc >= entry_time] if include_entry_bar else ohlc.loc[ohlc_index_utc > entry_time]
 
         if future.empty and not ohlc.empty and ohlc_index_utc[0] > entry_time:
             future = ohlc

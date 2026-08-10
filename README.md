@@ -44,7 +44,7 @@ This remains research-only: it does not place orders, and `probability_tp_before
 - ATR-bounded sweeps may reclaim over a declared 60-minute closed-1m window; a 15m zone invalidation does not truncate that already-open reclaim window.
 - Live strategy and lifecycle decisions are immutable after the first evaluation of each unique closed 1m bar; late trades are incorporated only in the next bar's decision.
 - A durable SQLite buffer receives Binance and Bybit WebSocket trades; 1m taker-buy bars provide flow baselines.
-- Market flow and raw trade-level footprint are reported independently. The legacy 0.40 composite remains the paper-entry gate unless a passed calibration artifact explicitly enables the dual gate.
+- Market flow and raw trade-level footprint are reported independently and both must clear their configured thresholds for a paper entry. The legacy composite is diagnostic-only. This mode is labelled `independent`, not calibrated, because its 0.40/0.40 thresholds are configured rather than validated.
 - Flow is observed provisionally from the closed breach bar and frozen on the closed reclaim bar; provisional observations cannot create entries.
 - Session CVD is persisted for the existing Asia, London and New York UTC windows and remains diagnostic-only.
 - Every projected zone has immutable identity plus creation, availability, expiry, touch, sweep, and invalidation state.
@@ -58,8 +58,9 @@ python research_worker.py --start 2025-07-19 --end 2026-07-19 --data-dir work/ru
 ```
 
 The two-venue Phase 2 calibration is also local-only. It downloads official
-Binance and Bybit Futures trade archives, validates complete daily coverage,
-and keeps production in shadow mode unless the locked holdout passes:
+Binance and Bybit Futures trade archives and validates complete daily coverage.
+Its result is retained as research evidence; the configured `independent` gate
+does not claim that its thresholds are calibrated:
 
 ```bash
 python -m pip install -e '.[research]'
@@ -68,9 +69,10 @@ python flow_calibration_worker.py \
   --data-dir work/runtime/flow-calibration
 ```
 
-To use a passed artifact, copy `flow_calibration.json` to the configured
-runtime path and set `FLOW_GATE_MODE=calibrated`. Missing or failed artifacts
-always fall back to `shadow`.
+To use a passed artifact instead, copy `flow_calibration.json` to the configured
+runtime path and set `FLOW_GATE_MODE=calibrated`. A missing or failed artifact
+requested as `calibrated` falls back to `shadow`; `independent` does not require
+an artifact.
 
 It downloads Binance Futures 1m candles (including taker-buy volume), derives completed 15m/1h/4h candles, and compares `reactive` and `mtf` variants over identical dates. Dataset pages, replay state, ledgers, and final results are persisted. Resume identity includes Git revision, configuration, date range, and dataset hash.
 

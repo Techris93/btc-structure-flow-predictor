@@ -81,26 +81,28 @@ def _agreement_from_deltas(deltas, direction, min_notional=1.0):
     return (agreed/total if total else 0.0),actual
 
 
-def footprint_components_from_aggregates(footprint_bars, direction, sweep_time, decision_time):
+def footprint_components_from_aggregates(footprint_bars, direction, sweep_time, decision_time, venue_freshness_seconds=150):
     """Causal raw-footprint ratio and venue agreement from closed aggregates."""
     aggregated=footprint_bars.copy() if footprint_bars is not None else pd.DataFrame()
     if aggregated.empty:
-        return {"ratio":1.0,"agreement":0.0,"deltas":{},"eligible":False,"exchanges":[]}
+        return {"ratio":1.0,"agreement":0.0,"deltas":{},"eligible":False,"exchanges":[],"fresh_exchanges":[]}
     aggregated["bar_close"]=pd.to_datetime(aggregated.bar_close,utc=True)
     sweep_open=pd.Timestamp(sweep_time)-pd.Timedelta("1min")
     aggregated=aggregated.loc[(aggregated.bar_close>sweep_open)&(aggregated.bar_close<=pd.Timestamp(decision_time))]
     if aggregated.empty:
-        return {"ratio":1.0,"agreement":0.0,"deltas":{},"eligible":False,"exchanges":[]}
+        return {"ratio":1.0,"agreement":0.0,"deltas":{},"eligible":False,"exchanges":[],"fresh_exchanges":[]}
     agreement_window=aggregated.loc[aggregated.bar_close>pd.Timestamp(decision_time)-pd.Timedelta(minutes=5)]
     deltas=(agreement_window.assign(delta=agreement_window.buy-agreement_window.sell).groupby("exchange").delta.sum().to_dict()) if not agreement_window.empty else {}
     agreement,actual=_agreement_from_deltas(deltas,direction)
+    freshness_cutoff=pd.Timestamp(decision_time)-pd.Timedelta(seconds=float(venue_freshness_seconds))
+    fresh_exchanges=sorted(str(value) for value in aggregated.loc[aggregated.bar_close>=freshness_cutoff,"exchange"].dropna().unique())
     footprint=aggregated.groupby("price_level")[["buy","sell"]].sum()
     ratio=float(((footprint.buy+1)/(footprint.sell+1)).median()) if len(footprint) else 1.0
-    return {"ratio":ratio,"agreement":float(agreement),"deltas":actual,"eligible":{"binance","bybit"}.issubset(actual),"exchanges":sorted(str(value) for value in aggregated.exchange.dropna().unique())}
+    return {"ratio":ratio,"agreement":float(agreement),"deltas":actual,"eligible":{"binance","bybit"}.issubset(actual) and {"binance","bybit"}.issubset(fresh_exchanges),"exchanges":sorted(str(value) for value in aggregated.exchange.dropna().unique()),"fresh_exchanges":fresh_exchanges}
 
 
-def _sweep_bar_trades(trades, sweep_time, decision_time, bar_freq="1min"):
-    """Return trades from the confirming bar's open through its close.
+def _sweep_window_trades(trades, sweep_time, decision_time, bar_freq="1min"):
+    """Return trades from the breach bar's open through the decision close.
 
     Candle timestamps are close times. Subtracting the bar duration makes the
     lower bound precede trades that occurred inside the sweep candle, while the
@@ -127,7 +129,8 @@ def footprint_confirmation(
     full_credit_ratio: float = 1.5,
     market_threshold: float = 0.40,
     raw_threshold: float = 0.40,
-    gate_mode: str = "shadow",
+    gate_mode: str = "independent",
+    venue_freshness_seconds: float = 150,
 ):
     features=flow_features_from_bars(flow_bars,window) if flow_bars is not None and not flow_bars.empty else orderflow_features(trades,window=window)
     features=features.loc[features.index<=pd.Timestamp(decision_time)]
@@ -137,7 +140,13 @@ def footprint_confirmation(
     elif "exchange" in trades:
         input_exchanges.update(str(value) for value in trades.exchange.dropna().unique())
     if len(features)<20: return False,{"reason":"flow_warmup","bars":len(features),"score":0.0,"threshold":min_score,"contributing_exchanges":sorted(input_exchanges),"market_flow_score":0.0,"market_flow_threshold":market_threshold,"market_flow_confirmed":False,"raw_footprint_score":0.0,"raw_footprint_threshold":raw_threshold,"raw_footprint_confirmed":False,"raw_footprint_eligible":False,"flow_gate_mode":gate_mode}
-    recent=features.loc[features.index>=pd.Timestamp(sweep_time)-pd.Timedelta(minutes=2)]
+    # Market-flow evidence begins with the first closed breach bar. Pre-breach
+    # bars provide baseline statistics inside flow_features_from_bars(), but
+    # cannot contribute confirmation evidence to this sweep episode.
+    recent=features.loc[
+        (features.index>=pd.Timestamp(sweep_time))
+        & (features.index<=pd.Timestamp(decision_time))
+    ]
     if recent.empty:
         recent=features.tail(5)
     current=features.iloc[-1]
@@ -155,15 +164,16 @@ def footprint_confirmation(
         reversal=1.0 if has_reversal else 0.0
     response_baseline=features.price_response.abs().rolling(20,min_periods=5).median().iloc[-1]
     stalled=float(min(1.0, (recent.price_response.abs()<=response_baseline).sum() / max(len(recent),1))) if np.isfinite(response_baseline) else 0.0
-    raw=_sweep_bar_trades(trades,sweep_time,decision_time)
+    raw=_sweep_window_trades(trades,sweep_time,decision_time)
     aggregated = footprint_bars.copy() if footprint_bars is not None else pd.DataFrame()
     if not aggregated.empty:
-        components=footprint_components_from_aggregates(aggregated,direction,sweep_time,decision_time)
+        components=footprint_components_from_aggregates(aggregated,direction,sweep_time,decision_time,venue_freshness_seconds)
         agreement,deltas=components["agreement"],components["deltas"]
     else:
+        breach_open=pd.Timestamp(sweep_time)-pd.Timedelta("1min")
         agreement,deltas=cross_exchange_agreement(
             trades,
-            pd.Timestamp(decision_time)-pd.Timedelta(minutes=5),
+            max(breach_open,pd.Timestamp(decision_time)-pd.Timedelta(minutes=5)),
             pd.Timestamp(decision_time),
             direction,
         )
@@ -198,12 +208,32 @@ def footprint_confirmation(
     )
     market_flow_score=market_contribution/0.80
     raw_footprint_score=0.75*imbalance+0.25*agreement
-    raw_footprint_eligible={"binance","bybit"}.issubset(deltas)
+    if not aggregated.empty:
+        fresh_exchanges=set(components.get("fresh_exchanges") or ())
+    else:
+        freshness_cutoff=pd.Timestamp(decision_time)-pd.Timedelta(seconds=float(venue_freshness_seconds))
+        fresh_exchanges=set(
+            str(value) for value in trades.loc[
+                (pd.to_datetime(trades.time,utc=True)>=freshness_cutoff)
+                & (pd.to_datetime(trades.time,utc=True)<pd.Timestamp(decision_time)),
+                "exchange",
+            ].dropna().unique()
+        ) if "exchange" in trades else set()
+    raw_footprint_eligible={"binance","bybit"}.issubset(deltas) and {"binance","bybit"}.issubset(fresh_exchanges)
     market_flow_confirmed=market_flow_score>=market_threshold
     raw_footprint_confirmed=raw_footprint_eligible and raw_footprint_score>=raw_threshold
     score = market_contribution + weights["cross_exchange"]*agreement + weights["footprint_imbalance"]*imbalance
-    confirmed = (market_flow_confirmed and raw_footprint_confirmed) if gate_mode=="calibrated" else score>=min_score
-    reason = "confirmed" if confirmed else "score_below_threshold"
+    confirmed = (market_flow_confirmed and raw_footprint_confirmed) if gate_mode in ("independent","calibrated") else score>=min_score
+    if confirmed:
+        reason="confirmed"
+    elif gate_mode in ("independent","calibrated") and not raw_footprint_eligible:
+        reason="two_venue_flow_unavailable"
+    elif gate_mode in ("independent","calibrated") and not market_flow_confirmed:
+        reason="market_flow_below_threshold"
+    elif gate_mode in ("independent","calibrated") and not raw_footprint_confirmed:
+        reason="raw_footprint_below_threshold"
+    else:
+        reason="score_below_threshold"
     contributing_exchanges=set(deltas)
     if "exchange" in raw:
         contributing_exchanges.update(str(value) for value in raw.exchange.dropna().unique())
@@ -218,10 +248,14 @@ def footprint_confirmation(
                        "agreement": round(agreement,3), "imbalance": round(imbalance,3),
                        "exchange_deltas": deltas, "agreement_status": agreement_status,
                        "contributing_exchanges": sorted(contributing_exchanges), "raw_sweep_trades": len(raw),
+                       "flow_window_start": (pd.Timestamp(sweep_time)-pd.Timedelta("1min")).isoformat(),
+                       "flow_window_end": pd.Timestamp(decision_time).isoformat(),
+                       "market_flow_window_bars":len(recent),
                        "market_flow_score": round(float(market_flow_score),3), "market_flow_threshold":market_threshold,
                        "market_flow_confirmed":bool(market_flow_confirmed),
                        "raw_footprint_score":round(float(raw_footprint_score),3), "raw_footprint_threshold":raw_threshold,
                        "raw_footprint_confirmed":bool(raw_footprint_confirmed), "raw_footprint_eligible":bool(raw_footprint_eligible),
+                       "fresh_exchanges":sorted(fresh_exchanges),
                        "raw_footprint_ratio":round(float(ratio if not footprint.empty else 1.0),6),
                        "flow_gate_mode":gate_mode,
                        "delta_z": float(current.delta_z) if np.isfinite(current.delta_z) else None,

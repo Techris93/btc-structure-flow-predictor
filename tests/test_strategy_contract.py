@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from btc_predictor.models import PredictorOutput, Zone
 from btc_predictor.strategy import Predictor
@@ -88,6 +89,12 @@ def test_paper_ledger_keeps_position_when_bias_remains_on_same_side():
         position_size=1.0,
     )
     ledger.update(pred)
+    assert ledger._pending is not None and ledger._open is None
+    fill_bar=pd.DataFrame(
+        {"open":[100.0],"high":[101.0],"low":[99.0],"close":[100.0]},
+        index=[pred.timestamp+pd.Timedelta(minutes=1)],
+    )
+    ledger.update_market(fill_bar)
     assert ledger._open is not None and ledger._open["side"] == "long"
     assert ledger._closed == []
     # Still bullish should not flip the open position
@@ -131,7 +138,7 @@ def test_paper_ledger_ignores_bars_before_entry():
         position_size=1.0,
     )
     status = ledger.update(pred, ohlc)
-    assert ledger._open is not None
+    assert ledger._open is None and ledger._pending is not None
     assert status["closed_trades"] == 0
     # After entry, a real stop should close the position.
     later = pd.DataFrame(
@@ -171,6 +178,11 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
         zone="zone1",
     )
     ledger.apply_lifecycle([confirmed_event(pred1, "signal-1")])
+    fill1=pd.DataFrame(
+        {"open":[65000.0],"high":[65050.0],"low":[64950.0],"close":[65000.0],"volume":[1.0]},
+        index=[pd.Timestamp("2026-07-25 10:01",tz="UTC")],
+    )
+    ledger.update_market(fill1)
     assert ledger._open is not None and ledger._open["zone"] == "zone1"
 
     # Test superseded by a new setup on a different zone
@@ -194,7 +206,7 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
     status = ledger.apply_lifecycle([confirmed_event(pred2, "signal-2")], ohlc)
     assert status["closed_trades"] == 4
     assert status["last_closed"]["exit_reason"] == "superseded_by_confirmed_setup"
-    assert ledger._open is not None and ledger._open["zone"] == "zone2"
+    assert ledger._open is None and ledger._pending is not None and ledger._pending["zone"] == "zone2"
 
 
 def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
@@ -214,6 +226,11 @@ def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
         **base,
     )
     ledger.apply_lifecycle([confirmed_event(pred1, "signal-1")])
+    fill=pd.DataFrame(
+        {"open":[65000.0],"high":[65050.0],"low":[64950.0],"close":[65000.0]},
+        index=[pd.Timestamp("2026-07-25 10:01",tz="UTC")],
+    )
+    ledger.update_market(fill)
     assert ledger._open is not None and ledger._open["entry"] == 65000.0
 
     # Same setup re-emitted each minute with drifting prices: no churn.
@@ -239,7 +256,7 @@ def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
     status = ledger.apply_lifecycle([confirmed_event(pred_new_sweep, "signal-2")])
     assert status["closed_trades"] == 4
     assert status["last_closed"]["exit_reason"] == "superseded_by_confirmed_setup"
-    assert ledger._open is not None and ledger._open["entry"] == 64900.0
+    assert ledger._open is None and ledger._pending is not None and ledger._pending["entry"] == 64900.0
 
 
 def test_deep_sweep_retrace_entry_is_directional_and_recomputes_rr(monkeypatch):
@@ -344,7 +361,7 @@ def test_paper_ledger_lifecycle_neutral_exit_and_unrealized_pnl(tmp_path):
     ledger.apply_lifecycle([confirmed_event(pred_open, "signal-1")])
 
     ohlc = pd.DataFrame(
-        {"open": [64900.0], "high": [64950.0], "low": [64850.0], "close": [64900.0], "volume": [1.0]},
+        {"open": [65000.0], "high": [65050.0], "low": [64850.0], "close": [64900.0], "volume": [1.0]},
         index=pd.DatetimeIndex([pd.Timestamp("2026-07-25 10:01", tz="UTC")]),
     )
     neutral = lambda minute: PredictorOutput(
@@ -408,10 +425,30 @@ def test_legacy_position_signal_binding_is_persisted_without_close(tmp_path):
     closed_before = len(ledger._closed)
 
     assert ledger.bind_active_signal("adopted-signal") is True
-    assert ledger._open["signal_id"] == "adopted-signal"
+    assert ledger._pending["signal_id"] == "adopted-signal"
     assert len(ledger._closed) == closed_before
     reloaded = PaperLedger(path)
-    assert reloaded._open["signal_id"] == "adopted-signal"
+    assert reloaded._pending["signal_id"] == "adopted-signal"
+
+
+def test_market_signal_fills_next_open_and_preserves_planned_risk(tmp_path):
+    ledger=PaperLedger(tmp_path/"ledger.json")
+    decision=pd.Timestamp("2026-01-01 00:00",tz="UTC")
+    prediction=PredictorOutput(
+        timestamp=decision,bias="bullish",entry=100.0,stop=95.0,target=110.0,
+        position_size=2.0,zone="zone1",
+    )
+    ledger.apply_lifecycle([confirmed_event(prediction,"signal-next-open")])
+    assert ledger._open is None and ledger._pending["entry_type"]=="market_next_open"
+    next_bar=pd.DataFrame(
+        {"open":[102.0],"high":[103.0],"low":[101.0],"close":[102.5]},
+        index=[decision+pd.Timedelta(minutes=1)],
+    )
+    status=ledger.update_market(next_bar)
+    assert status["pending_order"] is None
+    assert status["open_position"]["entry"]==102.0
+    assert status["open_position"]["entry_time"]==(decision+pd.Timedelta(minutes=1)).isoformat()
+    assert status["open_position"]["size"]==pytest.approx(10.0/7.0)
 
 
 def test_pending_retrace_order_cancels_only_after_lifecycle_neutralization(tmp_path):

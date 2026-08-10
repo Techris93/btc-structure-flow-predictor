@@ -57,6 +57,18 @@ services:
         value: "40000"
       - key: MAX_PROJECTED_ZONES
         value: "200"
+      # Independent market-flow and two-venue raw-footprint thresholds are
+      # entry authority. The legacy composite remains diagnostic-only.
+      - key: FLOW_GATE_MODE
+        value: independent
+      - key: MARKET_FLOW_THRESHOLD
+        value: "0.40"
+      - key: RAW_FOOTPRINT_THRESHOLD
+        value: "0.40"
+      - key: FOOTPRINT_PRICE_BUCKET
+        value: "25"
+      - key: FOOTPRINT_FULL_CREDIT_RATIO
+        value: "1.5"
       - key: MARKET_TYPE
         value: "linear"
       # Direct Binance futures is primary. A configured proxy remains optional.

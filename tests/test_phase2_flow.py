@@ -39,6 +39,37 @@ def test_shadow_mode_preserves_legacy_composite_gate():
     assert details["flow_gate_mode"]=="shadow"
 
 
+def test_independent_gate_requires_both_scores_and_two_venues():
+    bars=_flow_bars(); end=bars.index[-1]
+    trades=pd.DataFrame([
+        {"time":end-pd.Timedelta(seconds=40),"price":103,"qty":2,"side":"buy","exchange":"binance"},
+        {"time":end-pd.Timedelta(seconds=20),"price":103,"qty":2,"side":"buy","exchange":"bybit"},
+    ])
+    confirmed,details=footprint_confirmation(
+        trades,bars,"bullish",end,end,gate_mode="independent",
+        market_threshold=0.0,raw_threshold=1.1,
+    )
+    assert details["market_flow_confirmed"] is True
+    assert details["raw_footprint_confirmed"] is False
+    assert confirmed is False
+
+
+def test_independent_gate_rejects_a_present_but_stale_venue():
+    bars=_flow_bars(); end=bars.index[-1]; sweep=end-pd.Timedelta(minutes=5)
+    trades=pd.DataFrame([
+        {"time":end-pd.Timedelta(seconds=30),"price":103,"qty":2,"side":"buy","exchange":"binance"},
+        {"time":end-pd.Timedelta(minutes=3),"price":103,"qty":2,"side":"buy","exchange":"bybit"},
+    ])
+    confirmed,details=footprint_confirmation(
+        trades,bars,"bullish",sweep,end,gate_mode="independent",
+        market_threshold=0.0,raw_threshold=0.0,venue_freshness_seconds=150,
+    )
+    assert details["agreement_status"]=="cross_exchange"
+    assert details["fresh_exchanges"]==["binance"]
+    assert details["raw_footprint_eligible"] is False
+    assert confirmed is False
+
+
 def test_session_cvd_persists_resets_and_ignores_late_trade(tmp_path):
     path=tmp_path/"flow.json"; store=FlowStateStore(path)
     trades=[]
@@ -93,6 +124,78 @@ def test_calibrated_gate_requires_passed_artifact(tmp_path):
     path.write_text(json.dumps({"promotion_passed":True,"run_hash":"abc","selected_config":{"market_threshold":.5,"raw_threshold":.55,"price_bucket":50,"full_credit_ratio":2}}))
     config,_=load_flow_gate(path,"calibrated")
     assert config["gate_mode"]=="calibrated" and config["raw_threshold"]==.55 and config["artifact_run_hash"]=="abc"
+
+
+def test_independent_gate_needs_no_calibration_artifact(tmp_path):
+    config,artifact=load_flow_gate(tmp_path/"missing.json","independent")
+    assert artifact is None
+    assert config["gate_mode"]=="independent"
+    assert config["market_threshold"]==.40 and config["raw_threshold"]==.40
+
+
+def test_flow_evidence_window_excludes_pre_breach_bars(monkeypatch):
+    idx=pd.date_range("2026-01-01 00:01",periods=22,freq="min",tz="UTC")
+    features=pd.DataFrame({
+        "delta_z":[-5.0]*20+[0.0,0.0],
+        "sell_absorption":[True]*20+[False,False],
+        "buy_absorption":False,
+        "bullish_delta_reversal":False,
+        "bearish_delta_reversal":False,
+        "delta":[-100.0]*20+[0.0,0.0],
+        "price_response":0.0,
+        "low_price_impact_score":0.0,
+        "intensity_z":0.0,
+    },index=idx)
+    monkeypatch.setattr("btc_predictor.footprint.flow_features_from_bars",lambda *args,**kwargs:features)
+    sweep_time=idx[-2]; decision_time=idx[-1]
+    trades=pd.DataFrame([
+        {"time":sweep_time-pd.Timedelta(seconds=50),"price":100,"qty":1,"side":"sell","exchange":"binance"},
+        {"time":sweep_time-pd.Timedelta(seconds=40),"price":100,"qty":1,"side":"sell","exchange":"bybit"},
+        {"time":decision_time-pd.Timedelta(seconds=50),"price":101,"qty":1,"side":"buy","exchange":"binance"},
+        {"time":decision_time-pd.Timedelta(seconds=40),"price":101,"qty":1,"side":"buy","exchange":"bybit"},
+    ])
+    _,details=footprint_confirmation(
+        trades,_flow_bars(),"bullish",sweep_time,decision_time,
+        gate_mode="independent",market_threshold=0.0,raw_threshold=0.0,
+    )
+    assert details["market_flow_window_bars"]==2
+    assert details["raw_sweep_trades"]==4
+    assert details["flow_window_start"]==(sweep_time-pd.Timedelta(minutes=1)).isoformat()
+
+
+def test_predictor_recalculates_provisional_bars_but_never_repaints_frozen(monkeypatch):
+    idx=pd.date_range("2026-01-01",periods=101,freq="min",tz="UTC")
+    ohlc=pd.DataFrame({"open":100.0,"high":101.0,"low":99.0,"close":100.0,"volume":10.0},index=idx)
+    trades=pd.DataFrame({"time":idx,"price":100.0,"qty":1.0,"side":"buy","exchange":"binance"})
+    zone=Zone("episode","swing","below",95,96,2,idx[1],idx[2])
+    monkeypatch.setattr(Predictor,"_regime_bias",lambda self,frames:"bullish")
+    monkeypatch.setattr("btc_predictor.strategy.build_projected_zones",lambda frame:[zone])
+    monkeypatch.setattr("btc_predictor.strategy.atr",lambda frame:pd.Series(5.0,index=frame.index))
+    calls=[]
+    def fake_flow(*args,**kwargs):
+        calls.append(pd.Timestamp(args[4]))
+        score=.2+.1*len(calls)
+        return False,{"reason":"score_below_threshold","score":score,"threshold":.4,
+            "market_flow_score":score,"market_flow_threshold":.4,"market_flow_confirmed":False,
+            "raw_footprint_score":score,"raw_footprint_threshold":.4,"raw_footprint_confirmed":False,
+            "raw_footprint_eligible":False,"contributing_exchanges":[]}
+    monkeypatch.setattr("btc_predictor.strategy.footprint_confirmation",fake_flow)
+    frames={"15m":ohlc.iloc[::15],"1h":ohlc.iloc[-40:],"4h":ohlc.iloc[-40:]}
+    predictor=Predictor()
+    monkeypatch.setattr("btc_predictor.strategy.detect_sweep",lambda *args,**kwargs:{
+        "confirmed":False,"status":"waiting_reclaim","time":idx[-4],"depth_atr":.2,"extreme":94.0,
+    })
+    first=predictor.predict(ohlc.iloc[:-1],trades.iloc[:-1],frames=frames)
+    second=predictor.predict(ohlc,trades,frames=frames)
+    assert first.entry is None and second.entry is None and len(calls)==2
+    monkeypatch.setattr("btc_predictor.strategy.detect_sweep",lambda *args,**kwargs:{
+        "confirmed":True,"status":"confirmed","time":idx[-4],"reclaim_time":idx[-3],"depth_atr":.2,"extreme":94.0,
+    })
+    frozen1=predictor.predict(ohlc.iloc[:-1],trades.iloc[:-1],frames=frames)
+    frozen2=predictor.predict(ohlc,trades,frames=frames)
+    assert frozen1.flow_state=="frozen" and frozen2.flow_state=="frozen"
+    assert frozen1.orderflow_score==frozen2.orderflow_score
+    assert len(calls)==3
 
 
 def test_walk_forward_and_holdout_are_non_overlapping():

@@ -479,11 +479,12 @@
               <div class="row"><span>Market flow</span><span id="marketflow">—</span></div>
               <div class="row"><span>Raw footprint</span><span id="rawfootprint">—</span></div>
               <div class="row"><span>Flow state</span><span id="flowstate">—</span></div>
-              <div class="row"><span>Legacy composite gate</span><span id="flow">—</span></div>
+              <div class="row"><span>Independent gate</span><span id="flow">—</span></div>
               <div class="row"><span>Evaluation</span><span id="floweval">—</span></div>
               <div class="row"><span>Flow reason</span><span id="flowreason">—</span></div>
-              <div class="row"><span>Legacy score</span><span id="flowscore">—</span></div>
+              <div class="row"><span>Legacy composite · diagnostic</span><span id="flowscore">—</span></div>
               <div class="row"><span>Flow data</span><span id="flowsource">—</span></div>
+              <div class="row"><span>Fresh venues</span><span id="flowfresh">—</span></div>
               <div class="row"><span>Flow last success</span><span id="flowlastsuccess">—</span></div>
               <div class="row"><span>Session CVD · Binance</span><span id="cvdbinance">—</span></div>
               <div class="row"><span>Session CVD · Bybit</span><span id="cvdbybit">—</span></div>
@@ -831,6 +832,10 @@
           : "No contributing exchange";
         const transportLabel = x.orderflow_source ? humanize(x.orderflow_source) : null;
         setText("flowsource", [exchangeLabel, transportLabel].filter(Boolean).join(" · "));
+        const freshExchanges = Array.isArray(x.orderflow_fresh_exchanges)
+          ? x.orderflow_fresh_exchanges.filter(Boolean)
+          : [];
+        setText("flowfresh", freshExchanges.length ? freshExchanges.map(humanize).join(" + ") : "—");
         const dataHealth = s.data_health || {};
         const flowHealth = dataHealth.orderflow_input || {};
         setText("flowlastsuccess", fmtDate(flowHealth.last_successful_fetch_at), "mono tone-muted");

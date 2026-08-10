@@ -98,8 +98,8 @@ class PredictorOutput:
     setup_atr: float | None = None
     # Exchanges whose trades/features actually contributed to this decision.
     orderflow_exchanges: tuple[str, ...] = ()
-    # Independent Phase 2 diagnostics. Shadow mode preserves the legacy
-    # composite gate until a calibrated artifact has passed its holdout.
+    # Independent Phase 2 diagnostics. The composite remains diagnostic-only
+    # when the independent or calibrated gate is active.
     market_flow_score: float | None = None
     market_flow_threshold: float | None = None
     market_flow_confirmed: bool = False
@@ -108,7 +108,8 @@ class PredictorOutput:
     raw_footprint_threshold: float | None = None
     raw_footprint_confirmed: bool = False
     raw_footprint_eligible: bool = False
-    flow_gate_mode: str = "shadow"
+    flow_gate_mode: str = "independent"
     flow_state: str = "not_evaluated"
     session_cvd: dict[str, Any] | None = None
     sweep_observations: tuple[dict[str, Any], ...] = ()
+    orderflow_fresh_exchanges: tuple[str, ...] = ()

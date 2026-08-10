@@ -58,12 +58,13 @@ logging.basicConfig(
 )
 logger.setLevel(_log_level)
 data_dir = runtime_dir()
+COLLECTOR_STALE_SECONDS = max(30, int(os.getenv("COLLECTOR_STALE_SECONDS", "90")))
 # Late-entry guard: set RETRACE_ENTRY_ATR (e.g. "1.2") to enter deep sweeps on
 # a RETRACE_PCT pullback limit instead of at market. Empty/unset = disabled.
 _retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "").strip()
 flow_gate_config, flow_calibration_artifact = load_flow_gate(
     os.getenv("FLOW_CALIBRATION_PATH", str(data_dir / "flow_calibration.json")),
-    requested_mode=os.getenv("FLOW_GATE_MODE", "shadow"),
+    requested_mode=os.getenv("FLOW_GATE_MODE", "independent"),
     overrides={
         "legacy_threshold": float(os.getenv("ORDERFLOW_THRESHOLD", "0.40")),
         "market_threshold": float(os.getenv("MARKET_FLOW_THRESHOLD", "0.40")),
@@ -72,7 +73,7 @@ flow_gate_config, flow_calibration_artifact = load_flow_gate(
         "full_credit_ratio": float(os.getenv("FOOTPRINT_FULL_CREDIT_RATIO", "1.5")),
     },
 )
-if os.getenv("FLOW_GATE_MODE", "shadow").lower() == "calibrated" and flow_gate_config["gate_mode"] != "calibrated":
+if os.getenv("FLOW_GATE_MODE", "independent").lower() == "calibrated" and flow_gate_config["gate_mode"] != "calibrated":
     logger.warning("Calibrated flow gate requested but no passed artifact is available; remaining in shadow mode")
 predictor = Predictor(
     retrace_entry_atr=float(_retrace_atr) if _retrace_atr else None,
@@ -85,6 +86,7 @@ predictor = Predictor(
     raw_footprint_threshold=flow_gate_config["raw_threshold"],
     footprint_price_bucket=flow_gate_config["price_bucket"],
     footprint_full_credit_ratio=flow_gate_config["full_credit_ratio"],
+    venue_freshness_seconds=COLLECTOR_STALE_SECONDS,
 )
 live_lock = threading.Lock()
 push_lock = threading.Lock()
@@ -202,7 +204,6 @@ BINANCE_REST_429_DEFAULT_COOLDOWN_SECONDS = max(1.0, float(os.getenv("BINANCE_RE
 BINANCE_REST_418_DEFAULT_COOLDOWN_SECONDS = max(60.0, float(os.getenv("BINANCE_REST_418_DEFAULT_COOLDOWN_SECONDS", "600")))
 BINANCE_AGG_TRADES_WEIGHT = max(1.0, float(os.getenv("BINANCE_AGG_TRADES_WEIGHT", "20")))
 BINANCE_KLINES_WEIGHT = max(1.0, float(os.getenv("BINANCE_KLINES_WEIGHT", "2")))
-COLLECTOR_STALE_SECONDS = max(30, int(os.getenv("COLLECTOR_STALE_SECONDS", "90")))
 BINANCE_REST_ON_STALE = BINANCE_REST_GAP_RECOVERY
 LIVE_WATCHDOG_MISSED_POLLS = max(2, int(os.getenv("LIVE_WATCHDOG_MISSED_POLLS", "3")))
 LIVE_WATCHDOG_CHECK_SECONDS = max(5, int(os.getenv("LIVE_WATCHDOG_CHECK_SECONDS", "15")))

@@ -1,7 +1,7 @@
 import pandas as pd
 
 from btc_predictor.footprint import (
-    _sweep_bar_trades,
+    _sweep_window_trades,
     cross_exchange_agreement,
     footprint_confirmation,
     orderflow_features,
@@ -71,7 +71,7 @@ def test_sweep_bar_open_includes_trades_before_close_timestamp():
         ]
     )
 
-    retained = _sweep_bar_trades(trades, decision_time, decision_time)
+    retained = _sweep_window_trades(trades, decision_time, decision_time)
 
     assert len(retained) == 2
 
