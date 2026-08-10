@@ -115,6 +115,7 @@ def test_provisional_flow_cannot_create_entry(monkeypatch):
     monkeypatch.setattr("btc_predictor.strategy.footprint_confirmation",lambda *args,**kwargs:(True,{"reason":"confirmed","score":.9,"threshold":.4,"market_flow_score":.9,"market_flow_threshold":.4,"market_flow_confirmed":True,"raw_footprint_score":.9,"raw_footprint_threshold":.4,"raw_footprint_confirmed":True,"raw_footprint_eligible":True}))
     result=Predictor().predict(ohlc,trades,frames=frames)
     assert result.flow_state=="provisional" and result.orderflow_evaluation_status=="provisional"
+    assert result.orderflow_reason=="provisional_awaiting_reclaim"
     assert result.entry is None and result.orderflow_confirmation is False
 
 

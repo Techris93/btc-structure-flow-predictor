@@ -242,7 +242,9 @@ def test_bybit_supervisor_continues_when_binance_collector_dies():
                 "bybit", healthy_bybit, object(), 0.002
             )
         )
-        await asyncio.sleep(0.02)
+        deadline = asyncio.get_running_loop().time() + 0.2
+        while (calls["binance"] <= 1 or calls["bybit"] <= 5) and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.002)
         assert calls["binance"] > 1
         assert calls["bybit"] > 5
         for task in (binance_task, bybit_task):

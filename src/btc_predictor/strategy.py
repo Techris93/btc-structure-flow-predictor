@@ -67,7 +67,7 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
     if depth<min_depth:return {"status":"shallow_excursion","confirmed":False,"time":breach_time,"depth_atr":depth,"extreme":extreme}
     reclaim_time=selected.get("reclaim_time")
     if reclaim_time is None:return {"status":"waiting_reclaim","confirmed":False,"time":breach_time,"depth_atr":depth,"extreme":extreme}
-    if reclaim_time<recent.index[0] or reclaim_time>recent.index[-1]:return {"status":"expired_reclaim","confirmed":False}
+    if reclaim_time<recent.index[0] or reclaim_time>recent.index[-1]:return {"status":"expired_reclaim","confirmed":False,"time":breach_time,"reclaim_time":reclaim_time,"depth_atr":depth,"extreme":extreme}
     return {"status":"confirmed","confirmed":True,"time":breach_time,"reclaim_time":reclaim_time,"depth_atr":depth,"extreme":extreme}
 
 
@@ -84,6 +84,18 @@ def zone_reclaim_eligible(zone,at,reclaim_bars=60,bar_freq="1min"):
         return False
     invalidated_at=min(invalidation_times)
     return invalidated_at<=at<=invalidated_at+max(0,int(reclaim_bars))*pd.Timedelta(bar_freq)
+
+
+def pending_flow_reason(sweep):
+    """Describe why an episode has not reached an actionable frozen gate."""
+    status=str((sweep or {}).get("status") or "none")
+    return {
+        "none":"awaiting_sweep_breach",
+        "waiting_reclaim":"provisional_awaiting_reclaim",
+        "shallow_excursion":"sweep_depth_below_minimum",
+        "excessive_excursion":"sweep_depth_above_maximum",
+        "expired_reclaim":"sweep_reclaim_expired",
+    }.get(status,"awaiting_sweep_breach")
 
 
 class Predictor:
@@ -229,10 +241,10 @@ class Predictor:
             waiting=[p for p in flow_evaluated if p[1].get("status")=="waiting_reclaim"]
             selected=max(waiting or flow_evaluated,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
             z,sweep,_,flow=selected
-            diagnostics={}
+            diagnostics={"flow_state":"waiting_for_breach"}
             if flow is not None:
                 diagnostics=dict(orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_exchanges=tuple(flow.get("contributing_exchanges") or ()),orderflow_fresh_exchanges=tuple(flow.get("fresh_exchanges") or ()),exchange_agreement=flow.get("agreement",0.0),market_flow_score=flow.get("market_flow_score"),market_flow_threshold=flow.get("market_flow_threshold"),market_flow_confirmed=flow.get("market_flow_confirmed",False),raw_footprint_score=flow.get("raw_footprint_score"),raw_footprint_ratio=flow.get("raw_footprint_ratio"),raw_footprint_threshold=flow.get("raw_footprint_threshold"),raw_footprint_confirmed=flow.get("raw_footprint_confirmed",False),raw_footprint_eligible=flow.get("raw_footprint_eligible",False),flow_state="provisional")
-            return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,sweep_evaluation_status="evaluated",orderflow_evaluation_status="provisional" if flow is not None else "not_evaluated",orderflow_reason="awaiting_confirmed_sweep",orderflow_source=flow_source,sweep_observations=tuple(observations),**diagnostics,no_trade_reason="sweep_not_confirmed")
+            return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,sweep_evaluation_status="evaluated",orderflow_evaluation_status="provisional" if flow is not None else "not_evaluated",orderflow_reason=pending_flow_reason(sweep),orderflow_source=flow_source,sweep_observations=tuple(observations),**diagnostics,no_trade_reason="sweep_not_confirmed")
         z,sweep,confirm,flow=max(confirmed,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
         flow_diagnostics=dict(sweep_evaluation_status="evaluated",orderflow_evaluation_status="evaluated",orderflow_reason=flow["reason"],orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,orderflow_exchanges=tuple(flow.get("contributing_exchanges") or ()),orderflow_fresh_exchanges=tuple(flow.get("fresh_exchanges") or ()),exchange_agreement=flow.get("agreement",0.0),market_flow_score=flow.get("market_flow_score"),market_flow_threshold=flow.get("market_flow_threshold"),market_flow_confirmed=flow.get("market_flow_confirmed",False),raw_footprint_score=flow.get("raw_footprint_score"),raw_footprint_ratio=flow.get("raw_footprint_ratio"),raw_footprint_threshold=flow.get("raw_footprint_threshold"),raw_footprint_confirmed=flow.get("raw_footprint_confirmed",False),raw_footprint_eligible=flow.get("raw_footprint_eligible",False),flow_state="frozen",sweep_observations=tuple(observations))
         if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,**flow_diagnostics,no_trade_reason="orderflow_not_confirmed")

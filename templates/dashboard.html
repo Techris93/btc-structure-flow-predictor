@@ -789,19 +789,30 @@
         setText("zonekind", zoneKind(x.zone_kind, x.zone));
         setText("zone", zoneIdOnly(x.zone), "mono tone-muted");
         setText("sweep", humanize(x.sweep_status));
-        setText("sweepeval", humanize(x.sweep_evaluation_status));
+        setText(
+          "sweepeval",
+          x.sweep_evaluation_status === "evaluated" && x.sweep_status === "none"
+            ? "Evaluated · no breach"
+            : humanize(x.sweep_evaluation_status),
+        );
         setText(
           "sweepdepth",
           x.sweep_depth_atr == null ? "—" : fmtNumber(x.sweep_depth_atr, 2) + " ATR",
           "mono",
         );
 
+        const noSweepEpisode = x.sweep_status === "none" && !x.sweep_time;
+        const flowProvisional = x.orderflow_evaluation_status === "provisional";
         const flowEvaluated = x.orderflow_evaluation_status === "evaluated";
-        const flowLabel = !flowEvaluated
-          ? "Not evaluated"
-          : x.orderflow_confirmation
-            ? "Confirmed"
-            : "Unconfirmed";
+        const flowLabel = noSweepEpisode
+          ? "Not applicable"
+          : flowProvisional
+            ? "Provisional · cannot create entry"
+            : !flowEvaluated
+              ? "Not evaluated"
+              : x.orderflow_confirmation
+                ? "Confirmed"
+                : "Unconfirmed";
         setText("flow", flowLabel, x.orderflow_confirmation ? "tone-bullish" : "tone-neutral");
         const marketFlowLabel = x.market_flow_score == null
           ? "—"
@@ -813,8 +824,11 @@
             " · " + (!x.raw_footprint_eligible ? "Single source" : x.raw_footprint_confirmed ? "Confirmed" : "Unconfirmed");
         setText("marketflow", marketFlowLabel, x.market_flow_confirmed ? "tone-bullish" : "tone-neutral");
         setText("rawfootprint", rawFootprintLabel, x.raw_footprint_confirmed ? "tone-bullish" : "tone-neutral");
-        setText("flowstate", humanize(x.flow_state) + " · " + humanize(x.flow_gate_mode));
-        setText("floweval", humanize(x.orderflow_evaluation_status));
+        const flowStateLabel = noSweepEpisode
+          ? "Waiting for breach · " + humanize(x.flow_gate_mode)
+          : humanize(x.flow_state) + " · " + humanize(x.flow_gate_mode);
+        setText("flowstate", flowStateLabel);
+        setText("floweval", noSweepEpisode ? "Not started" : humanize(x.orderflow_evaluation_status));
         setText("flowreason", humanize(x.orderflow_reason));
         setText(
           "flowscore",
@@ -831,11 +845,17 @@
           ? sourceLabel(flowExchanges.join("+")) + (flowExchanges.length === 1 ? " only" : "")
           : "No contributing exchange";
         const transportLabel = x.orderflow_source ? humanize(x.orderflow_source) : null;
-        setText("flowsource", [exchangeLabel, transportLabel].filter(Boolean).join(" · "));
+        const flowSourceLabel = noSweepEpisode
+          ? [transportLabel ? transportLabel + " ready" : "Feed ready", "no active sweep window"].join(" · ")
+          : [exchangeLabel, transportLabel].filter(Boolean).join(" · ");
+        setText("flowsource", flowSourceLabel);
         const freshExchanges = Array.isArray(x.orderflow_fresh_exchanges)
           ? x.orderflow_fresh_exchanges.filter(Boolean)
           : [];
-        setText("flowfresh", freshExchanges.length ? freshExchanges.map(humanize).join(" + ") : "—");
+        setText(
+          "flowfresh",
+          noSweepEpisode ? "Not evaluated" : freshExchanges.length ? freshExchanges.map(humanize).join(" + ") : "—",
+        );
         const dataHealth = s.data_health || {};
         const flowHealth = dataHealth.orderflow_input || {};
         setText("flowlastsuccess", fmtDate(flowHealth.last_successful_fetch_at), "mono tone-muted");

@@ -125,6 +125,10 @@ def test_dashboard_restores_enabled_push_state_after_reload():
     assert '" · delivered"' not in dashboard
     assert '"Not evaluated"' in dashboard
     assert 'id="flowlastsuccess"' in dashboard
+    assert '"Waiting for breach · "' in dashboard
+    assert '"Provisional · cannot create entry"' in dashboard
+    assert '"no active sweep window"' in dashboard
+    assert 'noSweepEpisode ? "Not evaluated"' in dashboard
 
 
 def test_rest_flow_cache_is_selected_without_trade_stale_coupling():

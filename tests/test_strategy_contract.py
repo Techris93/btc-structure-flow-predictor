@@ -62,7 +62,8 @@ def test_predictor_marks_orderflow_not_evaluated_until_sweep_confirms(monkeypatc
     assert result.sweep_evaluation_status == "evaluated"
     assert result.orderflow_evaluation_status == "not_evaluated"
     assert result.orderflow_confirmation is False
-    assert result.orderflow_reason == "awaiting_confirmed_sweep"
+    assert result.orderflow_reason == "awaiting_sweep_breach"
+    assert result.flow_state == "waiting_for_breach"
 
 
 def test_predictor_requires_15m_alignment_with_higher_timeframes(monkeypatch):
