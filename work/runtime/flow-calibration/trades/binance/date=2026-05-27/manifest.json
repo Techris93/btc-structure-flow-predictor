@@ -1,0 +1,12 @@
+{
+  "archive_sha256": "951468f8bf04528a8bd82688bf35b402410ae78eb2f74bbaa82e2cecf3b4ad76",
+  "complete": true,
+  "date": "2026-05-27",
+  "exchange": "binance",
+  "maximum_time": "2026-05-27T23:59:59.957000+00:00",
+  "minimum_time": "2026-05-27T00:00:00.072000+00:00",
+  "minute_coverage": 1.0,
+  "parquet": "work/runtime/flow-calibration/trades/binance/date=2026-05-27/trades.parquet",
+  "rows": 1301821,
+  "source_url": "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision/data/futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-05-27.zip"
+}

@@ -1,0 +1,12 @@
+{
+  "archive_sha256": "04004dccee248ef7b098c5af643625f93b265d88dcf04b2feeba5b783545bb62",
+  "complete": true,
+  "date": "2026-06-13",
+  "exchange": "bybit",
+  "maximum_time": "2026-06-13T23:59:59.600100040+00:00",
+  "minimum_time": "2026-06-13T00:00:00.082400084+00:00",
+  "minute_coverage": 1.0,
+  "parquet": "work/runtime/flow-calibration/trades/bybit/date=2026-06-13/trades.parquet",
+  "rows": 945972,
+  "source_url": "https://s3.ap-southeast-1.amazonaws.com/public.bybit.com/trading/BTCUSDT/BTCUSDT2026-06-13.csv.gz"
+}
