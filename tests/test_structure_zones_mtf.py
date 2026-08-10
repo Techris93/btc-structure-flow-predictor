@@ -34,6 +34,32 @@ def test_zone_lifecycle_is_causal_and_ids_do_not_merge():
             assert (z.low,z.high,z.created_at,z.available_at)==(later[z.zone_id].low,later[z.zone_id].high,later[z.zone_id].created_at,later[z.zone_id].available_at)
 
 
+def test_equal_zone_tolerance_is_frozen_at_second_pivot_availability(monkeypatch):
+    idx = pd.date_range("2026-01-01 00:15", periods=12, freq="15min", tz="UTC")
+    pivots = pd.DataFrame(
+        [
+            {"pivot_time": idx[1], "available_at": idx[3], "kind": "low", "price": 100.00, "swing_id": "p"},
+            {"pivot_time": idx[3], "available_at": idx[5], "kind": "low", "price": 100.02, "swing_id": "q"},
+        ]
+    )
+
+    def fake_atr(frame):
+        values = pd.Series(1.0, index=frame.index)
+        values.loc[values.index > idx[5]] = 100.0
+        return values
+
+    monkeypatch.setattr("btc_predictor.zones.confirmed_pivots", lambda *_args, **_kwargs: pivots.copy())
+    monkeypatch.setattr("btc_predictor.zones.structure_events", lambda *_args, **_kwargs: pd.DataFrame())
+    monkeypatch.setattr("btc_predictor.zones.atr", fake_atr)
+    close = pd.Series(110.0, index=idx)
+    frame = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 10.0}, index=idx)
+
+    earlier = next(z for z in build_projected_zones(frame.iloc[:7]) if z.kind == "equal_lows")
+    later = next(z for z in build_projected_zones(frame) if z.kind == "equal_lows")
+
+    assert (earlier.low, earlier.high) == (later.low, later.high)
+
+
 def test_zone_book_includes_equal_session_profile_vwap_and_period_sources():
     idx=pd.date_range("2025-01-01 00:15",periods=10*24*4,freq="15min",tz="UTC")
     wave=pd.Series([100+(i%16) for i in range(len(idx))],index=idx)

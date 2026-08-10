@@ -476,12 +476,18 @@
 
             <section class="section">
               <h2>Order flow</h2>
-              <div class="row"><span>Footprint</span><span id="flow">—</span></div>
+              <div class="row"><span>Market flow</span><span id="marketflow">—</span></div>
+              <div class="row"><span>Raw footprint</span><span id="rawfootprint">—</span></div>
+              <div class="row"><span>Flow state</span><span id="flowstate">—</span></div>
+              <div class="row"><span>Legacy composite gate</span><span id="flow">—</span></div>
               <div class="row"><span>Evaluation</span><span id="floweval">—</span></div>
               <div class="row"><span>Flow reason</span><span id="flowreason">—</span></div>
-              <div class="row"><span>Flow score</span><span id="flowscore">—</span></div>
+              <div class="row"><span>Legacy score</span><span id="flowscore">—</span></div>
               <div class="row"><span>Flow data</span><span id="flowsource">—</span></div>
               <div class="row"><span>Flow last success</span><span id="flowlastsuccess">—</span></div>
+              <div class="row"><span>Session CVD · Binance</span><span id="cvdbinance">—</span></div>
+              <div class="row"><span>Session CVD · Bybit</span><span id="cvdbybit">—</span></div>
+              <div class="row"><span>Session CVD · Combined</span><span id="cvdcombined">—</span></div>
               <div class="row"><span>Reward / risk</span><span id="rr">—</span></div>
               <div class="row"><span>Position size</span><span id="size">—</span></div>
               <div class="row"><span>Prob. TP before SL</span><span id="prob">—</span></div>
@@ -599,6 +605,15 @@
           minimumFractionDigits: digits,
           maximumFractionDigits: digits,
         });
+      }
+
+      function fmtCompact(value) {
+        if (value == null || value === "" || Number.isNaN(Number(value))) return "—";
+        return new Intl.NumberFormat(undefined, {
+          notation: "compact",
+          maximumFractionDigits: 2,
+          signDisplay: "exceptZero",
+        }).format(Number(value));
       }
 
       function fmtPrice(value) {
@@ -787,6 +802,17 @@
             ? "Confirmed"
             : "Unconfirmed";
         setText("flow", flowLabel, x.orderflow_confirmation ? "tone-bullish" : "tone-neutral");
+        const marketFlowLabel = x.market_flow_score == null
+          ? "—"
+          : fmtNumber(x.market_flow_score, 3) + " / " + fmtNumber(x.market_flow_threshold, 2) +
+            " · " + (x.market_flow_confirmed ? "Confirmed" : "Unconfirmed");
+        const rawFootprintLabel = x.raw_footprint_score == null
+          ? "—"
+          : fmtNumber(x.raw_footprint_score, 3) + " / " + fmtNumber(x.raw_footprint_threshold, 2) +
+            " · " + (!x.raw_footprint_eligible ? "Single source" : x.raw_footprint_confirmed ? "Confirmed" : "Unconfirmed");
+        setText("marketflow", marketFlowLabel, x.market_flow_confirmed ? "tone-bullish" : "tone-neutral");
+        setText("rawfootprint", rawFootprintLabel, x.raw_footprint_confirmed ? "tone-bullish" : "tone-neutral");
+        setText("flowstate", humanize(x.flow_state) + " · " + humanize(x.flow_gate_mode));
         setText("floweval", humanize(x.orderflow_evaluation_status));
         setText("flowreason", humanize(x.orderflow_reason));
         setText(
@@ -797,10 +823,24 @@
                 (x.orderflow_threshold == null ? "" : " / " + fmtNumber(x.orderflow_threshold, 2)),
           "mono",
         );
-        setText("flowsource", humanize(x.orderflow_source));
+        const flowExchanges = Array.isArray(x.orderflow_exchanges)
+          ? x.orderflow_exchanges.filter(Boolean)
+          : [];
+        const exchangeLabel = flowExchanges.length
+          ? sourceLabel(flowExchanges.join("+")) + (flowExchanges.length === 1 ? " only" : "")
+          : "No contributing exchange";
+        const transportLabel = x.orderflow_source ? humanize(x.orderflow_source) : null;
+        setText("flowsource", [exchangeLabel, transportLabel].filter(Boolean).join(" · "));
         const dataHealth = s.data_health || {};
         const flowHealth = dataHealth.orderflow_input || {};
         setText("flowlastsuccess", fmtDate(flowHealth.last_successful_fetch_at), "mono tone-muted");
+        const cvd = x.session_cvd || {};
+        const cvdVenues = cvd.venues || {};
+        const binanceCvd = cvdVenues.binance || {};
+        const bybitCvd = cvdVenues.bybit || {};
+        setText("cvdbinance", fmtCompact(binanceCvd.cvd) + (binanceCvd.slope == null ? "" : " · Δ5 " + fmtCompact(binanceCvd.slope)), "mono");
+        setText("cvdbybit", fmtCompact(bybitCvd.cvd) + (bybitCvd.slope == null ? "" : " · Δ5 " + fmtCompact(bybitCvd.slope)), "mono");
+        setText("cvdcombined", cvd.complete ? fmtCompact(cvd.combined) + " · Δ5 " + fmtCompact(cvd.combined_slope) : "Unavailable · incomplete venues", "mono");
         setText("rr", x.reward_risk == null ? "—" : fmtNumber(x.reward_risk, 2) + "R", "mono");
         setText(
           "size",

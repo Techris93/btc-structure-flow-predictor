@@ -38,6 +38,8 @@ from btc_predictor.strategy import Predictor
 from btc_predictor.trade_store import TradeStore, start_collectors
 from btc_predictor.paper_position import PaperLedger
 from btc_predictor.signal_lifecycle import SignalLifecycle
+from btc_predictor.flow_gate import load_flow_gate
+from btc_predictor.flow_state import FlowStateStore
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -55,16 +57,35 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger.setLevel(_log_level)
+data_dir = runtime_dir()
 # Late-entry guard: set RETRACE_ENTRY_ATR (e.g. "1.2") to enter deep sweeps on
 # a RETRACE_PCT pullback limit instead of at market. Empty/unset = disabled.
 _retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "").strip()
+flow_gate_config, flow_calibration_artifact = load_flow_gate(
+    os.getenv("FLOW_CALIBRATION_PATH", str(data_dir / "flow_calibration.json")),
+    requested_mode=os.getenv("FLOW_GATE_MODE", "shadow"),
+    overrides={
+        "legacy_threshold": float(os.getenv("ORDERFLOW_THRESHOLD", "0.40")),
+        "market_threshold": float(os.getenv("MARKET_FLOW_THRESHOLD", "0.40")),
+        "raw_threshold": float(os.getenv("RAW_FOOTPRINT_THRESHOLD", "0.40")),
+        "price_bucket": float(os.getenv("FOOTPRINT_PRICE_BUCKET", "25")),
+        "full_credit_ratio": float(os.getenv("FOOTPRINT_FULL_CREDIT_RATIO", "1.5")),
+    },
+)
+if os.getenv("FLOW_GATE_MODE", "shadow").lower() == "calibrated" and flow_gate_config["gate_mode"] != "calibrated":
+    logger.warning("Calibrated flow gate requested but no passed artifact is available; remaining in shadow mode")
 predictor = Predictor(
     retrace_entry_atr=float(_retrace_atr) if _retrace_atr else None,
     retrace_pct=float(os.getenv("RETRACE_PCT", "0.5")),
     sweep_rearm_bars=max(1, int(os.getenv("SWEEP_REARM_BARS", "3"))),
     sweep_rearm_atr=max(0.0, float(os.getenv("SWEEP_REARM_ATR", "0.5"))),
+    flow_gate_mode=flow_gate_config["gate_mode"],
+    legacy_orderflow_threshold=flow_gate_config["legacy_threshold"],
+    market_flow_threshold=flow_gate_config["market_threshold"],
+    raw_footprint_threshold=flow_gate_config["raw_threshold"],
+    footprint_price_bucket=flow_gate_config["price_bucket"],
+    footprint_full_credit_ratio=flow_gate_config["full_credit_ratio"],
 )
-data_dir = runtime_dir()
 live_lock = threading.Lock()
 push_lock = threading.Lock()
 push_delivery_lock = threading.RLock()
@@ -149,6 +170,11 @@ if not secret_path.exists():
     secret_path.write_bytes(os.urandom(32)); os.chmod(secret_path, 0o600)
 _push_secret = secret_path.read_bytes()
 trade_store = TradeStore(data_dir / "live_trades.sqlite3", max_rows=TRADE_STORE_MAX_ROWS)
+flow_state_store = FlowStateStore(
+    data_dir / "flow_state.json",
+    price_bucket=flow_gate_config["price_bucket"],
+    retention_minutes=540,
+)
 paper_ledger = PaperLedger(
     os.getenv("PAPER_LEDGER_PATH", str(data_dir / "paper_ledger.json")),
     neutral_exit_observations=max(1, int(os.getenv("NEUTRAL_EXIT_OBSERVATIONS", "3"))),
@@ -1272,6 +1298,23 @@ def _select_flow_baseline(ws_flow, rest_flow, decision_time):
     return None, None
 
 
+class ClosedBarDecisionGate:
+    """Make each closed-bar decision immutable after its first evaluation."""
+
+    def __init__(self):
+        self.bar_at = None
+        self.value = None
+
+    def should_evaluate(self, bar_at):
+        bar_at = pd.Timestamp(bar_at)
+        return self.bar_at is None or bar_at > self.bar_at
+
+    def commit(self, bar_at, value):
+        """Commit only after lifecycle/accounting writes have succeeded."""
+        self.bar_at = pd.Timestamp(bar_at)
+        self.value = value
+
+
 def _live_loop_diagnostics():
     """Return in-memory loop health without acquiring application or DB locks."""
     now = time.monotonic()
@@ -1362,6 +1405,7 @@ def _live_loop():
     flow_baseline_last_ok_at = persisted_timestamp("flow_baseline_last_ok_at")
     orderflow_input_last_ok_at = persisted_timestamp("orderflow_input_last_ok_at")
     last_summary_log_at = pd.Timestamp(0, tz="UTC")
+    decision_gate = ClosedBarDecisionGate()
     while True:
         try:
             poll_started = pd.Timestamp.now(tz="UTC")
@@ -1485,15 +1529,30 @@ def _live_loop():
                 flow_baseline_last_ok_at = poll_started
             if flow_source or raw_flow_feature_bars >= 20:
                 orderflow_input_last_ok_at = poll_started
-            _set_live_loop_phase("predicting")
-            result = predictor.predict(
-                ohlc,
-                trades,
-                100_000,
-                frames=frames,
-                flow_bars=flow_bars,
-                flow_source=flow_source or "recent_trades_fallback",
+            # Persist only immutable closed-minute aggregates. Repeated polls
+            # of the same bar and late events cannot revise a prior decision.
+            flow_state_store.update(trades, now)
+            flow_aggregates = flow_state_store.footprint_bars(
+                now - pd.Timedelta(minutes=predictor.reclaim_bars + 2), now
             )
+            session_cvd = flow_state_store.session_cvd(now)
+            _set_live_loop_phase("predicting")
+            # One immutable strategy/lifecycle decision per unique closed 1m
+            # bar. Late trades never repaint an already-published decision.
+            new_decision = decision_gate.should_evaluate(now)
+            if new_decision:
+                result = predictor.predict(
+                    ohlc,
+                    trades,
+                    100_000,
+                    frames=frames,
+                    flow_bars=flow_bars,
+                    flow_source=flow_source or "recent_trades_fallback",
+                    flow_aggregates=flow_aggregates,
+                    session_cvd=session_cvd,
+                )
+            else:
+                result = decision_gate.value
             _set_live_loop_phase("updating_paper")
             # Apply market facts first. Raw predictions are never allowed to
             # open, invalidate or supersede a paper position.
@@ -1522,20 +1581,24 @@ def _live_loop():
                     active_before.get("signal_id"), "paper_exit"
                 )
             _set_live_loop_phase("notifications")
-            lifecycle_state, lifecycle_events = signal_lifecycle.evaluate(
-                lifecycle_before, result, market_paper_status, notification_now
-            )
-            decision_paper_status = paper_ledger.apply_lifecycle(lifecycle_events, ohlc)
-            # Persist lifecycle after idempotent ledger application. If the
-            # process dies between these writes, replaying the event cannot
-            # duplicate an entry or close; the inverse order could strand an
-            # active lifecycle with no corresponding paper position.
-            signal_lifecycle_store.write(lifecycle_state)
-            paper_status = decision_paper_status
-            paper_status["newly_closed"] = (
-                list(market_paper_status.get("newly_closed") or [])
-                + list(decision_paper_status.get("newly_closed") or [])
-            )
+            lifecycle_events = []
+            paper_status = market_paper_status
+            if new_decision:
+                lifecycle_state, lifecycle_events = signal_lifecycle.evaluate(
+                    lifecycle_before, result, market_paper_status, notification_now
+                )
+                decision_paper_status = paper_ledger.apply_lifecycle(lifecycle_events, ohlc)
+                # Persist lifecycle after idempotent ledger application. If
+                # the process dies between these writes, replaying the event
+                # cannot duplicate an entry or close.
+                signal_lifecycle_store.write(lifecycle_state)
+                flow_state_store.record_sweeps(result.sweep_observations, now)
+                decision_gate.commit(now, result)
+                paper_status = decision_paper_status
+                paper_status["newly_closed"] = (
+                    list(market_paper_status.get("newly_closed") or [])
+                    + list(decision_paper_status.get("newly_closed") or [])
+                )
             try:
                 _notify_paper_exits(paper_status.get("newly_closed") or [])
             except Exception:
@@ -1628,6 +1691,16 @@ def _live_loop():
                     "last_successful_fetch_at": orderflow_input_last_ok_at.isoformat() if orderflow_input_last_ok_at else None,
                     "last_error": None,
                 },
+                "session_cvd": session_cvd,
+                "flow_gate": {
+                    "mode": flow_gate_config["gate_mode"],
+                    "legacy_threshold": flow_gate_config["legacy_threshold"],
+                    "market_threshold": flow_gate_config["market_threshold"],
+                    "raw_threshold": flow_gate_config["raw_threshold"],
+                    "price_bucket": flow_gate_config["price_bucket"],
+                    "full_credit_ratio": flow_gate_config["full_credit_ratio"],
+                    "calibration_run_hash": flow_gate_config.get("artifact_run_hash"),
+                },
             }
             next_state = {
                 "status": feed_status,
@@ -1648,6 +1721,11 @@ def _live_loop():
                 "flow_baseline_last_ok_at": flow_baseline_last_ok_at.isoformat() if flow_baseline_last_ok_at else None,
                 "orderflow_input_last_ok_at": orderflow_input_last_ok_at.isoformat() if orderflow_input_last_ok_at else None,
                 "data_health": data_health,
+                "decision": {
+                    "policy": "immutable_closed_bar",
+                    "bar_at": decision_gate.bar_at.isoformat() if decision_gate.bar_at is not None else None,
+                    "evaluated_this_poll": new_decision,
+                },
                 "proxy": proxy_diagnostics,
                 "push_dispatch": push_dispatch_diagnostics,
                 "collectors": collectors,

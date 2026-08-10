@@ -41,9 +41,12 @@ This remains research-only: it does not place orders, and `probability_tp_before
 - 4h and 1h completed candles establish regime; disagreement is neutral.
 - A reversal of the held regime requires an opposing confirmed CHoCH.
 - 15m completed candles produce swing/equal-level, prior day/week, session, breakout, volume-profile and VWAP zones plus ATR risk.
-- ATR-bounded sweeps may reclaim over multiple closed 1m candles.
+- ATR-bounded sweeps may reclaim over a declared 60-minute closed-1m window; a 15m zone invalidation does not truncate that already-open reclaim window.
+- Live strategy and lifecycle decisions are immutable after the first evaluation of each unique closed 1m bar; late trades are incorporated only in the next bar's decision.
 - A durable SQLite buffer receives Binance and Bybit WebSocket trades; 1m taker-buy bars provide flow baselines.
-- Confirmation requires symmetric delta reversal, absorption/extreme delta, low price response, footprint imbalance, and Binance/Bybit agreement.
+- Market flow and raw trade-level footprint are reported independently. The legacy 0.40 composite remains the paper-entry gate unless a passed calibration artifact explicitly enables the dual gate.
+- Flow is observed provisionally from the closed breach bar and frozen on the closed reclaim bar; provisional observations cannot create entries.
+- Session CVD is persisted for the existing Asia, London and New York UTC windows and remains diagnostic-only.
 - Every projected zone has immutable identity plus creation, availability, expiry, touch, sweep, and invalidation state.
 
 ## Causal research
@@ -53,6 +56,21 @@ The Flask app does not execute backtests. Run the durable worker separately:
 ```bash
 python research_worker.py --start 2025-07-19 --end 2026-07-19 --data-dir work/runtime/research
 ```
+
+The two-venue Phase 2 calibration is also local-only. It downloads official
+Binance and Bybit Futures trade archives, validates complete daily coverage,
+and keeps production in shadow mode unless the locked holdout passes:
+
+```bash
+python -m pip install -e '.[research]'
+python flow_calibration_worker.py \
+  --ohlcv work/runtime/research-local/binance_1m.csv \
+  --data-dir work/runtime/flow-calibration
+```
+
+To use a passed artifact, copy `flow_calibration.json` to the configured
+runtime path and set `FLOW_GATE_MODE=calibrated`. Missing or failed artifacts
+always fall back to `shadow`.
 
 It downloads Binance Futures 1m candles (including taker-buy volume), derives completed 15m/1h/4h candles, and compares `reactive` and `mtf` variants over identical dates. Dataset pages, replay state, ledgers, and final results are persisted. Resume identity includes Git revision, configuration, date range, and dataset hash.
 
@@ -135,4 +153,3 @@ Budget check (Render + local): `fapi` weight limit is 2,400/min; WS is free up t
 - On REST error (418/429): cooldown doubles to >=30 min, never retries hot.
 
 Health exposes `binance_data_path`: `websocket` | `rest_backfill` | `stale`.
-

@@ -20,6 +20,16 @@ def _candidate(kind, side, level, width, created, available, score, sources, exp
             "score":score,"created_at":created,"available_at":available,"sources":tuple(sources),"expiry_bars":expiry_bars}
 
 
+def _width_available_at(x,atr_series,available_at,reference_price):
+    """Freeze zone width from inputs known when the zone became available."""
+    available_at=pd.Timestamp(available_at)
+    known_prices=x.loc[x.index<=available_at,"close"]
+    known_atr=atr_series.loc[atr_series.index<=available_at].dropna()
+    price=float(known_prices.iloc[-1]) if len(known_prices) else float(reference_price)
+    volatility=float(known_atr.iloc[-1]) if len(known_atr) else price*.005
+    return max(volatility*.12,price*.0005)
+
+
 def _period_levels(x, rule, kind, expiry_bars):
     shifted=x.copy(); shifted["period"]=(shifted.index-pd.Timedelta(nanoseconds=1)).tz_localize(None).to_period(rule)
     rows=[]
@@ -74,16 +84,21 @@ def build_projected_zones(ohlc: pd.DataFrame, lookback: int = 1000, pivot_left: 
     if x.empty: return []
     last_atr=max(float(a.iloc[-1]) if np.isfinite(a.iloc[-1]) else float(x.close.iloc[-1])*.005, float(x.close.iloc[-1])*.0003)
     base_width=max(last_atr*.12,float(x.close.iloc[-1])*.0005); raw=[]
-    for _,p in piv.iterrows():
-        width=max((float(a.get(p.available_at)) if np.isfinite(a.get(p.available_at,np.nan)) else last_atr)*.12,p.price*.0005)
+    atr_by_time=dict(zip(x.index,a.to_numpy())); close_by_time=dict(zip(x.index,x.close.to_numpy()))
+    for p in piv.itertuples():
+        atr_at=atr_by_time.get(p.available_at,np.nan)
+        width=max((float(atr_at) if np.isfinite(atr_at) else last_atr)*.12,p.price*.0005)
         side="above" if p.kind=="high" else "below"
         # Only add swings that are not too close to each other
         raw.append(_candidate("swing",side,float(p.price),width,p.pivot_time,p.available_at,1.0,("confirmed_swing",),expiry_bars))
     ordered=piv.sort_values("available_at")
     for kind in ("high","low"):
         same=ordered[ordered.kind==kind]
-        for (_,p),(_,q) in zip(same.iloc[:-1].iterrows(),same.iloc[1:].iterrows()):
-            tolerance=round(max(base_width,float(q.price)*.00025),8)  # tighter: ~0.025% of price
+        rows_list=list(same.itertuples())
+        for p,q in zip(rows_list[:-1],rows_list[1:]):
+            known_atr=atr_by_time.get(q.available_at,np.nan); known_price=close_by_time.get(q.available_at,np.nan)
+            creation_width=max(float(known_atr)*.12,float(known_price)*.0005) if np.isfinite(known_atr) and np.isfinite(known_price) else _width_available_at(x,a,q.available_at,q.price)
+            tolerance=round(max(creation_width,float(q.price)*.00025),8)  # frozen at second-pivot availability
             if abs(float(p.price)-float(q.price))<=tolerance:
                 level=(float(p.price)+float(q.price))/2; side="above" if kind=="high" else "below"
                 raw.append(_candidate(f"equal_{kind}s",side,level,tolerance,min(p.pivot_time,q.pivot_time),q.available_at,1.6,("equal_levels",p.swing_id,q.swing_id),192))
@@ -92,20 +107,23 @@ def build_projected_zones(ohlc: pd.DataFrame, lookback: int = 1000, pivot_left: 
         raw.append(_candidate(kind,side,float(level),base_width,created,available,score,sources,expiry))
     events=structure_events(x)
     if not events.empty:
-        for ts,event in events.tail(20).iterrows():
+        for event in events.tail(20).itertuples():
+            ts=event.Index
             side="below" if event.bias=="bullish" else "above"; level=float(event.level)
             raw.append(_candidate("untested_breakout",side,level,base_width,ts,ts,1.3,("structure_break",str(event.swing_id)),192))
 
-    zones=[]
+    zones=[]; bar_lows=x.low.to_numpy(); bar_highs=x.high.to_numpy(); index_values=x.index
     for item in raw:
         available=pd.Timestamp(item.pop("available_at")).as_unit(x.index.unit,round_ok=True); pos=x.index.searchsorted(available,side="right")
         expiry_bars_for_zone=item.pop("expiry_bars"); expiry_pos=pos+expiry_bars_for_zone
-        expires=x.index[expiry_pos] if expiry_pos<len(x) else None
-        future=x.iloc[pos:]; future=future if expires is None else future.loc[future.index<expires]
-        swept=(future.low<item["low"]) if item["side"]=="below" else (future.high>item["high"])
-        swept_at=swept[swept].index[0] if swept.any() else None
-        before=future if swept_at is None else future.loc[future.index<swept_at]
-        touches=int(((before.high>=item["low"])&(before.low<=item["high"])).sum())
+        expires=index_values[expiry_pos] if expiry_pos<len(x) else None
+        stop_pos=expiry_pos if expiry_pos<len(x) else len(x)
+        segment_lows=bar_lows[pos:stop_pos]; segment_highs=bar_highs[pos:stop_pos]
+        hits=(segment_lows<item["low"]) if item["side"]=="below" else (segment_highs>item["high"])
+        first_hit=int(np.argmax(hits)) if hits.any() else None
+        swept_at=index_values[pos+first_hit] if first_hit is not None else None
+        end_pos=pos+first_hit if first_hit is not None else stop_pos
+        touches=int(np.count_nonzero((bar_highs[pos:end_pos]>=item["low"])&(bar_lows[pos:end_pos]<=item["high"])))
         # Dynamic score: age decay + touch penalty + recency bonus
         age_bars = len(x) - pos
         age_decay = min(age_bars / 384, 0.25)  # cap at 0.25 penalty over ~4 days

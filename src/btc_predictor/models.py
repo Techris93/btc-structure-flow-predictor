@@ -81,7 +81,7 @@ class PredictorOutput:
     sweep_time: str | None = None
     reclaim_time: str | None = None
     orderflow_reason: str | None = None
-    exchange_agreement: bool | None = None
+    exchange_agreement: float | None = None
     # "market" (fill at signal price) or "limit" (pending retracement order);
     # appended last so positional constructions keep working.
     entry_type: str = "market"
@@ -96,3 +96,19 @@ class PredictorOutput:
     # Decision-time setup ATR. Lifecycle replacement checks use this to
     # distinguish a materially different setup from harmless price drift.
     setup_atr: float | None = None
+    # Exchanges whose trades/features actually contributed to this decision.
+    orderflow_exchanges: tuple[str, ...] = ()
+    # Independent Phase 2 diagnostics. Shadow mode preserves the legacy
+    # composite gate until a calibrated artifact has passed its holdout.
+    market_flow_score: float | None = None
+    market_flow_threshold: float | None = None
+    market_flow_confirmed: bool = False
+    raw_footprint_score: float | None = None
+    raw_footprint_ratio: float | None = None
+    raw_footprint_threshold: float | None = None
+    raw_footprint_confirmed: bool = False
+    raw_footprint_eligible: bool = False
+    flow_gate_mode: str = "shadow"
+    flow_state: str = "not_evaluated"
+    session_cvd: dict[str, Any] | None = None
+    sweep_observations: tuple[dict[str, Any], ...] = ()

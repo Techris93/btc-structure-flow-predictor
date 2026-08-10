@@ -1,12 +1,13 @@
 import pandas as pd
 
 from btc_predictor.footprint import (
+    _sweep_bar_trades,
     cross_exchange_agreement,
     footprint_confirmation,
     orderflow_features,
 )
 from btc_predictor.models import Zone
-from btc_predictor.strategy import detect_sweep
+from btc_predictor.strategy import detect_sweep, zone_reclaim_eligible
 from btc_predictor.trade_store import TradeStore
 
 
@@ -42,6 +43,72 @@ def test_continuous_deeper_breach_keeps_original_sweep_identity():
     assert result["reclaim_time"] == idx[2]
 
 
+def test_sweep_cannot_precede_zone_availability():
+    idx = pd.date_range("2026-01-01 00:01", periods=5, freq="min", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 101.0,
+            "low": [99.0, 94.0, 98.0, 99.0, 99.0],
+            "close": [100.0, 95.0, 98.0, 100.0, 100.0],
+            "volume": 1.0,
+        },
+        index=idx,
+    )
+    zone = Zone("future", "swing", "below", 96, 97, 1, idx[0], idx[3])
+
+    result = detect_sweep(frame, zone, "bullish", 10, reclaim_bars=15)
+
+    assert result == {"status": "none", "confirmed": False}
+
+
+def test_sweep_bar_open_includes_trades_before_close_timestamp():
+    decision_time = pd.Timestamp("2026-01-01 00:05:00Z")
+    trades = pd.DataFrame(
+        [
+            {"time": decision_time - pd.Timedelta(seconds=50), "price": 100, "qty": 1, "side": "sell", "exchange": "binance"},
+            {"time": decision_time - pd.Timedelta(seconds=10), "price": 101, "qty": 1, "side": "buy", "exchange": "bybit"},
+        ]
+    )
+
+    retained = _sweep_bar_trades(trades, decision_time, decision_time)
+
+    assert len(retained) == 2
+
+
+def test_invalidated_zone_keeps_full_declared_reclaim_window():
+    idx = pd.date_range("2026-01-01", periods=70, freq="min", tz="UTC")
+    zone = Zone(
+        "grace",
+        "swing",
+        "below",
+        96,
+        97,
+        1,
+        idx[0],
+        idx[0],
+        swept_at=idx[2],
+        invalidated_at=idx[2],
+    )
+
+    assert zone.is_active(idx[10]) is False
+    assert zone_reclaim_eligible(zone, idx[10], reclaim_bars=60) is True
+    assert zone_reclaim_eligible(zone, idx[63], reclaim_bars=60) is False
+    frame = pd.DataFrame(
+        {
+            "open": 98.0,
+            "high": 99.0,
+            "low": [99.0, 94.0] + [95.0] * 8 + [98.0],
+            "close": [98.0, 95.0] + [95.0] * 8 + [98.0],
+            "volume": 1.0,
+        },
+        index=idx[:11],
+    )
+    sweep = detect_sweep(frame, zone, "bullish", 10, reclaim_bars=60)
+    assert sweep["confirmed"] is True
+    assert sweep["reclaim_time"] == idx[10]
+
+
 def test_sweep_identity_rearms_only_after_three_clear_bars_and_atr_distance():
     idx = pd.date_range("2026-01-01", periods=6, freq="min", tz="UTC")
     frame = pd.DataFrame(
@@ -74,6 +141,33 @@ def test_orderflow_reversals_are_symmetric_and_exchange_agreement_is_required():
     assert agrees and set(deltas)=={"binance","bybit"}
 
 
+def test_cross_exchange_agreement_rejects_single_venue_window():
+    end = pd.Timestamp("2026-01-01 00:05:00Z")
+    trades = pd.DataFrame([
+        {"time": end - pd.Timedelta(seconds=10), "price": 100, "qty": 2, "side": "buy", "exchange": "binance"}
+    ])
+
+    score, deltas = cross_exchange_agreement(trades, end - pd.Timedelta(minutes=1), end, "bullish")
+
+    assert score == 0.0
+    assert set(deltas) == {"binance"}
+
+
+def test_price_impact_metric_is_honestly_named():
+    idx = pd.date_range("2026-01-01", periods=3, freq="min", tz="UTC")
+    trades = pd.DataFrame([
+        {"time": ts - pd.Timedelta(seconds=1), "price": 100 + i, "qty": 1, "side": "buy"}
+        for i, ts in enumerate(idx)
+    ])
+
+    features = orderflow_features(trades, window=2)
+
+    assert "price_impact_ratio" in features
+    assert "low_price_impact_score" in features
+    assert "kyle_lambda" not in features
+    assert "kyle_absorption" not in features
+
+
 def test_footprint_confirmation_passes_complete_agreement_window():
     idx = pd.date_range("2025-01-01", periods=30, freq="min", tz="UTC")
     trades = []
@@ -97,6 +191,7 @@ def test_footprint_confirmation_passes_complete_agreement_window():
     assert isinstance(confirmed, bool)
     assert 0.0 <= details["agreement"] <= 1.0
     assert set(details["exchange_deltas"]) == {"binance", "bybit"}
+    assert set(details["contributing_exchanges"]) == {"binance", "bybit"}
 
 
 def test_trade_store_deduplicates_and_persists(tmp_path):
