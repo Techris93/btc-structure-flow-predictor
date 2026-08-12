@@ -8,6 +8,22 @@ from .strategy import Predictor
 from .timeframes import completed_timeframes
 
 
+def _adapt_predictor_for_available_flow(predictor, trades):
+    """Independent/calibrated gates need two venues. Proxy klines do not have them."""
+    if predictor is None:
+        from .research import predictor_for_replay
+        return predictor_for_replay(trades), "shadow_proxy_default"
+    mode = str(getattr(predictor, "flow_gate_mode", "") or "")
+    has_exchange = trades is not None and hasattr(trades, "columns") and "exchange" in trades.columns
+    venues = set()
+    if has_exchange and not getattr(trades, "empty", True):
+        venues = {str(value).lower() for value in trades.exchange.dropna().unique()}
+    if mode in ("independent", "calibrated") and not {"binance", "bybit"}.issubset(venues):
+        predictor.flow_gate_mode = "shadow"
+        return predictor, "shadow_because_two_venue_flow_unavailable"
+    return predictor, None
+
+
 def _close_trade(open_trade, exit_price, exit_time, equity, fee_bps, reason):
     side_sign = 1 if open_trade["side"] == "long" else -1
     gross = (exit_price - open_trade["entry"]) * open_trade["size"] * side_sign
@@ -42,7 +58,7 @@ def run_event_backtest(
         raise ValueError("mode must be reactive or mtf")
     if same_bar_policy not in {"conservative", "optimistic"}:
         raise ValueError("same_bar_policy must be conservative or optimistic")
-    predictor = predictor or Predictor()
+    predictor, gate_adapt = _adapt_predictor_for_available_flow(predictor, trades)
     state = resume_state or {}
     equity = float(state.get("equity", initial_equity))
     records = list(state.get("records", [])); open_trade = state.get("open_trade"); pending = state.get("pending")
@@ -57,6 +73,9 @@ def run_event_backtest(
     # different units (us/ns) across pandas inputs and admit future rows.
     trade_times = trade_data["time"].reset_index(drop=True)
     derived = completed_timeframes(bars) if mode == "mtf" else None
+    # searchsorted frame windows: avoid O(n) boolean masks every decision bar
+    # (that path slowed from ~300 bars/s to ~20 bars/s as history grew).
+    frame_cache = {name: {"position": None, "frame": None} for name in (derived or {})}
 
     for i in range(max(80, int(state.get("next_i", 80))), len(bars)):
         now, b = bars.index[i], bars.iloc[i]
@@ -89,18 +108,34 @@ def run_event_backtest(
             trade_end = trade_times.searchsorted(pd.Timestamp(now), side="left")
             tt = trade_data.iloc[max(0, trade_end-3000):trade_end]
             frames = None
-            if mode == "mtf":
-                frames = {name: frame.loc[frame.index <= now].tail(400) for name, frame in derived.items()}
-            out = predictor.predict(history, tt, equity, frames=frames)
+            if mode == "mtf" and derived is not None:
+                frames = {}
+                for name, frame in derived.items():
+                    position = int(frame.index.searchsorted(now, side="right"))
+                    cached = frame_cache[name]
+                    if cached["position"] != position:
+                        cached["position"] = position
+                        cached["frame"] = frame.iloc[max(0, position - 400):position]
+                    frames[name] = cached["frame"]
+            flow_bars = history if "taker_buy_volume" in history.columns else None
+            out = predictor.predict(
+                history,
+                tt,
+                equity,
+                frames=frames,
+                flow_bars=flow_bars,
+                flow_source="historical_binance_kline" if flow_bars is not None else None,
+            )
             if out.entry is not None and out.position_size:
                 pending = {"decision_time": now, "side": "long" if out.bias == "bullish" else "short",
                            "signal_entry": out.entry, "stop": out.stop, "target": out.target,
                            "size": out.position_size, "zone": out.zone, "setup_type": out.setup_type}
             else:
                 rejections[out.no_trade_reason or "unknown"] += 1
-        if progress and (i % 1000 == 0 or i == len(bars)-1):
+        if progress and (i % 500 == 0 or i == len(bars)-1):
             progress(i + 1, len(bars), records)
-        if checkpoint and i % 1000 == 0:
+        # Checkpoint less often once large — JSON of full records is a bottleneck.
+        if checkpoint and (i % 5000 == 0 or i == len(bars) - 1):
             checkpoint({"next_i":i+1,"equity":equity,"records":records,"open_trade":open_trade,"pending":pending,
                         "rejections":dict(rejections),"collisions":collisions,"held_bias":predictor._held_bias})
 
@@ -135,6 +170,8 @@ def run_event_backtest(
         "same_bar_collisions": collisions, "same_bar_policy": same_bar_policy,
         "open_position": open_position_status, "rejection_counts": dict(rejections),
         "causality": "close-time decision; next-open fill; trades < decision time",
+        "flow_gate_mode": getattr(predictor, "flow_gate_mode", None),
+        "flow_gate_adapt": gate_adapt,
     }
     return result, stats
 

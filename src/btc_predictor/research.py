@@ -60,6 +60,27 @@ def proxy_trades(one_minute: pd.DataFrame):
     return pd.concat([a, b], ignore_index=True).loc[lambda x: x.qty > 0].sort_values("time")
 
 
+def trades_have_two_venues(trades: pd.DataFrame) -> bool:
+    if trades is None or getattr(trades, "empty", True) or "exchange" not in trades:
+        return False
+    venues = {str(value).lower() for value in trades.exchange.dropna().unique()}
+    return {"binance", "bybit"}.issubset(venues)
+
+
+def predictor_for_replay(trades: pd.DataFrame | None = None, **kwargs):
+    """Predictor that can actually fire on the available trade grain.
+
+    Live ``independent`` requires Binance+Bybit raw footprint. Proxy 1m
+    taker-buy rows have no venue column, so that gate rejects every sweep
+    as ``orderflow_not_confirmed`` / ``two_venue_flow_unavailable``.
+    Historical kline replay therefore uses the designed ``shadow`` composite.
+    """
+    kwargs.setdefault("cache_closed_frames", True)
+    if not trades_have_two_venues(trades):
+        kwargs.setdefault("flow_gate_mode", "shadow")
+    return Predictor(**kwargs)
+
+
 def run_comparison(data_dir, start, end, config=None):
     config = {"fee_bps":5,"slippage_bps":2,"same_bar_policy":"conservative","decision_stride":1, **(config or {})}
     root = Path(data_dir); root.mkdir(parents=True, exist_ok=True)
@@ -83,7 +104,7 @@ def run_comparison(data_dir, start, end, config=None):
             checkpoint.write({"complete":False,"dataset_hash":dataset_hash,"resume_state":replay_state,"bars_processed":replay_state["next_i"],"updated_at":pd.Timestamp.utcnow().isoformat()})
         def progress(done, total, ledger):
             status.write({"status":"running","phase":"backtesting","variant":mode,"bars_processed":done,"total_bars":total,"closed_trades":len(ledger),"run_hash":run_hash})
-        ledger, stats = run_event_backtest(bars, trades, Predictor(), mode=mode, progress=progress, resume_state=resume, checkpoint=save_resume, **config)
+        ledger, stats = run_event_backtest(bars, trades, predictor_for_replay(trades), mode=mode, progress=progress, resume_state=resume, checkpoint=save_resume, **config)
         ledger.to_csv(root/f"{run_hash}-{mode}-ledger.csv", index=False)
         checkpoint.write({"complete":True,"dataset_hash":dataset_hash,"stats":stats,"ledger":f"{run_hash}-{mode}-ledger.csv"})
         outputs[mode] = stats

@@ -108,6 +108,9 @@ class PaperLedger:
         risk_fraction: float = live_policy.RISK_FRACTION,
         soft_filters: bool = live_policy.SOFT_FILTERS_ENABLED,
         apply_research_costs: bool = True,
+        use_fixed_pct_exits: bool = live_policy.USE_FIXED_PCT_EXITS,
+        max_hold_hours: float = live_policy.MAX_HOLD_HOURS,
+        fill_min_rr: float = live_policy.FILL_MIN_RR,
     ):
         self.path = Path(path) if path else None
         self.store = JsonStore(self.path) if self.path else None
@@ -123,6 +126,9 @@ class PaperLedger:
         self.risk_fraction = float(risk_fraction)
         self.soft_filters = bool(soft_filters)
         self.apply_research_costs = bool(apply_research_costs)
+        self.use_fixed_pct_exits = bool(use_fixed_pct_exits)
+        self.max_hold_hours = float(max_hold_hours)
+        self.fill_min_rr = float(fill_min_rr)
         self._open: dict | None = None
         self._pending: dict | None = None
         self._closed: list[dict] = []
@@ -450,18 +456,22 @@ class PaperLedger:
                 return
             ts, bar = next(iter(future.iterrows()))
             fill = float(bar.open)
-            risk = (fill - pending["stop"]) if side == "long" else (pending["stop"] - fill)
-            reward = (pending["target"] - fill) if side == "long" else (fill - pending["target"])
-            if risk <= 0 or reward <= 0:
+            stop, target = pending["stop"], pending["target"]
+            if self.use_fixed_pct_exits:
+                geo = live_policy.fixed_pct_exits(fill, side)
+                stop, target = geo["stop"], geo["target"]
+            risk = (fill - stop) if side == "long" else (stop - fill)
+            reward = (target - fill) if side == "long" else (fill - target)
+            if risk <= 0 or reward <= 0 or not live_policy.fill_min_rr_ok(fill, stop, target, side, self.fill_min_rr):
                 logger.info(
-                    "Pending %s market signal invalidated by next-open gap: fill=%.2f stop=%.2f target=%.2f",
-                    side, fill, pending["stop"], pending["target"],
+                    "Pending %s market signal invalidated at next open: fill=%.2f stop=%.2f target=%.2f",
+                    side, fill, stop, target,
                 )
                 self._pending = None
+                self._last_reject = {"reason": "fill_rr_below_minimum", "fill": fill, "stop": stop, "target": target}
                 return
             planned_risk = float(pending.get("planned_risk_notional") or 0.0)
             size = planned_risk / risk if planned_risk > 0 else pending["size"]
-            # Re-apply notional cap at fill.
             notional = abs(fill * size)
             max_notional = self._equity * self.max_notional_multiple
             if notional > max_notional and fill > 0:
@@ -469,14 +479,17 @@ class PaperLedger:
             self._open = dict(
                 pending,
                 entry=fill,
+                stop=float(stop),
+                target=float(target),
                 size=float(size),
                 entry_time=pd.Timestamp(ts).isoformat(),
                 filled_at=pd.Timestamp(ts).isoformat(),
+                planned_rr=(target - fill) / risk if side == "long" else (fill - target) / risk,
             )
             self._pending = None
             logger.info(
-                "Pending %s market signal filled at next open %.2f (%s)",
-                side, fill, self._open["entry_time"],
+                "Pending %s market signal filled at next open %.2f sl=%.2f tp=%.2f (%s)",
+                side, fill, stop, target, self._open["entry_time"],
             )
             return
 
@@ -494,7 +507,17 @@ class PaperLedger:
                     logger.info("Pending %s order at %.2f invalidated: stop hit before fill", side, limit)
                     self._pending = None
                     return
-                self._open = dict(pending, entry_time=pd.Timestamp(ts).isoformat(), filled_at=pd.Timestamp(ts).isoformat())
+                filled = dict(pending, entry_time=pd.Timestamp(ts).isoformat(), filled_at=pd.Timestamp(ts).isoformat())
+                if self.use_fixed_pct_exits:
+                    geo = live_policy.fixed_pct_exits(limit, side)
+                    if not live_policy.fill_min_rr_ok(limit, geo["stop"], geo["target"], side, self.fill_min_rr):
+                        logger.info("Pending %s limit invalidated: fill RR below minimum", side)
+                        self._pending = None
+                        return
+                    filled["stop"] = geo["stop"]
+                    filled["target"] = geo["target"]
+                    filled["planned_rr"] = geo["reward_risk"]
+                self._open = filled
                 self._pending = None
                 logger.info("Pending %s order filled at %.2f (%s)", side, limit, self._open["entry_time"])
                 return
@@ -515,6 +538,7 @@ class PaperLedger:
         if future.empty and not ohlc.empty and ohlc_index_utc[0] > entry_time:
             future = ohlc
 
+        max_hold = pd.Timedelta(hours=self.max_hold_hours) if self.max_hold_hours > 0 else None
         for ts, bar in future.iterrows():
             if side == "long":
                 if float(bar.low) <= stop:
@@ -530,6 +554,9 @@ class PaperLedger:
                 if float(bar.low) <= target:
                     self._close(ts, target, "target")
                     return
+            if max_hold is not None and (pd.Timestamp(ts) - entry_time) >= max_hold:
+                self._close(ts, float(bar.close), "max_hold")
+                return
 
     def _close(self, exit_time, exit_price, reason):
         if self._open is None:

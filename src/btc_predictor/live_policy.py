@@ -23,9 +23,18 @@ RESEARCH_INITIAL_EQUITY = 100_000.0
 RISK_FRACTION = 0.0025
 
 # Risk governance (unproven sizes; process only).
-MAX_NOTIONAL_MULTIPLE = float(os.getenv("PAPER_MAX_NOTIONAL_MULTIPLE", "1.5"))
+MAX_NOTIONAL_MULTIPLE = float(os.getenv("PAPER_MAX_NOTIONAL_MULTIPLE", "1.0"))
 DAILY_LOSS_R = float(os.getenv("PAPER_DAILY_LOSS_R", "2.0"))
 WEEKLY_LOSS_R = float(os.getenv("PAPER_WEEKLY_LOSS_R", "4.0"))
+MAX_HOLD_HOURS = float(os.getenv("PAPER_MAX_HOLD_HOURS", "12"))
+SAME_SIDE_COOLDOWN_HOURS = float(os.getenv("PAPER_SAME_SIDE_COOLDOWN_HOURS", "8"))
+FILL_MIN_RR = float(os.getenv("PAPER_FILL_MIN_RR", "1.5"))
+
+# Fixed percent exits: 0.5% stop / 1% target → 2R from the fill.
+FIXED_STOP_PCT = float(os.getenv("FIXED_STOP_PCT", "0.005"))
+FIXED_TARGET_PCT = float(os.getenv("FIXED_TARGET_PCT", "0.01"))
+USE_FIXED_PCT_EXITS = os.getenv("USE_FIXED_PCT_EXITS", "1").lower() in ("1", "true", "yes", "on")
+HUNDRED_PUSH_BUFFER = float(os.getenv("PAPER_HUNDRED_PUSH_BUFFER", "1.0"))  # dollars beyond the 100
 
 # Soft filters from 3-trade postmortem — labeled unproven.
 SOFT_FILTERS_ENABLED = os.getenv("PAPER_SOFT_FILTERS", "1").lower() in ("1", "true", "yes", "on")
@@ -50,7 +59,8 @@ REVIEW_METRICS = (
 )
 
 # Shadow book: Book A = production paper; Book B adds one extra skip rule.
-SHADOW_RULE = os.getenv("PAPER_SHADOW_RULE", "skip_planned_rr_above_2_5")
+# Fixed 0.5%/1% makes RR≈2 always, so Book B tracks untested_breakout skips.
+SHADOW_RULE = os.getenv("PAPER_SHADOW_RULE", "skip_untested_breakout")
 SHADOW_RR_CAP = float(os.getenv("PAPER_SHADOW_RR_CAP", "2.5"))
 SHADOW_MAGNET_DOLLARS = float(os.getenv("PAPER_SHADOW_MAGNET_DOLLARS", "50"))
 
@@ -88,6 +98,16 @@ def policy_manifest() -> dict[str, Any]:
             "daily_loss_r": DAILY_LOSS_R,
             "weekly_loss_r": WEEKLY_LOSS_R,
             "one_open_risk_unit": True,
+            "max_hold_hours": MAX_HOLD_HOURS,
+            "same_side_cooldown_hours": SAME_SIDE_COOLDOWN_HOURS,
+            "fill_min_rr": FILL_MIN_RR,
+        },
+        "exits": {
+            "mode": "fixed_pct" if USE_FIXED_PCT_EXITS else "structural_atr",
+            "stop_pct": FIXED_STOP_PCT,
+            "target_pct": FIXED_TARGET_PCT,
+            "planned_rr": (FIXED_TARGET_PCT / FIXED_STOP_PCT) if FIXED_STOP_PCT else None,
+            "push_stop_through_100": False,
         },
         "soft_filters": {
             "enabled": SOFT_FILTERS_ENABLED,
@@ -186,6 +206,75 @@ def stop_geometry(entry: float | None, stop: float | None, side: str | None = No
     }
 
 
+def push_stop_beyond_hundred(entry: float, stop: float, side: str, buffer: float | None = None) -> tuple[float, bool]:
+    """If the stop sits just in front of a $100 print, push it through.
+
+    Long: stop is below entry. If a 100 lies between stop and entry, the stop
+    is in front of that magnet — move it to magnet-buffer. Short is symmetric.
+    """
+    buf = HUNDRED_PUSH_BUFFER if buffer is None else float(buffer)
+    entry_f, stop_f = float(entry), float(stop)
+    side = "long" if side in ("long", "bullish") else "short"
+    lo, hi = (stop_f, entry_f) if side == "long" else (entry_f, stop_f)
+    first_hundred = math.ceil(lo / 100.0) * 100.0
+    pushed = False
+    if first_hundred < hi - 1e-9 and first_hundred > lo + 1e-9:
+        if side == "long":
+            stop_f = first_hundred - buf
+            pushed = True
+        else:
+            stop_f = first_hundred + buf
+            pushed = True
+    return stop_f, pushed
+
+
+def fixed_pct_exits(
+    entry: float,
+    side: str,
+    *,
+    stop_pct: float | None = None,
+    target_pct: float | None = None,
+    push_through_100: bool = False,
+) -> dict[str, Any]:
+    """0.5% stop / 1% target from *this* price (signal or fill). Always ~2R."""
+    stop_pct = FIXED_STOP_PCT if stop_pct is None else float(stop_pct)
+    target_pct = FIXED_TARGET_PCT if target_pct is None else float(target_pct)
+    entry_f = float(entry)
+    is_long = side in ("long", "bullish")
+    if is_long:
+        stop = entry_f * (1.0 - stop_pct)
+        target = entry_f * (1.0 + target_pct)
+    else:
+        stop = entry_f * (1.0 + stop_pct)
+        target = entry_f * (1.0 - target_pct)
+    pushed = False
+    if push_through_100:
+        stop, pushed = push_stop_beyond_hundred(entry_f, stop, "long" if is_long else "short")
+    risk = abs(entry_f - stop)
+    reward = abs(entry_f - target)
+    rr = reward / risk if risk > 0 else 0.0
+    return {
+        "entry": entry_f,
+        "stop": float(stop),
+        "target": float(target),
+        "risk": float(risk),
+        "reward": float(reward),
+        "reward_risk": float(rr),
+        "stop_pct": stop_pct,
+        "target_pct": target_pct,
+        "stop_pushed_through_100": pushed,
+    }
+
+
+def fill_min_rr_ok(entry: float, stop: float, target: float, side: str, min_rr: float | None = None) -> bool:
+    floor = FILL_MIN_RR if min_rr is None else float(min_rr)
+    risk = (entry - stop) if side in ("long", "bullish") else (stop - entry)
+    reward = (target - entry) if side in ("long", "bullish") else (entry - target)
+    if risk <= 0 or reward <= 0:
+        return False
+    return (reward / risk) >= floor
+
+
 def enrich_decision_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     """Attach geometry and probability metadata to a lifecycle/predictor snapshot."""
     snap = dict(snapshot or {})
@@ -216,10 +305,8 @@ def enrich_decision_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     kind = snap.get("zone_kind") or (zone.split(":", 1)[0] if zone else None)
     if kind and not snap.get("zone_kind"):
         snap["zone_kind"] = kind
-    if kind in SOFT_WIDE_BREAKOUT_KINDS and geometry.get("stop_distance_pct") is not None:
-        snap["wide_untested_breakout"] = geometry["stop_distance_pct"] >= SOFT_WIDE_STOP_PCT
-    else:
-        snap["wide_untested_breakout"] = False
+    # With fixed 0.5% stops, width is uniform. Flag the zone kind only.
+    snap["wide_untested_breakout"] = bool(kind in SOFT_WIDE_BREAKOUT_KINDS)
     # Soft expectancy diagnostic only — never size or hard-gate from this.
     p = snap.get("probability_tp_before_sl")
     if p is not None and rr is not None:
@@ -271,16 +358,27 @@ def evaluate_soft_filters(
         warnings.append("stop_near_100_print")
 
     if snap.get("wide_untested_breakout"):
-        hard_skips.append("wide_stop_untested_breakout")
-        warnings.append("prefer_vwap_equal_or_tight_geometry")
+        # Book A: warning only — 0.5% SL is now uniform. Book B shadows the skip.
+        warnings.append("untested_breakout_zone")
 
-    # After a stop at a magnet, require a different zone id (T1→T2 pattern).
+    # After a stop, require a new zone and block same-side re-entry for a cooldown.
     if last_closed and str(last_closed.get("exit_reason") or "") == "stop":
         prev_geom = stop_geometry(last_closed.get("entry"), last_closed.get("stop"), last_closed.get("side"))
         if prev_geom.get("stop_on_major_magnet"):
             prev_zone = last_closed.get("zone")
             if prev_zone and snap.get("zone") == prev_zone:
                 hard_skips.append("same_zone_after_magnet_stop")
+        last_side = last_closed.get("side")
+        next_side = "long" if snap.get("bias") == "bullish" else "short" if snap.get("bias") == "bearish" else None
+        if last_side and next_side == last_side and last_closed.get("exit_time") and snap.get("timestamp"):
+            try:
+                gap_h = (
+                    pd.Timestamp(snap["timestamp"]) - pd.Timestamp(last_closed["exit_time"])
+                ).total_seconds() / 3600.0
+                if gap_h < SAME_SIDE_COOLDOWN_HOURS:
+                    hard_skips.append("same_side_cooldown_after_stop")
+            except (TypeError, ValueError):
+                pass
 
     return {
         "enabled": True,
@@ -693,6 +791,11 @@ def shadow_rule_skip(snapshot: dict[str, Any], rule: str | None = None) -> dict[
         if dists and min(dists) <= SHADOW_MAGNET_DOLLARS:
             skip = True
             detail = f"stop_magnet_dist={min(dists):.2f}<={SHADOW_MAGNET_DOLLARS:g}"
+    elif rule == "skip_untested_breakout":
+        kind = snap.get("zone_kind") or str(snap.get("zone") or "").split(":", 1)[0]
+        if kind == "untested_breakout":
+            skip = True
+            detail = "zone_kind=untested_breakout"
     else:
         detail = f"unknown_rule:{rule}"
     return {

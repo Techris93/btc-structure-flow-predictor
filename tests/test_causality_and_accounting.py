@@ -12,7 +12,7 @@ def bars(count=83):
 
 class RecordingPredictor:
     def __init__(self, stop=90, target=110): self.calls=[]; self.stop=stop; self.target=target
-    def predict(self, history, trades, equity, frames=None):
+    def predict(self, history, trades, equity, frames=None, **kwargs):
         self.calls.append((history.index[-1], trades.time.max(), frames))
         return PredictorOutput(history.index[-1], "bullish", "reversal", "z", "confirmed", True, 100, self.stop, self.target, 2, None, 1)
 

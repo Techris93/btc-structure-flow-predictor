@@ -12,6 +12,7 @@ from .indicators import atr
 from .models import PredictorOutput
 from .structure import structure_events
 from .zones import build_projected_zones
+from . import live_policy
 
 
 def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,reclaim_bars=15,rearm_bars=3,rearm_atr=.5):
@@ -99,8 +100,13 @@ def pending_flow_reason(sweep):
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5,sweep_rearm_bars=3,sweep_rearm_atr=.5,flow_gate_mode="independent",legacy_orderflow_threshold=.40,market_flow_threshold=.40,raw_footprint_threshold=.40,footprint_price_bucket=25.0,footprint_full_credit_ratio=1.5,venue_freshness_seconds=150,cache_closed_frames=False):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5,sweep_rearm_bars=3,sweep_rearm_atr=.5,flow_gate_mode="independent",legacy_orderflow_threshold=.40,market_flow_threshold=.40,raw_footprint_threshold=.40,footprint_price_bucket=25.0,footprint_full_credit_ratio=1.5,venue_freshness_seconds=150,cache_closed_frames=False,use_fixed_pct_exits=None,stop_pct=None,target_pct=None):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
+        # Default off so isolated strategy tests keep ATR/structural geometry.
+        # Live app passes True (0.5% SL / 1% TP).
+        self.use_fixed_pct_exits=bool(use_fixed_pct_exits) if use_fixed_pct_exits is not None else False
+        self.stop_pct=live_policy.FIXED_STOP_PCT if stop_pct is None else float(stop_pct)
+        self.target_pct=live_policy.FIXED_TARGET_PCT if target_pct is None else float(target_pct)
         self.reclaim_bars=reclaim_bars; self.require_15m_align=require_15m_align; self.half_life_minutes=half_life_minutes
         self.sweep_rearm_bars=max(1,int(sweep_rearm_bars)); self.sweep_rearm_atr=max(0.0,float(sweep_rearm_atr))
         # Late-entry guard: when a confirmed sweep is deeper than
@@ -256,10 +262,17 @@ class Predictor:
         signal_decay = float(np.exp(-delta_t_minutes / tau))
 
         active_targets=[q for q in zones if q.is_active(now) and q.zone_id!=z.zone_id]
-        # Pick the nearest opposing zone that already satisfies min_rr; if none
-        # qualifies, project the target at min_rr*risk (or 2 ATR, whichever is
-        # farther) instead of taking a nearby micro-level that kills the R:R.
-        if bias=="bullish":
+        entry=price; entry_type="market"
+        if self.retrace_entry_atr is not None and sweep.get("depth_atr") is not None and sweep["depth_atr"]>=self.retrace_entry_atr:
+            leg=abs(sweep["extreme"]-price)
+            if leg>0:
+                candidate_entry=(price-self.retrace_pct*leg) if bias=="bullish" else (price+self.retrace_pct*leg)
+                if np.isfinite(candidate_entry) and candidate_entry>0:
+                    entry=candidate_entry; entry_type="limit"
+        if self.use_fixed_pct_exits:
+            geo=live_policy.fixed_pct_exits(entry,bias,stop_pct=self.stop_pct,target_pct=self.target_pct)
+            stop,target,risk,rr=geo["stop"],geo["target"],geo["risk"],geo["reward_risk"]
+        elif bias=="bullish":
             stop=min(sweep["extreme"]-.5*a,price-self.atr_mult*a); risk=price-stop
             options=sorted(q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price)
             target=next((t for t in options if risk>0 and (t-price)/risk>=self.min_rr), None)
@@ -273,25 +286,20 @@ class Predictor:
             if target is None:
                 target=min(price-self.min_rr*risk,price-2*a) if risk>0 else price-2*a
             rr=(price-target)/risk if risk>0 else 0.0
-        entry=price; entry_type="market"
-        if self.retrace_entry_atr is not None and sweep.get("depth_atr") is not None and sweep["depth_atr"]>=self.retrace_entry_atr:
-            leg=abs(sweep["extreme"]-price)
-            if leg>0:
-                # A bullish reclaim should retrace down; a bearish reclaim
-                # should retrace up. The limit must remain on the profitable
-                # side of the stop or we fall back to the market geometry.
-                candidate_entry=(price-self.retrace_pct*leg) if bias=="bullish" else (price+self.retrace_pct*leg)
-                candidate_risk=(candidate_entry-stop) if bias=="bullish" else (stop-candidate_entry)
-                if candidate_risk>0 and np.isfinite(candidate_risk):
-                    entry=candidate_entry; entry_type="limit"; risk=candidate_risk
-                    if bias=="bullish":
-                        target=next((t for t in options if (t-entry)/risk>=self.min_rr),max(entry+self.min_rr*risk,entry+2*a))
-                        rr=(target-entry)/risk
-                    else:
-                        target=next((t for t in options if (entry-t)/risk>=self.min_rr),min(entry-self.min_rr*risk,entry-2*a))
-                        rr=(entry-target)/risk
+        if entry_type=="limit" and not self.use_fixed_pct_exits:
+            candidate_risk=(entry-stop) if bias=="bullish" else (stop-entry)
+            if candidate_risk>0 and np.isfinite(candidate_risk):
+                risk=candidate_risk
+                options=sorted(q.midpoint for q in active_targets if q.side==("above" if bias=="bullish" else "below"))
+                if bias=="bullish":
+                    target=next((t for t in options if t>entry and (t-entry)/risk>=self.min_rr),max(entry+self.min_rr*risk,entry+2*a))
+                    rr=(target-entry)/risk
                 else:
-                    log.info("retrace_entry_skipped bias=%s depth_atr=%.2f market=%.2f candidate=%.2f invalid_risk=%.2f",bias,sweep["depth_atr"],price,candidate_entry,candidate_risk)
+                    target=next((t for t in options if t<entry and (entry-t)/risk>=self.min_rr),min(entry-self.min_rr*risk,entry-2*a))
+                    rr=(entry-target)/risk
+            else:
+                log.info("retrace_entry_skipped bias=%s depth_atr=%.2f market=%.2f candidate=%.2f invalid_risk=%.2f",bias,sweep["depth_atr"],price,entry,candidate_risk)
+                entry=price; entry_type="market"
 
         skipped=[]
         for candidate in active_targets:

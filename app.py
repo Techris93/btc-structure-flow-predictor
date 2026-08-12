@@ -60,9 +60,8 @@ logging.basicConfig(
 logger.setLevel(_log_level)
 data_dir = runtime_dir()
 COLLECTOR_STALE_SECONDS = max(30, int(os.getenv("COLLECTOR_STALE_SECONDS", "90")))
-# Late-entry guard: set RETRACE_ENTRY_ATR (e.g. "1.2") to enter deep sweeps on
-# a RETRACE_PCT pullback limit instead of at market. Empty/unset = disabled.
-_retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "").strip()
+# Late-entry guard: deep sweeps enter on a retrace limit. Set empty to disable.
+_retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "1.2").strip()
 flow_gate_config, flow_calibration_artifact = load_flow_gate(
     os.getenv("FLOW_CALIBRATION_PATH", str(data_dir / "flow_calibration.json")),
     requested_mode=os.getenv("FLOW_GATE_MODE", "independent"),
@@ -88,6 +87,9 @@ predictor = Predictor(
     footprint_price_bucket=flow_gate_config["price_bucket"],
     footprint_full_credit_ratio=flow_gate_config["full_credit_ratio"],
     venue_freshness_seconds=COLLECTOR_STALE_SECONDS,
+    use_fixed_pct_exits=os.getenv("USE_FIXED_PCT_EXITS", "1").lower() in ("1", "true", "yes", "on"),
+    stop_pct=float(os.getenv("FIXED_STOP_PCT", "0.005")),
+    target_pct=float(os.getenv("FIXED_TARGET_PCT", "0.01")),
 )
 live_lock = threading.Lock()
 push_lock = threading.Lock()
@@ -193,6 +195,9 @@ paper_ledger = PaperLedger(
     risk_fraction=float(os.getenv("PAPER_RISK_FRACTION", str(live_policy.RISK_FRACTION))),
     soft_filters=os.getenv("PAPER_SOFT_FILTERS", "1").lower() in ("1", "true", "yes", "on"),
     apply_research_costs=os.getenv("PAPER_APPLY_RESEARCH_COSTS", "1").lower() in ("1", "true", "yes", "on"),
+    use_fixed_pct_exits=os.getenv("USE_FIXED_PCT_EXITS", "1").lower() in ("1", "true", "yes", "on"),
+    max_hold_hours=float(os.getenv("PAPER_MAX_HOLD_HOURS", str(live_policy.MAX_HOLD_HOURS))),
+    fill_min_rr=float(os.getenv("PAPER_FILL_MIN_RR", str(live_policy.FILL_MIN_RR))),
 )
 signal_lifecycle = SignalLifecycle(
     confirm_observations=SIGNAL_CONFIRM_OBSERVATIONS,

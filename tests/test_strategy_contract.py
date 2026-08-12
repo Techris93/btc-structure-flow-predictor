@@ -32,7 +32,7 @@ def test_strategy_uses_setup_atr_checks_all_zones_and_leaves_probability_uncalib
     monkeypatch.setattr("btc_predictor.strategy.build_projected_zones",lambda frame:[near,swept,target])
     monkeypatch.setattr("btc_predictor.strategy.atr",lambda frame:pd.Series(5.,index=frame.index))
     monkeypatch.setattr("btc_predictor.strategy.footprint_confirmation",lambda *a,**k:(True,{"reason":"confirmed","agreement":True}))
-    result=Predictor(min_rr=.1).predict(o,trades,frames=frames)
+    result=Predictor(min_rr=.1, use_fixed_pct_exits=False).predict(o,trades,frames=frames)
     assert result.zone == "swept"
     assert result.stop <= result.entry - 1.5*5
     assert result.probability_tp_before_sl is not None and 0 <= result.probability_tp_before_sl <= 1
@@ -80,7 +80,7 @@ def test_predictor_requires_15m_alignment_with_higher_timeframes(monkeypatch):
 
 
 def test_paper_ledger_keeps_position_when_bias_remains_on_same_side():
-    ledger=PaperLedger()
+    ledger=PaperLedger(use_fixed_pct_exits=False)
     pred=PredictorOutput(
         timestamp=pd.Timestamp("2025-01-01",tz="UTC"),
         bias="bullish",
@@ -129,7 +129,7 @@ def test_paper_ledger_ignores_bars_before_entry():
         },
         index=idx,
     )
-    ledger = PaperLedger()
+    ledger = PaperLedger(use_fixed_pct_exits=False)
     pred = PredictorOutput(
         timestamp=idx[-1],
         bias="bullish",
@@ -164,7 +164,7 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
     path = tmp_path / "paper_ledger.json"
     # Lifecycle/persistence unit test: disable soft filters so magnet stops
     # used as fixtures do not interact with unproven postmortem heuristics.
-    ledger = PaperLedger(path, soft_filters=False)
+    ledger = PaperLedger(path, soft_filters=False, use_fixed_pct_exits=False)
     # Since path didn't exist, it seeds the 3 historical trades
     status = ledger._status()
     assert status["closed_trades"] == 3
@@ -214,7 +214,7 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
 
 def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
     """A re-emitted signal for the same setup keeps its original trade."""
-    ledger = PaperLedger(tmp_path / "ledger.json")
+    ledger = PaperLedger(tmp_path / "ledger.json", use_fixed_pct_exits=False)
     base = dict(
         bias="bearish",
         stop=65200.0,
@@ -292,7 +292,7 @@ def test_deep_sweep_retrace_entry_is_directional_and_recomputes_rr(monkeypatch):
     )
     monkeypatch.setattr("btc_predictor.strategy.build_projected_zones", lambda frame: [sweep_zone, target_zone])
 
-    result = Predictor(retrace_entry_atr=1.2).predict(ohlc, trades, frames=frames)
+    result = Predictor(retrace_entry_atr=1.2, use_fixed_pct_exits=False).predict(ohlc, trades, frames=frames)
 
     assert result.entry_type == "limit"
     assert result.entry < 100.0
@@ -312,7 +312,7 @@ def test_pending_retrace_order_waits_for_a_real_limit_touch(tmp_path):
         sweep_time="2026-01-01 00:00:00+00:00",
         entry_type="limit",
     )
-    ledger = PaperLedger(tmp_path / "ledger.json")
+    ledger = PaperLedger(tmp_path / "ledger.json", use_fixed_pct_exits=False)
 
     signal_bar = pd.DataFrame(
         {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0]},
@@ -354,6 +354,7 @@ def test_paper_ledger_lifecycle_neutral_exit_and_unrealized_pnl(tmp_path):
         tmp_path / "ledger.json",
         neutral_exit_observations=3,
         soft_filters=False,
+        use_fixed_pct_exits=False,
     )
     pred_open = PredictorOutput(
         timestamp=pd.Timestamp("2026-07-25 10:00", tz="UTC"),
@@ -397,7 +398,7 @@ def test_paper_ledger_lifecycle_neutral_exit_and_unrealized_pnl(tmp_path):
     assert status["last_closed"]["exit"] == 64900.0
 
     # A directional re-confirmation resets the neutral grace counter.
-    ledger2 = PaperLedger(tmp_path / "ledger2.json", neutral_exit_observations=3)
+    ledger2 = PaperLedger(tmp_path / "ledger2.json", neutral_exit_observations=3, use_fixed_pct_exits=False)
     ledger2.apply_lifecycle([confirmed_event(pred_open, "signal-1")])
     ledger2.update(neutral(1), ohlc)
     ledger2.update(
@@ -420,7 +421,7 @@ def test_paper_ledger_lifecycle_neutral_exit_and_unrealized_pnl(tmp_path):
 
 def test_legacy_position_signal_binding_is_persisted_without_close(tmp_path):
     path = tmp_path / "ledger.json"
-    ledger = PaperLedger(path)
+    ledger = PaperLedger(path, use_fixed_pct_exits=False)
     pred = PredictorOutput(
         timestamp=pd.Timestamp("2026-07-25 10:00", tz="UTC"),
         bias="bullish",
@@ -436,12 +437,12 @@ def test_legacy_position_signal_binding_is_persisted_without_close(tmp_path):
     assert ledger.bind_active_signal("adopted-signal") is True
     assert ledger._pending["signal_id"] == "adopted-signal"
     assert len(ledger._closed) == closed_before
-    reloaded = PaperLedger(path)
+    reloaded = PaperLedger(path, use_fixed_pct_exits=False)
     assert reloaded._pending["signal_id"] == "adopted-signal"
 
 
 def test_market_signal_fills_next_open_and_preserves_planned_risk(tmp_path):
-    ledger=PaperLedger(tmp_path/"ledger.json")
+    ledger=PaperLedger(tmp_path/"ledger.json", use_fixed_pct_exits=False, fill_min_rr=0.0)
     decision=pd.Timestamp("2026-01-01 00:00",tz="UTC")
     prediction=PredictorOutput(
         timestamp=decision,bias="bullish",entry=100.0,stop=95.0,target=110.0,
@@ -461,7 +462,7 @@ def test_market_signal_fills_next_open_and_preserves_planned_risk(tmp_path):
 
 
 def test_pending_retrace_order_cancels_only_after_lifecycle_neutralization(tmp_path):
-    ledger = PaperLedger(tmp_path / "ledger.json", neutral_exit_observations=2)
+    ledger = PaperLedger(tmp_path / "ledger.json", neutral_exit_observations=2, use_fixed_pct_exits=False)
     t0 = pd.Timestamp("2026-01-01 00:00", tz="UTC")
     pending = PredictorOutput(
         timestamp=t0,

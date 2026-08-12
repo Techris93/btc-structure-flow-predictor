@@ -22,7 +22,7 @@ def test_seeded_rescore_reports_gross_vs_net():
 
 
 def test_paper_ledger_uses_research_economics_on_close():
-    ledger = PaperLedger(soft_filters=False, apply_research_costs=True)
+    ledger = PaperLedger(soft_filters=False, apply_research_costs=True, use_fixed_pct_exits=False)
     # Clear seeded history for a pure unit trade.
     ledger._closed = []
     ledger._equity = 100_000.0
@@ -79,7 +79,7 @@ def test_soft_filter_skips_hero_rr_and_round_magnet_stop():
 
 
 def test_soft_filter_blocks_on_ledger_place():
-    ledger = PaperLedger(soft_filters=True)
+    ledger = PaperLedger(soft_filters=True, use_fixed_pct_exits=False)
     ledger._closed = []
     ledger._equity = 100_000.0
     event = {

@@ -44,12 +44,16 @@ Paper accounting matches research defaults: **fee 5 bps + slippage 2 bps**. Dash
 |---------|----------|
 | Decision snapshots | Full geometry/flow/regime fields on each confirmed setup (`decision_snapshots.json`, closed trades) |
 | Fail closed | No new paper entries unless `MARKET_TYPE=linear` and Binance+Bybit futures feeds are fresh (not spot/mixed/stale) |
-| Risk | 0.25% risk fraction; max notional 1.5× equity; daily −2R / weekly −4R stops; one open risk unit |
-| Soft filters | Unproven postmortem heuristics (hero RR, stop-on-round magnet, wide `untested_breakout`); labeled unvalidated |
+| Risk | 0.25% risk; max notional **1.0×** equity; daily −2R / weekly −4R; one open unit |
+| Exits | **0.5% stop / 1% target** of Bitcoin price from the fill (2R). Exact percents — no $100 magnet nudge. |
+| Fill gate | Next-open fill is cancelled if RR &lt; 1.5 after rebase |
+| Time / cooldown | Flatten at **12h** if SL/TP not hit; no same-side re-entry for **8h** after a stop |
+| Retrace | Deep sweeps (`RETRACE_ENTRY_ATR=1.2`) use a limit pullback instead of chasing next open |
+| Soft filters | Unproven (hero RR, major magnet, same-side cooldown); `untested_breakout` is Book B shadow-only |
 | Probability | Heuristic **display/log only** — never used for sizing or hard lifecycle ranking |
 | Retune discipline | No parameter changes until ≥40 closed paper trades or 90 days; review metrics only |
 | Funnel diary | Weekly counters at `/api/funnel` |
-| Shadow book B | Forward-only extra skip (`skip_planned_rr_above_2_5` by default) at `/api/shadow` |
+| Shadow book B | Forward-only extra skip (`skip_untested_breakout` by default) at `/api/shadow` |
 | Calibration read-only | `/api/calibration` — stay on `independent` unless an artifact already passed promotion |
 
 Policy API: `GET /api/policy`. Seeded three-trade rescore: `GET /api/paper/rescore` and `outputs/seeded_trade_rescore.json`.
