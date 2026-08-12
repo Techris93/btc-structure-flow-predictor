@@ -40,6 +40,7 @@ from btc_predictor.paper_position import PaperLedger
 from btc_predictor.signal_lifecycle import SignalLifecycle
 from btc_predictor.flow_gate import load_flow_gate
 from btc_predictor.flow_state import FlowStateStore
+from btc_predictor import live_policy
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -126,6 +127,10 @@ signal_lifecycle_store = JsonStore(data_dir / "signal_lifecycle.json")
 signal_event_queue_store = JsonStore(data_dir / "signal_event_queue.json")
 live_state_store = JsonStore(data_dir / "live_state.json")
 research_status_store = JsonStore(os.getenv("BTC_RESEARCH_STATUS", str(data_dir / "research/status.json")))
+funnel_diary_store = JsonStore(data_dir / "funnel_diary.json")
+decision_snapshot_store = JsonStore(data_dir / "decision_snapshots.json")
+shadow_book_store = JsonStore(data_dir / "shadow_book.json")
+ops_reliability_store = JsonStore(data_dir / "ops_reliability.json")
 push_subscriptions = subscription_store.read([])
 
 PUSH_ALLOWED_HOST_SUFFIXES = tuple(
@@ -180,6 +185,14 @@ flow_state_store = FlowStateStore(
 paper_ledger = PaperLedger(
     os.getenv("PAPER_LEDGER_PATH", str(data_dir / "paper_ledger.json")),
     neutral_exit_observations=max(1, int(os.getenv("NEUTRAL_EXIT_OBSERVATIONS", "3"))),
+    fee_bps=float(os.getenv("PAPER_FEE_BPS", str(live_policy.RESEARCH_FEE_BPS))),
+    slippage_bps=float(os.getenv("PAPER_SLIPPAGE_BPS", str(live_policy.RESEARCH_SLIPPAGE_BPS))),
+    max_notional_multiple=float(os.getenv("PAPER_MAX_NOTIONAL_MULTIPLE", str(live_policy.MAX_NOTIONAL_MULTIPLE))),
+    daily_loss_r=float(os.getenv("PAPER_DAILY_LOSS_R", str(live_policy.DAILY_LOSS_R))),
+    weekly_loss_r=float(os.getenv("PAPER_WEEKLY_LOSS_R", str(live_policy.WEEKLY_LOSS_R))),
+    risk_fraction=float(os.getenv("PAPER_RISK_FRACTION", str(live_policy.RISK_FRACTION))),
+    soft_filters=os.getenv("PAPER_SOFT_FILTERS", "1").lower() in ("1", "true", "yes", "on"),
+    apply_research_costs=os.getenv("PAPER_APPLY_RESEARCH_COSTS", "1").lower() in ("1", "true", "yes", "on"),
 )
 signal_lifecycle = SignalLifecycle(
     confirm_observations=SIGNAL_CONFIRM_OBSERVATIONS,
@@ -187,6 +200,16 @@ signal_lifecycle = SignalLifecycle(
     bias_observations=BIAS_CONFIRM_OBSERVATIONS,
     replacement_distance_atr=SIGNAL_REPLACEMENT_DISTANCE_ATR,
 )
+funnel_diary = live_policy.FunnelDiary(funnel_diary_store)
+decision_snapshot_log = live_policy.DecisionSnapshotLog(decision_snapshot_store)
+shadow_book = live_policy.ShadowBook(shadow_book_store)
+ops_reliability = live_policy.OpsReliability(ops_reliability_store)
+try:
+    live_policy.write_seeded_rescore_report(Path(data_dir) / "seeded_trade_rescore.json")
+    # Also keep a repo-visible copy for offline review when runtime is work/.
+    live_policy.write_seeded_rescore_report(Path("outputs") / "seeded_trade_rescore.json")
+except Exception:
+    logger.exception("Failed to write seeded trade rescore report")
 
 MARKET_TYPE = os.getenv("MARKET_TYPE", "linear").lower()
 if MARKET_TYPE not in ("spot", "linear"):
@@ -1268,6 +1291,73 @@ def _live_poll_interval_seconds():
     return max(20, int(os.getenv("LIVE_POLL_SECONDS", "45")))
 
 
+def _prediction_fail_closed(result, reason: str):
+    """Clear tradeable fields while preserving diagnostics (research-only mode)."""
+    from dataclasses import replace
+    from btc_predictor.models import PredictorOutput
+    if result is None:
+        return result
+    if isinstance(result, PredictorOutput):
+        return replace(
+            result,
+            setup_type=None,
+            entry=None,
+            stop=None,
+            target=None,
+            position_size=0.0,
+            orderflow_confirmation=False,
+            no_trade_reason=reason,
+            probability_tp_before_sl=result.probability_tp_before_sl,
+        )
+    # Dict-shaped persisted predictions.
+    blocked = dict(result)
+    blocked.update({
+        "setup_type": None,
+        "entry": None,
+        "stop": None,
+        "target": None,
+        "position_size": 0.0,
+        "orderflow_confirmation": False,
+        "no_trade_reason": reason,
+    })
+    return blocked
+
+
+def _governance_payload(paper_status=None, data_quality=None):
+    paper_status = paper_status if paper_status is not None else paper_ledger._status()
+    closed = int(paper_status.get("closed_trades") or 0)
+    return {
+        "policy": live_policy.policy_manifest(),
+        "data_quality": data_quality or live_policy.evaluate_data_quality(
+            market_type=MARKET_TYPE,
+            binance_feed_mode=None,
+            stale_exchanges=[],
+        ),
+        "economics": paper_status.get("economics") or live_policy.research_economics(),
+        "pnl_reporting": paper_status.get("pnl_reporting"),
+        "retune_discipline": paper_status.get("retune_discipline")
+            or live_policy.retune_discipline_status(closed),
+        "funnel": funnel_diary.status(),
+        "shadow_book": shadow_book.status(),
+        "decision_snapshots": decision_snapshot_log.status(),
+        "calibration": live_policy.calibration_status(
+            flow_calibration_artifact, flow_gate_config
+        ),
+        "ops": ops_reliability.status(
+            paper_status=paper_status,
+            live_loop=_live_loop_diagnostics(),
+            data_quality=data_quality,
+        ),
+        "seeded_trade_rescore": live_policy.rescore_seeded_trades(),
+        "probability_policy": {
+            "source": live_policy.PROBABILITY_SOURCE,
+            "use": live_policy.PROBABILITY_USE,
+            "sizing": "fixed_risk_fraction_only",
+            "lifecycle_ranking": "soft_diagnostic_only",
+        },
+    }
+
+
 def _process_rss_mb():
     """Read current resident memory on Linux without a third-party package."""
     try:
@@ -1554,6 +1644,24 @@ def _live_loop():
                 )
             else:
                 result = decision_gate.value
+            # Fail closed on bad data before paper lifecycle can confirm entries.
+            binance_ws_fresh_pre = bool((collectors.get("binance") or {}).get("fresh"))
+            bybit_pipeline_ok_pre = bool((collectors.get("bybit") or {}).get("fresh"))
+            binance_pipeline_ok_pre = binance_ws_fresh_pre and flow_source is not None
+            stale_pre = []
+            if not bybit_pipeline_ok_pre:
+                stale_pre.append("bybit")
+            if not binance_pipeline_ok_pre:
+                stale_pre.append("binance")
+            data_quality = live_policy.evaluate_data_quality(
+                market_type=MARKET_TYPE,
+                binance_feed_mode=(collectors.get("binance") or {}).get("mode"),
+                stale_exchanges=stale_pre,
+                collectors=collectors,
+                binance_data_path=binance_data_path,
+            )
+            if new_decision and not data_quality.get("tradable"):
+                result = _prediction_fail_closed(result, "data_quality_fail_closed")
             _set_live_loop_phase("updating_paper")
             # Apply market facts first. Raw predictions are never allowed to
             # open, invalidate or supersede a paper position.
@@ -1588,6 +1696,13 @@ def _live_loop():
                 lifecycle_state, lifecycle_events = signal_lifecycle.evaluate(
                     lifecycle_before, result, market_paper_status, notification_now
                 )
+                # Drop new entries when data quality is research-only; still
+                # allow invalidation/expiry events for open theses.
+                if not data_quality.get("tradable"):
+                    lifecycle_events = [
+                        event for event in lifecycle_events
+                        if str(event.get("event_type") or "") != "setup_confirmed"
+                    ]
                 decision_paper_status = paper_ledger.apply_lifecycle(lifecycle_events, ohlc)
                 # Persist lifecycle after idempotent ledger application. If
                 # the process dies between these writes, replaying the event
@@ -1600,6 +1715,35 @@ def _live_loop():
                     list(market_paper_status.get("newly_closed") or [])
                     + list(decision_paper_status.get("newly_closed") or [])
                 )
+                # Instrumentation: funnel, decision snapshots, shadow book.
+                try:
+                    funnel_diary.record_prediction(
+                        result,
+                        ts=notification_now,
+                        blocked_data=not data_quality.get("tradable"),
+                    )
+                    if paper_status.get("newly_closed"):
+                        funnel_diary.record("paper_exits", ts=notification_now, n=len(paper_status["newly_closed"]))
+                    if any(str(e.get("event_type")) == "setup_confirmed" for e in lifecycle_events):
+                        funnel_diary.record("paper_entries", ts=notification_now)
+                    reject = paper_status.get("last_reject") or {}
+                    if reject.get("reason") == "soft_filter":
+                        funnel_diary.record("soft_filter_skips", ts=notification_now)
+                    if reject.get("reason") == "risk_cap":
+                        funnel_diary.record("risk_cap_skips", ts=notification_now)
+                    decision_snapshot_log.append(
+                        SignalLifecycle.snapshot(result),
+                        meta={
+                            "data_quality": data_quality,
+                            "lifecycle_events": [e.get("event_type") for e in lifecycle_events],
+                            "last_reject": reject or None,
+                        },
+                    )
+                    for event in lifecycle_events:
+                        if str(event.get("event_type") or "") == "setup_confirmed":
+                            shadow_book.observe_confirmed(event)
+                except Exception:
+                    logger.exception("Live governance instrumentation failed")
             try:
                 _notify_paper_exits(paper_status.get("newly_closed") or [])
             except Exception:
@@ -1703,11 +1847,23 @@ def _live_loop():
                     "calibration_run_hash": flow_gate_config.get("artifact_run_hash"),
                 },
             }
+            # Refresh data-quality with final feed_status inputs.
+            data_quality = live_policy.evaluate_data_quality(
+                market_type=MARKET_TYPE,
+                binance_feed_mode=collectors.get("binance", {}).get("mode", "unknown"),
+                stale_exchanges=stale_exchanges,
+                collectors=collectors,
+                binance_data_path=binance_data_path,
+            )
+            pred_dict = dict(result.__dict__) if hasattr(result, "__dict__") else dict(result or {})
+            pred_dict["probability_source"] = live_policy.PROBABILITY_SOURCE
+            pred_dict["probability_use"] = live_policy.PROBABILITY_USE
+            pred_dict["probability_tp_before_sl_is_heuristic"] = True
             next_state = {
                 "status": feed_status,
                 "source": sources,
                 "market_type": MARKET_TYPE,
-                "prediction": dict(result.__dict__),
+                "prediction": pred_dict,
                 "paper": paper_status,
                 "binance_feed_mode": collectors.get("binance", {}).get("mode", "unknown"),
                 "flow_source": flow_source,
@@ -1722,6 +1878,8 @@ def _live_loop():
                 "flow_baseline_last_ok_at": flow_baseline_last_ok_at.isoformat() if flow_baseline_last_ok_at else None,
                 "orderflow_input_last_ok_at": orderflow_input_last_ok_at.isoformat() if orderflow_input_last_ok_at else None,
                 "data_health": data_health,
+                "data_quality": data_quality,
+                "governance": _governance_payload(paper_status, data_quality),
                 "decision": {
                     "policy": "immutable_closed_bar",
                     "bar_at": decision_gate.bar_at.isoformat() if decision_gate.bar_at is not None else None,
@@ -2050,14 +2208,20 @@ def api_live():
     if not live_thread_started: state = live_state_store.read(state)
     if state.get("prediction"):
         state["prediction"] = dict(state["prediction"]); state["prediction"]["timestamp"] = str(state["prediction"]["timestamp"])
+        state["prediction"]["probability_source"] = live_policy.PROBABILITY_SOURCE
+        state["prediction"]["probability_use"] = live_policy.PROBABILITY_USE
+        state["prediction"]["probability_tp_before_sl_is_heuristic"] = True
     last_automatic_delivery = _latest_delivery_summary("automatic")
     last_test_delivery = _latest_delivery_summary("test")
     last_notification_decision = _latest_push_decision()
     push_dispatch = _push_dispatch_diagnostics()
     push_counts = _subscription_counts()
+    paper_status = state.get("paper") or paper_ledger._status()
+    data_quality = state.get("data_quality")
     return jsonify({
         "paper_only": True,
         **state,
+        "governance": state.get("governance") or _governance_payload(paper_status, data_quality),
         "live_loop": _live_loop_diagnostics(),
         "process_rss_mb": _process_rss_mb(),
         "push": {
@@ -2076,6 +2240,53 @@ def api_live():
             "dispatch": push_dispatch,
         },
     })
+
+
+@app.get("/api/policy")
+def api_policy():
+    paper_status = paper_ledger._status()
+    return jsonify(_governance_payload(paper_status, None))
+
+
+@app.get("/api/funnel")
+def api_funnel():
+    return jsonify(funnel_diary.status())
+
+
+@app.get("/api/shadow")
+def api_shadow():
+    return jsonify(shadow_book.status())
+
+
+@app.get("/api/paper/economics")
+def api_paper_economics():
+    status = paper_ledger._status()
+    return jsonify({
+        "economics": status.get("economics"),
+        "pnl_reporting": status.get("pnl_reporting"),
+        "gross_pnl": status.get("gross_pnl"),
+        "net_pnl": status.get("net_pnl"),
+        "fees_paid": status.get("fees_paid"),
+        "slippage_cost": status.get("slippage_cost"),
+        "equity_gross": status.get("equity_gross"),
+        "equity_net": status.get("equity_net"),
+        "expectancy_r_net": status.get("expectancy_r_net"),
+        "sum_r_gross": status.get("sum_r_gross"),
+        "sum_r_net": status.get("sum_r_net"),
+        "closed_trades": status.get("closed_trades"),
+        "recent_closed": status.get("recent_closed"),
+        "retune_discipline": status.get("retune_discipline"),
+    })
+
+
+@app.get("/api/paper/rescore")
+def api_paper_rescore():
+    return jsonify(live_policy.rescore_seeded_trades())
+
+
+@app.get("/api/calibration")
+def api_calibration():
+    return jsonify(live_policy.calibration_status(flow_calibration_artifact, flow_gate_config))
 
 
 @app.get("/api/backtest/one-year")

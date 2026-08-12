@@ -162,7 +162,9 @@ def test_paper_ledger_ignores_bars_before_entry():
 
 def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
     path = tmp_path / "paper_ledger.json"
-    ledger = PaperLedger(path)
+    # Lifecycle/persistence unit test: disable soft filters so magnet stops
+    # used as fixtures do not interact with unproven postmortem heuristics.
+    ledger = PaperLedger(path, soft_filters=False)
     # Since path didn't exist, it seeds the 3 historical trades
     status = ledger._status()
     assert status["closed_trades"] == 3
@@ -348,7 +350,11 @@ def test_pending_retrace_order_waits_for_a_real_limit_touch(tmp_path):
 
 def test_paper_ledger_lifecycle_neutral_exit_and_unrealized_pnl(tmp_path):
     """Lifecycle neutralization closes a dead thesis; raw neutral is inert."""
-    ledger = PaperLedger(tmp_path / "ledger.json", neutral_exit_observations=3)
+    ledger = PaperLedger(
+        tmp_path / "ledger.json",
+        neutral_exit_observations=3,
+        soft_filters=False,
+    )
     pred_open = PredictorOutput(
         timestamp=pd.Timestamp("2026-07-25 10:00", tz="UTC"),
         bias="bearish",
@@ -372,8 +378,10 @@ def test_paper_ledger_lifecycle_neutral_exit_and_unrealized_pnl(tmp_path):
 
     status = ledger.update(neutral(1), ohlc)
     assert ledger._open is not None
-    assert status["open_unrealized_pnl"] == 100.0
-    assert status["mark_to_market_equity"] == round(status["equity"] + 100.0, 2)
+    # Gross MTM is +100; net applies research fee+slip on the mark.
+    assert status["open_unrealized_pnl_gross"] == 100.0
+    assert status["open_unrealized_pnl"] < 100.0
+    assert status["mark_to_market_equity"] == round(status["equity"] + status["open_unrealized_pnl"], 2)
 
     ledger.update(neutral(2), ohlc)
     ledger.update(neutral(3), ohlc)

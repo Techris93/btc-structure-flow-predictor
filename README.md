@@ -34,7 +34,25 @@ print(stats)
 - Walk-forward splits keep test bars after the training window.
 - The live connectors are adapters only; raw events should be persisted append-only and replayed deterministically.
 
-This remains research-only: it does not place orders, and `probability_tp_before_sl` remains null until out-of-sample calibration exists.
+This remains research-only: it does not place live exchange orders.
+
+### Live paper governance (no long backtest required)
+
+Paper accounting matches research defaults: **fee 5 bps + slippage 2 bps**. Dashboard and `/api/paper/economics` report **gross vs approx-net** — do not treat gross as alpha.
+
+| Control | Behavior |
+|---------|----------|
+| Decision snapshots | Full geometry/flow/regime fields on each confirmed setup (`decision_snapshots.json`, closed trades) |
+| Fail closed | No new paper entries unless `MARKET_TYPE=linear` and Binance+Bybit futures feeds are fresh (not spot/mixed/stale) |
+| Risk | 0.25% risk fraction; max notional 1.5× equity; daily −2R / weekly −4R stops; one open risk unit |
+| Soft filters | Unproven postmortem heuristics (hero RR, stop-on-round magnet, wide `untested_breakout`); labeled unvalidated |
+| Probability | Heuristic **display/log only** — never used for sizing or hard lifecycle ranking |
+| Retune discipline | No parameter changes until ≥40 closed paper trades or 90 days; review metrics only |
+| Funnel diary | Weekly counters at `/api/funnel` |
+| Shadow book B | Forward-only extra skip (`skip_planned_rr_above_2_5` by default) at `/api/shadow` |
+| Calibration read-only | `/api/calibration` — stay on `independent` unless an artifact already passed promotion |
+
+Policy API: `GET /api/policy`. Seeded three-trade rescore: `GET /api/paper/rescore` and `outputs/seeded_trade_rescore.json`.
 
 ## Live feature contract
 

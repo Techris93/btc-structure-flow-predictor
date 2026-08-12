@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 
+from btc_predictor import live_policy
+
 
 def _value(source: Any, name: str, default=None):
     if isinstance(source, dict):
@@ -69,6 +71,7 @@ class SignalLifecycle:
             "zone",
             "zone_kind",
             "sweep_status",
+            "sweep_depth_atr",
             "sweep_time",
             "reclaim_time",
             "orderflow_confirmation",
@@ -100,7 +103,8 @@ class SignalLifecycle:
         snapshot = {field: _value(prediction, field) for field in fields}
         for field in ("timestamp", "sweep_time", "reclaim_time"):
             snapshot[field] = _timestamp(snapshot.get(field))
-        return snapshot
+        # Geometry + heuristic-p metadata for durable decision logs.
+        return live_policy.enrich_decision_snapshot(snapshot)
 
     @staticmethod
     def is_actionable(snapshot):
@@ -138,6 +142,7 @@ class SignalLifecycle:
 
     @staticmethod
     def _expectancy(snapshot):
+        """Soft diagnostic only — probability is heuristic/uncalibrated."""
         probability = snapshot.get("probability_tp_before_sl")
         reward_risk = snapshot.get("reward_risk")
         if probability is None or reward_risk is None:
@@ -146,7 +151,12 @@ class SignalLifecycle:
         return probability * float(reward_risk) - (1.0 - probability)
 
     def _material_replacement(self, active, snapshot):
-        """Reject same-direction scanner drift while allowing real episodes."""
+        """Reject same-direction scanner drift while allowing real episodes.
+
+        Replacement is structural (bias/zone/entry distance). Heuristic
+        probability expectancy is logged as a soft diagnostic and must not
+        hard-gate replacement until calibrated out of sample.
+        """
         current = (active or {}).get("snapshot") or {}
         if not current:
             return True
@@ -162,10 +172,16 @@ class SignalLifecycle:
         if entry is None or current_entry is None or not setup_atr:
             return False
         separated = abs(float(entry) - float(current_entry)) >= self.replacement_distance_atr * float(setup_atr)
+        # Soft diagnostic only (not used for the allow decision).
         candidate_edge = self._expectancy(snapshot)
         current_edge = self._expectancy(current)
-        improved = candidate_edge is not None and (current_edge is None or candidate_edge > current_edge)
-        return bool(separated and improved)
+        snapshot["soft_expectancy_r"] = candidate_edge
+        snapshot["soft_expectancy_vs_active"] = (
+            None if candidate_edge is None or current_edge is None
+            else float(candidate_edge) - float(current_edge)
+        )
+        snapshot["soft_expectancy_is_diagnostic"] = True
+        return bool(separated)
 
     @staticmethod
     def _retire(state, signal_id):

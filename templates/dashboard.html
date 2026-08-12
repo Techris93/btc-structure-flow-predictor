@@ -510,13 +510,30 @@
 
             <section class="section">
               <h2>Paper performance</h2>
-              <div class="row"><span>Equity</span><span id="paperequity" class="mono">—</span></div>
-              <div class="row"><span>Mark-to-market equity</span><span id="papermtm" class="mono">—</span></div>
-              <div class="row"><span>Net P&amp;L</span><span id="paperpnl" class="mono">—</span></div>
-              <div class="row"><span>Open unrealized P&amp;L</span><span id="paperunrealized" class="mono">—</span></div>
+              <div class="row"><span>Equity (net)</span><span id="paperequity" class="mono">—</span></div>
+              <div class="row"><span>Equity (gross)</span><span id="paperequitygross" class="mono">—</span></div>
+              <div class="row"><span>Mark-to-market (net)</span><span id="papermtm" class="mono">—</span></div>
+              <div class="row"><span>Gross P&amp;L</span><span id="papergross" class="mono">—</span></div>
+              <div class="row"><span>Approx net P&amp;L</span><span id="paperpnl" class="mono">—</span></div>
+              <div class="row"><span>Fees + slip</span><span id="papercosts" class="mono">—</span></div>
+              <div class="row"><span>Open unrealized (net)</span><span id="paperunrealized" class="mono">—</span></div>
               <div class="row"><span>Closed trades</span><span id="papertrades">—</span></div>
               <div class="row"><span>Win rate</span><span id="winrate">—</span></div>
-              <div class="row"><span>Profit factor</span><span id="pf">—</span></div>
+              <div class="row"><span>Profit factor (net)</span><span id="pf">—</span></div>
+              <div class="row"><span>Expectancy R (net)</span><span id="paperexpr" class="mono">—</span></div>
+              <p class="footer-note" id="papernote">Gross ≠ alpha. Net uses research fee 5 bps + slip 2 bps.</p>
+            </section>
+
+            <section class="section">
+              <h2>Live policy</h2>
+              <div class="row"><span>Data quality</span><span id="dataquality">—</span></div>
+              <div class="row"><span>Retune allowed</span><span id="retuneallowed">—</span></div>
+              <div class="row"><span>Review by</span><span id="reviewby">—</span></div>
+              <div class="row"><span>Soft filters</span><span id="softfilters">—</span></div>
+              <div class="row"><span>Shadow rule</span><span id="shadowrule">—</span></div>
+              <div class="row"><span>Calibration</span><span id="calstatus">—</span></div>
+              <div class="row"><span>Funnel (week)</span><span id="funnelweek" class="mono">—</span></div>
+              <p class="footer-note">Probability is heuristic / display-only. Fixed 0.25% risk. Flow 0.40 not retuned from small n.</p>
             </section>
           </div>
           <p id="updated" class="footer-note">Waiting for first live update…</p>
@@ -922,9 +939,17 @@
           "mono",
         );
 
-        setText("paperequity", fmtMoney(paper.equity), "mono");
-        setText("papermtm", fmtMoney(paper.mark_to_market_equity ?? paper.equity), "mono");
-        setText("paperpnl", fmtMoney(paper.net_pnl), "mono");
+        setText("paperequity", fmtMoney(paper.equity_net ?? paper.equity), "mono");
+        setText("paperequitygross", fmtMoney(paper.equity_gross ?? paper.equity), "mono");
+        setText("papermtm", fmtMoney(paper.mark_to_market_equity ?? paper.equity_net ?? paper.equity), "mono");
+        setText("papergross", paper.gross_pnl == null ? "—" : fmtMoney(paper.gross_pnl), "mono");
+        setText("paperpnl", paper.net_pnl == null ? "—" : fmtMoney(paper.net_pnl), "mono");
+        const costTotal = Number(paper.fees_paid || 0) + Number(paper.slippage_cost || 0);
+        setText(
+          "papercosts",
+          paper.fees_paid == null && paper.slippage_cost == null ? "—" : fmtMoney(costTotal),
+          "mono",
+        );
         setText(
           "paperunrealized",
           paper.open_unrealized_pnl == null ? "—" : fmtMoney(paper.open_unrealized_pnl),
@@ -937,7 +962,60 @@
             : String(paper.closed_trades) + (paper.open_position ? " · open" : ""),
         );
         setText("winrate", paper.win_rate == null ? "—" : fmtPct(paper.win_rate));
-        setText("pf", paper.profit_factor == null ? "—" : fmtNumber(paper.profit_factor, 2), "mono");
+        const pf = paper.profit_factor_net ?? paper.profit_factor;
+        setText("pf", pf == null ? "—" : fmtNumber(pf, 2), "mono");
+        setText(
+          "paperexpr",
+          paper.expectancy_r_net == null ? "—" : fmtNumber(paper.expectancy_r_net, 3),
+          "mono",
+        );
+        if (paper.pnl_reporting && paper.pnl_reporting.label) {
+          setText("papernote", paper.pnl_reporting.label + " — do not treat gross as alpha.");
+        }
+        const gov = s.governance || {};
+        const dq = s.data_quality || gov.data_quality || {};
+        setText(
+          "dataquality",
+          dq.status || (dq.tradable === false ? "research-only / no trade" : dq.tradable ? "tradable" : "—"),
+        );
+        const retune = paper.retune_discipline || gov.retune_discipline || {};
+        setText(
+          "retuneallowed",
+          retune.parameter_changes_allowed == null
+            ? "—"
+            : retune.parameter_changes_allowed
+              ? "yes"
+              : "no",
+        );
+        setText("reviewby", retune.review_by ? String(retune.review_by).slice(0, 10) : "—");
+        const soft = (gov.policy && gov.policy.soft_filters) || {};
+        setText("softfilters", soft.enabled == null ? "—" : soft.enabled ? "on (unproven)" : "off");
+        const shadow = gov.shadow_book || {};
+        setText("shadowrule", shadow.rule || "—");
+        const cal = gov.calibration || {};
+        setText(
+          "calstatus",
+          cal.present
+            ? cal.promotion_passed
+              ? "artifact passed (review)"
+              : "present, not passed"
+            : "none → stay independent",
+        );
+        const funnel = (gov.funnel && gov.funnel.counts) || {};
+        setText(
+          "funnelweek",
+          gov.funnel
+            ? [
+                "n=" + (funnel.decision_bars || 0),
+                "wait=" + (funnel.sweep_waiting || 0),
+                "flowX=" + (funnel.flow_reject || 0),
+                "ok=" + (funnel.flow_pass_actionable || 0),
+                "in=" + (funnel.paper_entries || 0),
+                "out=" + (funnel.paper_exits || 0),
+              ].join(" · ")
+            : "—",
+          "mono",
+        );
 
         const updated = fmtDate(s.updated_at);
         $("updated").textContent =
