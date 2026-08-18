@@ -131,6 +131,7 @@ def footprint_confirmation(
     raw_threshold: float = 0.40,
     gate_mode: str = "independent",
     venue_freshness_seconds: float = 150,
+    setup_type: str = "reversal",
 ):
     features=flow_features_from_bars(flow_bars,window) if flow_bars is not None and not flow_bars.empty else orderflow_features(trades,window=window)
     features=features.loc[features.index<=pd.Timestamp(decision_time)]
@@ -154,16 +155,46 @@ def footprint_confirmation(
 
     low_impact_score = float(recent.low_price_impact_score.mean()) if not recent.empty else 0.5
 
-    if direction=="bullish":
-        extreme=float(((recent.delta_z<-1).sum() + recent.sell_absorption.sum()) / max(len(recent),1))
-        has_reversal=recent_tail.bullish_delta_reversal.any() or current.delta>0 or recent_tail.delta.sum()>0
-        reversal=1.0 if has_reversal else 0.0
+    if setup_type == "continuation":
+        if direction == "bullish":
+            trend_delta = float(((recent.delta_z > 0).sum() + (recent.delta > 0).sum()) / (2 * max(len(recent), 1)))
+            momentum = float((recent.price_response > 0).sum() / max(len(recent), 1)) if not recent.empty else 0.5
+            low_opposing_absorption = float(max(0.0, 1.0 - (recent.sell_absorption.sum() / max(len(recent), 1))))
+        else:
+            trend_delta = float(((recent.delta_z < 0).sum() + (recent.delta < 0).sum()) / (2 * max(len(recent), 1)))
+            momentum = float((recent.price_response < 0).sum() / max(len(recent), 1)) if not recent.empty else 0.5
+            low_opposing_absorption = float(max(0.0, 1.0 - (recent.buy_absorption.sum() / max(len(recent), 1))))
+        extreme = trend_delta
+        reversal = momentum
+        stalled = low_opposing_absorption
+        market_contribution = 0.40 * trend_delta + 0.30 * momentum + 0.30 * low_opposing_absorption
+        market_flow_score = market_contribution
     else:
-        extreme=float(((recent.delta_z>1).sum() + recent.buy_absorption.sum()) / max(len(recent),1))
-        has_reversal=recent_tail.bearish_delta_reversal.any() or current.delta<0 or recent_tail.delta.sum()<0
-        reversal=1.0 if has_reversal else 0.0
-    response_baseline=features.price_response.abs().rolling(20,min_periods=5).median().iloc[-1]
-    stalled=float(min(1.0, (recent.price_response.abs()<=response_baseline).sum() / max(len(recent),1))) if np.isfinite(response_baseline) else 0.0
+        if direction=="bullish":
+            extreme=float(((recent.delta_z<-1).sum() + recent.sell_absorption.sum()) / max(len(recent),1))
+            has_reversal=recent_tail.bullish_delta_reversal.any() or current.delta>0 or recent_tail.delta.sum()>0
+            reversal=1.0 if has_reversal else 0.0
+        else:
+            extreme=float(((recent.delta_z>1).sum() + recent.buy_absorption.sum()) / max(len(recent),1))
+            has_reversal=recent_tail.bearish_delta_reversal.any() or current.delta<0 or recent_tail.delta.sum()<0
+            reversal=1.0 if has_reversal else 0.0
+        response_baseline=features.price_response.abs().rolling(20,min_periods=5).median().iloc[-1]
+        stalled=float(min(1.0, (recent.price_response.abs()<=response_baseline).sum() / max(len(recent),1))) if np.isfinite(response_baseline) else 0.0
+        weights = {
+            "extreme_delta": 0.25,
+            "delta_reversal": 0.25,
+            "price_response": 0.15,
+            "low_price_impact": 0.15,
+            "cross_exchange": 0.10,
+            "footprint_imbalance": 0.10,
+        }
+        market_contribution = (
+            weights["extreme_delta"] * extreme
+            + weights["delta_reversal"] * reversal
+            + weights["price_response"] * stalled
+            + weights["low_price_impact"] * low_impact_score
+        )
+        market_flow_score=market_contribution/0.80
     raw=_sweep_window_trades(trades,sweep_time,decision_time)
     aggregated = footprint_bars.copy() if footprint_bars is not None else pd.DataFrame()
     if not aggregated.empty:
@@ -206,7 +237,8 @@ def footprint_confirmation(
         + weights["price_response"] * stalled
         + weights["low_price_impact"] * low_impact_score
     )
-    market_flow_score=market_contribution/0.80
+    if setup_type != "continuation":
+        market_flow_score=market_contribution/0.80
     raw_footprint_score=0.75*imbalance+0.25*agreement
     if not aggregated.empty:
         fresh_exchanges=set(components.get("fresh_exchanges") or ())

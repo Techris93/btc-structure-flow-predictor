@@ -294,6 +294,7 @@ class PaperLedger:
         order["flow_gate_mode"] = enriched.get("flow_gate_mode")
         order["planned_rr"] = enriched.get("planned_rr") or enriched.get("reward_risk")
         order["reward_risk"] = enriched.get("reward_risk")
+        order["setup_type"] = enriched.get("setup_type") or snapshot.get("setup_type") or "reversal"
         order["stop_distance"] = enriched.get("stop_distance")
         order["stop_distance_pct"] = enriched.get("stop_distance_pct")
         order["stop_on_round_magnet"] = enriched.get("stop_on_round_magnet")
@@ -617,6 +618,7 @@ class PaperLedger:
             "exit_reason": reason,
             "zone": self._open.get("zone"),
             "zone_kind": self._open.get("zone_kind"),
+            "setup_type": self._open.get("setup_type", "reversal"),
             "signal_id": self._open.get("signal_id"),
             "lifecycle_event_id": self._open.get("lifecycle_event_id"),
             "lifecycle_event_type": self._open.get("lifecycle_event_type"),
@@ -667,6 +669,18 @@ class PaperLedger:
             sum_slip = sum(float(t.get("slippage_cost", 0) or 0) for t in closed)
             sum_r_net = sum(float(t.get("r_multiple_net", t.get("r_multiple", 0)) or 0) for t in closed)
             sum_r_gross = sum(float(t.get("r_multiple_gross", t.get("r_multiple", 0)) or 0) for t in closed)
+            setup_type_stats = {}
+            for st in ("reversal", "continuation"):
+                sub = [t for t in closed if str(t.get("setup_type") or "reversal").lower() == st]
+                sub_wins = sum(1 for t in sub if float(t.get("net_pnl", t.get("pnl", 0))) > 0)
+                sub_losses = sum(1 for t in sub if float(t.get("net_pnl", t.get("pnl", 0))) <= 0)
+                setup_type_stats[st] = {
+                    "trades": len(sub),
+                    "wins": sub_wins,
+                    "losses": sub_losses,
+                    "win_rate": round(sub_wins / len(sub), 4) if sub else 0.0,
+                    "net_pnl": round(sum(float(t.get("net_pnl", t.get("pnl", 0))) for t in sub), 2),
+                }
             unrealized = None
             unrealized_gross = None
             if self._open is not None and last_price is not None:
@@ -722,6 +736,7 @@ class PaperLedger:
                 "sum_r_net": round(sum_r_net, 4),
                 "sum_r_gross": round(sum_r_gross, 4),
                 "expectancy_r_net": round(sum_r_net / len(closed), 4) if closed else None,
+                "setup_type_stats": setup_type_stats,
                 "last_closed": closed[-1] if closed else None,
                 "last_reject": self._last_reject,
                 "economics": economics,

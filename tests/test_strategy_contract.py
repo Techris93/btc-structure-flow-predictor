@@ -75,8 +75,12 @@ def test_predictor_requires_15m_alignment_with_higher_timeframes(monkeypatch):
             return "bearish", pd.DataFrame(columns=["bias","event","level"])
         return "bullish", pd.DataFrame(columns=["bias","event","level"])
     monkeypatch.setattr(Predictor,"_last",fake_last)
-    predictor=Predictor()
-    assert predictor._regime_bias(frames)=="neutral"
+    # Decoupled 4H/1H regime (default): 15m pullback does not veto bullish 4H/1H bias
+    predictor=Predictor(require_15m_align=False)
+    assert predictor._regime_bias(frames)=="bullish"
+    # Explicit opt-in for strict 15m alignment vetoes to neutral
+    strict_predictor=Predictor(require_15m_align=True)
+    assert strict_predictor._regime_bias(frames)=="neutral"
 
 
 def test_paper_ledger_keeps_position_when_bias_remains_on_same_side():

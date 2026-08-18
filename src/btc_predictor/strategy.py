@@ -72,6 +72,81 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
     return {"status":"confirmed","confirmed":True,"time":breach_time,"reclaim_time":reclaim_time,"depth_atr":depth,"extreme":extreme}
 
 
+def detect_continuation(ohlc,zone,direction,setup_atr,min_acceptance_bars=1,max_retest_bars=40,retest_tolerance_atr=0.5):
+    """Find a causal breakout & retest continuation episode from closed 1m bars."""
+    eligible=ohlc.copy()
+    eligible.index=pd.to_datetime(eligible.index,utc=True)
+    available_at=pd.Timestamp(zone.available_at)
+    available_at=available_at.tz_localize("UTC") if available_at.tzinfo is None else available_at.tz_convert("UTC")
+    recent=eligible.loc[eligible.index>=available_at].tail(max_retest_bars+1)
+    if len(recent) < min_acceptance_bars + 2:
+        return {"status":"none","confirmed":False}
+
+    breakout_mask = (recent.close.to_numpy() > zone.high) if direction == "bullish" else (recent.close.to_numpy() < zone.low)
+    if not np.any(breakout_mask):
+        return {"status":"none","confirmed":False}
+
+    episodes = []; episode = None
+    tolerance = retest_tolerance_atr * setup_atr
+    for ts, bar in recent.iterrows():
+        accepted = float(bar.close) > zone.high if direction == "bullish" else float(bar.close) < zone.low
+        if accepted and episode is None:
+            episode = {
+                "time": ts,
+                "acceptance_bars": 1,
+                "retest_time": None,
+                "extreme": float(bar.high if direction == "bullish" else bar.low),
+                "retest_extreme": None,
+                "depth_atr": 0.0,
+            }
+            continue
+        if episode is None:
+            continue
+
+        if episode["retest_time"] is None:
+            retesting = (float(bar.low) <= zone.high + tolerance and float(bar.close) >= zone.low - tolerance) if direction == "bullish" else (float(bar.high) >= zone.low - tolerance and float(bar.close) <= zone.high + tolerance)
+            failed_breakout = (float(bar.close) < zone.low - tolerance) if direction == "bullish" else (float(bar.close) > zone.high + tolerance)
+            if failed_breakout:
+                episode = None
+                continue
+            if retesting:
+                retest_extreme = float(bar.low if direction == "bullish" else bar.high)
+                depth = (zone.high - float(bar.low)) / setup_atr if direction == "bullish" else (float(bar.high) - zone.low) / setup_atr
+                if episode.get("retest_extreme") is None or (retest_extreme < episode["retest_extreme"] if direction == "bullish" else retest_extreme > episode["retest_extreme"]):
+                    episode["retest_extreme"] = retest_extreme
+                    episode["depth_atr"] = max(0.0, depth)
+                bounced = (float(bar.close) >= zone.high) if direction == "bullish" else (float(bar.close) <= zone.low)
+                if bounced:
+                    episode["retest_time"] = ts
+                    episodes.append(episode)
+                    episode = None
+            else:
+                if accepted:
+                    episode["acceptance_bars"] += 1
+                    if direction == "bullish":
+                        episode["extreme"] = max(episode["extreme"], float(bar.high))
+                    else:
+                        episode["extreme"] = min(episode["extreme"], float(bar.low))
+
+    if not episodes:
+        if episode is not None and episode.get("retest_extreme") is not None:
+            return {"status":"waiting_retest_confirm","confirmed":False,"time":episode["time"],"depth_atr":episode.get("depth_atr",0.0),"extreme":episode["retest_extreme"]}
+        return {"status":"none","confirmed":False}
+
+    selected = episodes[-1]
+    retest_time = selected.get("retest_time")
+    if retest_time is None:
+        return {"status":"waiting_retest_confirm","confirmed":False,"time":selected["time"],"depth_atr":selected.get("depth_atr",0.0),"extreme":selected.get("retest_extreme",selected["extreme"])}
+    return {
+        "status": "confirmed",
+        "confirmed": True,
+        "time": selected["time"],
+        "reclaim_time": retest_time,
+        "depth_atr": selected.get("depth_atr", 0.0),
+        "extreme": selected.get("retest_extreme", selected["extreme"]),
+    }
+
+
 def zone_reclaim_eligible(zone,at,reclaim_bars=60,bar_freq="1min"):
     """Keep an invalidated zone eligible for its declared reclaim window."""
     at=pd.Timestamp(at)
@@ -93,6 +168,7 @@ def pending_flow_reason(sweep):
     return {
         "none":"awaiting_sweep_breach",
         "waiting_reclaim":"provisional_awaiting_reclaim",
+        "waiting_retest_confirm":"provisional_awaiting_retest_confirm",
         "shallow_excursion":"sweep_depth_below_minimum",
         "excessive_excursion":"sweep_depth_above_maximum",
         "expired_reclaim":"sweep_reclaim_expired",
@@ -100,7 +176,7 @@ def pending_flow_reason(sweep):
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=True,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5,sweep_rearm_bars=3,sweep_rearm_atr=.5,flow_gate_mode="independent",legacy_orderflow_threshold=.40,market_flow_threshold=.40,raw_footprint_threshold=.40,footprint_price_bucket=25.0,footprint_full_credit_ratio=1.5,venue_freshness_seconds=150,cache_closed_frames=False,use_fixed_pct_exits=None,stop_pct=None,target_pct=None):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=False,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5,sweep_rearm_bars=3,sweep_rearm_atr=.5,flow_gate_mode="independent",legacy_orderflow_threshold=.40,market_flow_threshold=.40,raw_footprint_threshold=.40,footprint_price_bucket=25.0,footprint_full_credit_ratio=1.5,venue_freshness_seconds=150,cache_closed_frames=False,use_fixed_pct_exits=None,stop_pct=None,target_pct=None):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         # Default off so isolated strategy tests keep ATR/structural geometry.
         # Live app passes True (0.5% SL / 1% TP).
@@ -165,6 +241,10 @@ class Predictor:
         setup=frames.get("15m"); setup_bias=self._last(setup)[0] if setup is not None else None
         if setup is not None:self.last_regimes["15m"]=setup_bias
         candidate=signals[0] if signals[0]==signals[1] else "neutral"
+        if candidate=="neutral" and signals[0] in ("bullish","bearish"):
+            events_1h = event_sets[1]
+            if not events_1h.empty and events_1h.iloc[-1].bias == signals[0]:
+                candidate = signals[0]
         if candidate=="neutral":return "neutral"
         if self.require_15m_align and setup is not None:
             self.last_regimes["15m"]=setup_bias
@@ -206,16 +286,21 @@ class Predictor:
         now=o.index[-1]; price=float(o.close.iloc[-1]); setup_atr=self._setup_atr(setup); a=float(setup_atr.iloc[-1]) if len(setup_atr) else np.nan
         if bias=="neutral" or not np.isfinite(a):return self._output(now,bias,no_trade_reason="timeframe_conflict" if self.last_regimes["4h"]!=self.last_regimes["1h"] else "neutral_or_unready_structure")
         zones=self._projected_zones(setup); directional=[z for z in zones if zone_reclaim_eligible(z,now,self.reclaim_bars,self.flow_freq) and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above"))]
-        if not directional:return self._output(now,bias,no_trade_reason="no_projected_zone")
-        evaluated=[(z,detect_sweep(o,z,bias,a,*self.sweep_atr,self.reclaim_bars,self.sweep_rearm_bars,self.sweep_rearm_atr)) for z in directional]
+        continuation_zones=[z for z in zones if zone_reclaim_eligible(z,now,self.reclaim_bars,self.flow_freq) and ((bias=="bullish" and z.side=="above") or (bias=="bearish" and z.side=="below"))]
+        if not directional and not continuation_zones:return self._output(now,bias,no_trade_reason="no_projected_zone")
+        evaluated=[]
+        for z in directional:
+            evaluated.append((z, "reversal", detect_sweep(o,z,bias,a,*self.sweep_atr,self.reclaim_bars,self.sweep_rearm_bars,self.sweep_rearm_atr)))
+        for z in continuation_zones:
+            evaluated.append((z, "continuation", detect_continuation(o,z,bias,a)))
         flow_evaluated=[]; observations=[]
-        for z,sweep in evaluated:
+        for z,stype,sweep in evaluated:
             sweep_time=sweep.get("time")
             if sweep_time is None:
-                flow_evaluated.append((z,sweep,None,None)); continue
+                flow_evaluated.append((z,stype,sweep,None,None)); continue
             flow_end=pd.Timestamp(sweep.get("reclaim_time")) if sweep.get("confirmed") and sweep.get("reclaim_time") is not None else now
             usable=t.loc[t.time<flow_end]
-            frozen_key=(bias,pd.Timestamp(sweep_time).isoformat(),flow_end.isoformat(),self.flow_gate_mode,self.legacy_orderflow_threshold,self.market_flow_threshold,self.raw_footprint_threshold,self.footprint_price_bucket,self.footprint_full_credit_ratio) if sweep.get("confirmed") else None
+            frozen_key=(bias,stype,pd.Timestamp(sweep_time).isoformat(),flow_end.isoformat(),self.flow_gate_mode,self.legacy_orderflow_threshold,self.market_flow_threshold,self.raw_footprint_threshold,self.footprint_price_bucket,self.footprint_full_credit_ratio) if sweep.get("confirmed") else None
             cached_flow=self._frozen_flow_cache.get(frozen_key) if frozen_key is not None else None
             if cached_flow is not None:
                 flow_confirm,flow=cached_flow
@@ -230,29 +315,31 @@ class Predictor:
                     raw_threshold=self.raw_footprint_threshold,
                     gate_mode=self.flow_gate_mode,
                     venue_freshness_seconds=self.venue_freshness_seconds,
+                    setup_type=stype,
                 )
                 if frozen_key is not None:self._remember(self._frozen_flow_cache,frozen_key,(flow_confirm,flow),max_entries=256)
             state="frozen" if sweep.get("confirmed") else "provisional"
-            flow_evaluated.append((z,sweep,flow_confirm,flow))
+            flow_evaluated.append((z,stype,sweep,flow_confirm,flow))
             observations.append({
                 "zone":z.zone_id,"sweep_time":pd.Timestamp(sweep_time).isoformat(),
                 "reclaim_time":pd.Timestamp(sweep.get("reclaim_time")).isoformat() if sweep.get("reclaim_time") is not None else None,
-                "sweep_status":sweep.get("status"),"flow_state":state,
+                "sweep_status":sweep.get("status"),"setup_type":stype,"flow_state":state,
                 "market_flow_score":flow.get("market_flow_score"),"raw_footprint_score":flow.get("raw_footprint_score"),
                 "orderflow_score":flow.get("score"),"contributing_exchanges":flow.get("contributing_exchanges") or [],
                 "fresh_exchanges":flow.get("fresh_exchanges") or [],
             })
-        confirmed=[pair for pair in flow_evaluated if pair[1].get("confirmed")]
+        confirmed=[item for item in flow_evaluated if item[2].get("confirmed")]
         if not confirmed:
-            waiting=[p for p in flow_evaluated if p[1].get("status")=="waiting_reclaim"]
-            selected=max(waiting or flow_evaluated,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
-            z,sweep,_,flow=selected
+            waiting=[p for p in flow_evaluated if p[2].get("status") in ("waiting_reclaim","waiting_retest_confirm")]
+            selected=max(waiting or flow_evaluated,key=lambda p:(p[0].score,-abs(price-p[0].midpoint))) if (waiting or flow_evaluated) else None
+            if selected is None:return self._output(now,bias,no_trade_reason="no_projected_zone")
+            z,stype,sweep,_,flow=selected
             diagnostics={"flow_state":"waiting_for_breach"}
             if flow is not None:
                 diagnostics=dict(orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_exchanges=tuple(flow.get("contributing_exchanges") or ()),orderflow_fresh_exchanges=tuple(flow.get("fresh_exchanges") or ()),exchange_agreement=flow.get("agreement",0.0),market_flow_score=flow.get("market_flow_score"),market_flow_threshold=flow.get("market_flow_threshold"),market_flow_confirmed=flow.get("market_flow_confirmed",False),raw_footprint_score=flow.get("raw_footprint_score"),raw_footprint_ratio=flow.get("raw_footprint_ratio"),raw_footprint_threshold=flow.get("raw_footprint_threshold"),raw_footprint_confirmed=flow.get("raw_footprint_confirmed",False),raw_footprint_eligible=flow.get("raw_footprint_eligible",False),flow_state="provisional")
-            return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,sweep_evaluation_status="evaluated",orderflow_evaluation_status="provisional" if flow is not None else "not_evaluated",orderflow_reason=pending_flow_reason(sweep),orderflow_source=flow_source,sweep_observations=tuple(observations),**diagnostics,no_trade_reason="sweep_not_confirmed")
-        z,sweep,confirm,flow=max(confirmed,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
-        flow_diagnostics=dict(sweep_evaluation_status="evaluated",orderflow_evaluation_status="evaluated",orderflow_reason=flow["reason"],orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,orderflow_exchanges=tuple(flow.get("contributing_exchanges") or ()),orderflow_fresh_exchanges=tuple(flow.get("fresh_exchanges") or ()),exchange_agreement=flow.get("agreement",0.0),market_flow_score=flow.get("market_flow_score"),market_flow_threshold=flow.get("market_flow_threshold"),market_flow_confirmed=flow.get("market_flow_confirmed",False),raw_footprint_score=flow.get("raw_footprint_score"),raw_footprint_ratio=flow.get("raw_footprint_ratio"),raw_footprint_threshold=flow.get("raw_footprint_threshold"),raw_footprint_confirmed=flow.get("raw_footprint_confirmed",False),raw_footprint_eligible=flow.get("raw_footprint_eligible",False),flow_state="frozen",sweep_observations=tuple(observations))
+            return self._output(now,bias,setup_type=stype,zone=z.zone_id,zone_kind=z.kind,sweep_status=sweep.get("status","approaching"),sweep_depth_atr=sweep.get("depth_atr"),sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,sweep_evaluation_status="evaluated",orderflow_evaluation_status="provisional" if flow is not None else "not_evaluated",orderflow_reason=pending_flow_reason(sweep),orderflow_source=flow_source,sweep_observations=tuple(observations),**diagnostics,no_trade_reason="sweep_not_confirmed")
+        z,stype,sweep,confirm,flow=max(confirmed,key=lambda p:(p[0].score,-abs(price-p[0].midpoint)))
+        flow_diagnostics=dict(setup_type=stype,sweep_evaluation_status="evaluated",orderflow_evaluation_status="evaluated",orderflow_reason=flow["reason"],orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,orderflow_exchanges=tuple(flow.get("contributing_exchanges") or ()),orderflow_fresh_exchanges=tuple(flow.get("fresh_exchanges") or ()),exchange_agreement=flow.get("agreement",0.0),market_flow_score=flow.get("market_flow_score"),market_flow_threshold=flow.get("market_flow_threshold"),market_flow_confirmed=flow.get("market_flow_confirmed",False),raw_footprint_score=flow.get("raw_footprint_score"),raw_footprint_ratio=flow.get("raw_footprint_ratio"),raw_footprint_threshold=flow.get("raw_footprint_threshold"),raw_footprint_confirmed=flow.get("raw_footprint_confirmed",False),raw_footprint_eligible=flow.get("raw_footprint_eligible",False),flow_state="frozen",sweep_observations=tuple(observations))
         if not confirm:return self._output(now,bias,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,**flow_diagnostics,no_trade_reason="orderflow_not_confirmed")
         
         # Exponential state decay calculation
@@ -313,7 +400,7 @@ class Predictor:
         log.info("target_select bias=%s entry=%.2f stop=%.2f target=%.2f rr=%.2f skipped_zones=%s",bias,entry,stop,target,rr,skipped)
         # Heuristic only — display/log. Never size or hard-gate from this p.
         prob = self._probability_estimate(flow.get("score",0.0), rr, bias, decay=signal_decay)
-        base=dict(setup_type="reversal",zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],orderflow_evaluation_status="evaluated",sweep_evaluation_status="evaluated",orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,orderflow_exchanges=tuple(flow.get("contributing_exchanges") or ()),orderflow_fresh_exchanges=tuple(flow.get("fresh_exchanges") or ()),exchange_agreement=flow.get("agreement"),market_flow_score=flow.get("market_flow_score"),market_flow_threshold=flow.get("market_flow_threshold"),market_flow_confirmed=flow.get("market_flow_confirmed",False),raw_footprint_score=flow.get("raw_footprint_score"),raw_footprint_ratio=flow.get("raw_footprint_ratio"),raw_footprint_threshold=flow.get("raw_footprint_threshold"),raw_footprint_confirmed=flow.get("raw_footprint_confirmed",False),raw_footprint_eligible=flow.get("raw_footprint_eligible",False),flow_state="frozen",sweep_observations=tuple(observations),entry=entry,entry_type=entry_type,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob,setup_atr=a)
+        base=dict(setup_type=stype,zone=z.zone_id,zone_kind=z.kind,sweep_status="confirmed",sweep_depth_atr=sweep["depth_atr"],sweep_time=str(sweep.get("time")) if sweep.get("time") is not None else None,reclaim_time=str(sweep.get("reclaim_time")) if sweep.get("reclaim_time") is not None else None,orderflow_confirmation=True,orderflow_reason=flow["reason"],orderflow_evaluation_status="evaluated",sweep_evaluation_status="evaluated",orderflow_score=flow.get("score"),orderflow_threshold=flow.get("threshold"),orderflow_bars=flow.get("bars"),orderflow_source=flow_source,orderflow_exchanges=tuple(flow.get("contributing_exchanges") or ()),orderflow_fresh_exchanges=tuple(flow.get("fresh_exchanges") or ()),exchange_agreement=flow.get("agreement"),market_flow_score=flow.get("market_flow_score"),market_flow_threshold=flow.get("market_flow_threshold"),market_flow_confirmed=flow.get("market_flow_confirmed",False),raw_footprint_score=flow.get("raw_footprint_score"),raw_footprint_ratio=flow.get("raw_footprint_ratio"),raw_footprint_threshold=flow.get("raw_footprint_threshold"),raw_footprint_confirmed=flow.get("raw_footprint_confirmed",False),raw_footprint_eligible=flow.get("raw_footprint_eligible",False),flow_state="frozen",sweep_observations=tuple(observations),entry=entry,entry_type=entry_type,stop=stop,target=target,reward_risk=rr,probability_tp_before_sl=prob,setup_atr=a)
         if rr<self.min_rr or not np.isfinite(risk) or risk<=0:
             log.info("insufficient_reward_risk bias=%s entry=%.2f stop=%.2f target=%.2f rr=%.2f min_rr=%.2f skipped_zones=%s",bias,entry,stop,target,rr,self.min_rr,skipped)
             return self._output(now,bias,**base,no_trade_reason="insufficient_reward_risk")

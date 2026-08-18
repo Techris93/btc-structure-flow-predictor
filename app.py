@@ -942,7 +942,18 @@ def _paper_exit_event_id(trade):
 
 def _paper_exit_payload(trade, event_id):
     reason = str(trade.get("exit_reason") or "").lower()
-    outcome = "Target hit" if reason == "target" else "Stop hit"
+    if reason == "target":
+        outcome = "Target hit"
+    elif reason == "stop":
+        outcome = "Stop hit"
+    elif reason == "superseded_by_confirmed_setup":
+        outcome = "Setup replaced"
+    elif reason == "signal_neutralized":
+        outcome = "Signal neutralized"
+    elif reason == "signal_flipped":
+        outcome = "Signal flipped"
+    else:
+        outcome = reason.replace("_", " ").capitalize()
     side = str(trade.get("side") or "trade").capitalize()
     exit_price = float(trade.get("exit") or 0.0)
     pnl = float(trade.get("pnl") or 0.0)
@@ -967,7 +978,7 @@ def _notify_paper_exits(newly_closed):
     known_ids = set(notified_ids)
     known_ids.update(item.get("event_id") for item in pending)
     for trade in newly_closed or []:
-        if str(trade.get("exit_reason") or "").lower() not in ("target", "stop"):
+        if str(trade.get("exit_reason") or "").lower() not in ("target", "stop", "superseded_by_confirmed_setup", "signal_neutralized", "signal_flipped"):
             continue
         event_id = _paper_exit_event_id(trade)
         if event_id not in known_ids:
