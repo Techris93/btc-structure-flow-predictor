@@ -150,8 +150,8 @@ class SignalLifecycle:
         probability = float(probability)
         return probability * float(reward_risk) - (1.0 - probability)
 
-    def _material_replacement(self, active, snapshot):
-        """Reject same-direction replacements while allowing opposite reversals.
+    def _material_replacement(self, active, snapshot, has_active_position=True):
+        """Reject same-direction replacements while an actual trade is active.
 
         Under Option A (strict single-position rule), while a position is active,
         additional setups in the SAME direction are diagnostic-only and cannot
@@ -160,6 +160,8 @@ class SignalLifecycle:
         """
         current = (active or {}).get("snapshot") or {}
         if not current:
+            return True
+        if not has_active_position:
             return True
         if snapshot.get("bias") != current.get("bias"):
             return True
@@ -288,6 +290,28 @@ class SignalLifecycle:
         signal_id = self.signal_id(snapshot)
         actionable = signal_id is not None
         active = state.get("active")
+        is_real_paper_status = (
+            isinstance(paper_status, dict)
+            and (
+                "closed_trades" in paper_status
+                or "open_position" in paper_status
+            )
+        )
+        if is_real_paper_status:
+            has_active_position = bool(
+                paper_status.get("open_position")
+                or paper_status.get("pending_order")
+            )
+        else:
+            has_active_position = bool(active)
+
+        # If the paper ledger is flat (e.g. previous trade closed or was skipped),
+        # clear any stale active signal lock so fresh valid setups can be taken and notified.
+        if active and is_real_paper_status and not has_active_position:
+            self._retire(state, active.get("signal_id"))
+            active = None
+            state["active"] = None
+            state["missing_observations"] = 0
 
         # Definitive paper closures terminate the matching active lifecycle.
         for trade in (paper_status or {}).get("newly_closed") or []:
@@ -322,7 +346,7 @@ class SignalLifecycle:
             signal_id = None
             state["candidate"] = None
         if actionable:
-            if active and active.get("signal_id") != signal_id and not self._material_replacement(active, snapshot):
+            if active and active.get("signal_id") != signal_id and not self._material_replacement(active, snapshot, has_active_position=has_active_position):
                 actionable = False
                 signal_id = None
                 state["candidate"] = None

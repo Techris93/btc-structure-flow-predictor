@@ -244,3 +244,62 @@ def test_strict_single_position_same_direction_rejected_opposite_flips(tmp_path)
     assert status3["pending_order"] is not None
     assert status3["pending_order"]["signal_id"] == "sig-long-1"
     assert status3["pending_order"]["side"] == "long"
+
+
+def test_flat_ledger_allows_subsequent_setup_confirmation_after_skipped_signal():
+    """When paper ledger is flat (previous signal skipped or closed), new setup confirms and notifies."""
+    engine = web_app.SignalLifecycle(confirm_observations=2)
+    state = engine.initial_state()
+
+    # 1. Signal 1 confirms in lifecycle
+    pred1 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-08-19 10:00", tz="UTC"),
+        bias="bullish",
+        setup_type="continuation",
+        entry=64332.80,
+        stop=64011.14,
+        target=64976.13,
+        position_size=0.77,
+        zone="zone1",
+        sweep_status="confirmed",
+        sweep_time="2026-08-19T09:58:00+00:00",
+        orderflow_confirmation=True,
+    )
+    state, _ = engine.evaluate(state, pred1, {}, pd.Timestamp("2026-08-19 10:00:30Z"))
+    pred1_b = PredictorOutput(**{**pred1.__dict__, "timestamp": pd.Timestamp("2026-08-19 10:01", tz="UTC")})
+    state, events = engine.evaluate(state, pred1_b, {}, pd.Timestamp("2026-08-19 10:01:30Z"))
+    assert len(events) == 1
+    assert events[0]["event_type"] == "setup_confirmed"
+    assert state["active"] is not None
+
+    # 2. Paper status is passed and shows account is flat (open_position=None, pending_order=None, closed_trades=28)
+    flat_paper_status = {
+        "open_position": None,
+        "pending_order": None,
+        "closed_trades": 28,
+        "equity": 96410.14,
+    }
+
+    # 3. Subsequent Signal 2 (e.g. afternoon breakout at 64,775) arrives while flat
+    pred2 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-08-19 13:42", tz="UTC"),
+        bias="bullish",
+        setup_type="continuation",
+        entry=64775.00,
+        stop=64451.13,
+        target=65422.75,
+        position_size=0.77,
+        zone="zone2",
+        sweep_status="confirmed",
+        sweep_time="2026-08-19T13:40:00+00:00",
+        orderflow_confirmation=True,
+    )
+    state, events2_a = engine.evaluate(state, pred2, flat_paper_status, pd.Timestamp("2026-08-19 13:42:30Z"))
+    assert events2_a == []
+    pred2_b = PredictorOutput(**{**pred2.__dict__, "timestamp": pd.Timestamp("2026-08-19 13:43", tz="UTC")})
+    state, events2_b = engine.evaluate(state, pred2_b, flat_paper_status, pd.Timestamp("2026-08-19 13:43:30Z"))
+
+    # Signal 2 must confirm and notify because the account was flat
+    assert len(events2_b) == 1
+    assert events2_b[0]["event_type"] == "setup_confirmed"
+    assert events2_b[0]["snapshot"]["entry"] == 64775.00
