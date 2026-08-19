@@ -203,8 +203,8 @@ def test_lifecycle_snapshot_includes_geometry():
     assert snap["probability_tp_before_sl_is_heuristic"] is True
 
 
-def test_lifecycle_replacement_does_not_require_heuristic_expectancy():
-    """Structural separation alone is enough; p-ranking is soft only."""
+def test_lifecycle_rejects_same_direction_replacement_while_active():
+    """Option A: Same-direction setups are diagnostic only while an active signal is held."""
     engine = SignalLifecycle(confirm_observations=2, replacement_distance_atr=0.25)
     base = PredictorOutput(
         timestamp=pd.Timestamp("2026-07-28T12:00:00Z"),
@@ -232,7 +232,7 @@ def test_lifecycle_replacement_does_not_require_heuristic_expectancy():
         pd.Timestamp("2026-07-28T12:01:30Z"),
     )
     assert any(e["event_type"] == "setup_confirmed" for e in events)
-    # Worse heuristic p but far entry still replaces.
+    # Same direction (bullish) setup does NOT replace active signal
     far = PredictorOutput(
         **{
             **base.__dict__,
@@ -248,7 +248,29 @@ def test_lifecycle_replacement_does_not_require_heuristic_expectancy():
     assert events == []
     far2 = PredictorOutput(**{**far.__dict__, "timestamp": pd.Timestamp("2026-07-28T12:03:00Z")})
     state, events = engine.evaluate(state, far2, {}, pd.Timestamp("2026-07-28T12:03:30Z"))
-    assert any(e["event_type"] == "setup_confirmed" for e in events)
+    assert events == []
+    assert state["active"]["snapshot"]["zone"] == "equal_lows:abc"
+
+    # An opposite-direction (bearish) confirmed setup DOES replace and flips
+    bear = PredictorOutput(
+        **{
+            **base.__dict__,
+            "timestamp": pd.Timestamp("2026-07-28T12:04:00Z"),
+            "bias": "bearish",
+            "zone": "previous_day_high:top",
+            "sweep_time": "2026-07-28T12:03:00+00:00",
+            "entry": 65600.0,
+            "stop": 65850.0,
+            "target": 65100.0,
+        }
+    )
+    state, events = engine.evaluate(state, bear, {}, pd.Timestamp("2026-07-28T12:04:30Z"))
+    assert events == []
+    bear2 = PredictorOutput(**{**bear.__dict__, "timestamp": pd.Timestamp("2026-07-28T12:05:00Z")})
+    state, events = engine.evaluate(state, bear2, {}, pd.Timestamp("2026-07-28T12:05:30Z"))
+    assert len(events) == 1
+    assert events[0]["event_type"] == "setup_confirmed"
+    assert events[0]["bias_reversal"] is True
 
 
 def test_funnel_and_shadow_stores(tmp_path):

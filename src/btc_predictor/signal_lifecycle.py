@@ -151,37 +151,22 @@ class SignalLifecycle:
         return probability * float(reward_risk) - (1.0 - probability)
 
     def _material_replacement(self, active, snapshot):
-        """Reject same-direction scanner drift while allowing real episodes.
+        """Reject same-direction replacements while allowing opposite reversals.
 
-        Replacement is structural (bias/zone/entry distance). Heuristic
-        probability expectancy is logged as a soft diagnostic and must not
-        hard-gate replacement until calibrated out of sample.
+        Under Option A (strict single-position rule), while a position is active,
+        additional setups in the SAME direction are diagnostic-only and cannot
+        replace or mutate the active trade. Only confirmed setups in the OPPOSITE
+        direction can replace/flip the active position.
         """
         current = (active or {}).get("snapshot") or {}
         if not current:
             return True
         if snapshot.get("bias") != current.get("bias"):
             return True
-        # A different identity on the same zone is a new, explicitly rearmed
-        # sweep episode; detect_sweep guarantees that rearm condition.
-        if snapshot.get("zone") == current.get("zone"):
-            return True
-        entry = snapshot.get("entry")
-        current_entry = current.get("entry")
-        setup_atr = snapshot.get("setup_atr") or current.get("setup_atr")
-        if entry is None or current_entry is None or not setup_atr:
-            return False
-        separated = abs(float(entry) - float(current_entry)) >= self.replacement_distance_atr * float(setup_atr)
-        # Soft diagnostic only (not used for the allow decision).
-        candidate_edge = self._expectancy(snapshot)
-        current_edge = self._expectancy(current)
-        snapshot["soft_expectancy_r"] = candidate_edge
-        snapshot["soft_expectancy_vs_active"] = (
-            None if candidate_edge is None or current_edge is None
-            else float(candidate_edge) - float(current_edge)
-        )
-        snapshot["soft_expectancy_is_diagnostic"] = True
-        return bool(separated)
+        # Same-direction setup while a trade/signal is active: diagnostic only.
+        snapshot["replacement_status"] = "ignored_same_direction_active"
+        snapshot["diagnostic_only"] = True
+        return False
 
     @staticmethod
     def _retire(state, signal_id):

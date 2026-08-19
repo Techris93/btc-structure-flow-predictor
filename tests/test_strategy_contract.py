@@ -192,8 +192,8 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
     ledger.update_market(fill1)
     assert ledger._open is not None and ledger._open["zone"] == "zone1"
 
-    # Test superseded by a new setup on a different zone
-    pred2 = PredictorOutput(
+    # Test same-direction setup is rejected and does not supersede Trade 1
+    pred2_same_direction = PredictorOutput(
         timestamp=pd.Timestamp("2026-07-25 10:15", tz="UTC"),
         bias="bearish",
         entry=64800.0,
@@ -206,14 +206,27 @@ def test_paper_ledger_atomic_persistence_and_superseded_setups(tmp_path):
         {"open": [64900.0], "high": [64950.0], "low": [64850.0], "close": [64900.0], "volume": [1.0]},
         index=pd.DatetimeIndex([pd.Timestamp("2026-07-25 10:15", tz="UTC")]),
     )
-    # Raw output is inert; only a confirmed replacement may supersede.
-    status = ledger.update(pred2, ohlc)
+    status = ledger.update(pred2_same_direction, ohlc)
     assert status["closed_trades"] == 3
     assert ledger._open is not None and ledger._open["zone"] == "zone1"
-    status = ledger.apply_lifecycle([confirmed_event(pred2, "signal-2")], ohlc)
+    status = ledger.apply_lifecycle([confirmed_event(pred2_same_direction, "signal-2")], ohlc)
+    assert status["closed_trades"] == 3
+    assert ledger._open is not None and ledger._open["zone"] == "zone1"
+
+    # Test opposite-direction confirmed setup DOES close Trade 1 as signal_flipped and opens Trade 2
+    pred_opposite = PredictorOutput(
+        timestamp=pd.Timestamp("2026-07-25 10:20", tz="UTC"),
+        bias="bullish",
+        entry=65100.0,
+        stop=64800.0,
+        target=65600.0,
+        position_size=1.0,
+        zone="bull_zone1",
+    )
+    status = ledger.apply_lifecycle([confirmed_event(pred_opposite, "signal-opp")], ohlc)
     assert status["closed_trades"] == 4
-    assert status["last_closed"]["exit_reason"] == "superseded_by_confirmed_setup"
-    assert ledger._open is None and ledger._pending is not None and ledger._pending["zone"] == "zone2"
+    assert status["last_closed"]["exit_reason"] == "signal_flipped"
+    assert ledger._open is None and ledger._pending is not None and ledger._pending["zone"] == "bull_zone1"
 
 
 def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
@@ -251,7 +264,7 @@ def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
         assert status["closed_trades"] == 3
         assert ledger._open is not None and ledger._open["entry"] == 65000.0
 
-    # A raw new sweep remains inert until lifecycle confirmation.
+    # A new same-direction sweep event does NOT close the active trade under Option A
     pred_new_sweep = PredictorOutput(
         timestamp=pd.Timestamp("2026-07-25 10:05", tz="UTC"),
         entry=64900.0,
@@ -261,9 +274,8 @@ def test_paper_ledger_no_churn_on_same_setup_reemission(tmp_path):
     assert status["closed_trades"] == 3
     assert ledger._open is not None and ledger._open["entry"] == 65000.0
     status = ledger.apply_lifecycle([confirmed_event(pred_new_sweep, "signal-2")])
-    assert status["closed_trades"] == 4
-    assert status["last_closed"]["exit_reason"] == "superseded_by_confirmed_setup"
-    assert ledger._open is None and ledger._pending is not None and ledger._pending["entry"] == 64900.0
+    assert status["closed_trades"] == 3
+    assert ledger._open is not None and ledger._open["entry"] == 65000.0
 
 
 def test_deep_sweep_retrace_entry_is_directional_and_recomputes_rr(monkeypatch):

@@ -149,3 +149,98 @@ def test_paper_position_records_and_segregates_setup_type(tmp_path):
     assert status["setup_type_stats"]["continuation"]["trades"] == 1
     assert status["setup_type_stats"]["continuation"]["wins"] == 1
     assert status["setup_type_stats"]["reversal"]["trades"] == 3
+
+
+def test_strict_single_position_same_direction_rejected_opposite_flips(tmp_path):
+    """Option A: While Short is active, 2nd Short is rejected. Opposite Long closes Short as signal_flipped."""
+    ledger = PaperLedger(tmp_path / "ledger.json", use_fixed_pct_exits=False)
+
+    # 1. Open Trade #1 (Short)
+    pred_short1 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-08-10 13:00", tz="UTC"),
+        bias="bearish",
+        setup_type="reversal",
+        entry=64862.80,
+        stop=65268.25,
+        target=64112.00,
+        position_size=1.0,
+        zone="zone_short_1",
+    )
+    event_s1 = {
+        "event_id": "e_s1",
+        "event_type": "setup_confirmed",
+        "signal_id": "sig-short-1",
+        "created_at": "2026-08-10T13:00:00Z",
+        "snapshot": dict(pred_short1.__dict__, timestamp="2026-08-10T13:00:00Z"),
+    }
+    ledger.apply_lifecycle([event_s1])
+    fill_bar1 = pd.DataFrame(
+        {"open": [64862.80], "high": [64900.0], "low": [64800.0], "close": [64850.0]},
+        index=[pd.Timestamp("2026-08-10 13:01", tz="UTC")],
+    )
+    status = ledger.update_market(fill_bar1)
+    assert status["open_position"] is not None
+    assert status["open_position"]["signal_id"] == "sig-short-1"
+    assert status["open_position"]["entry"] == 64862.80
+    assert status["open_position"]["stop"] == 65268.25
+    assert status["open_position"]["target"] == 64112.00
+    closed_before = status["closed_trades"]
+
+    # 2. Second Short arrives while Trade #1 is active -> must be rejected without mutating Trade #1
+    pred_short2 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-08-10 14:00", tz="UTC"),
+        bias="bearish",
+        setup_type="reversal",
+        entry=64787.60,
+        stop=64982.23,
+        target=64472.50,
+        position_size=1.2,
+        zone="zone_short_2",
+    )
+    event_s2 = {
+        "event_id": "e_s2",
+        "event_type": "setup_confirmed",
+        "signal_id": "sig-short-2",
+        "created_at": "2026-08-10T14:00:00Z",
+        "snapshot": dict(pred_short2.__dict__, timestamp="2026-08-10T14:00:00Z"),
+    }
+    status2 = ledger.apply_lifecycle([event_s2])
+    # Assert Trade #1 is completely untouched
+    assert status2["closed_trades"] == closed_before
+    assert status2["open_position"] is not None
+    assert status2["open_position"]["signal_id"] == "sig-short-1"
+    assert status2["open_position"]["entry"] == 64862.80
+    assert status2["open_position"]["stop"] == 65268.25
+    assert status2["open_position"]["target"] == 64112.00
+    assert status2["open_position"]["size"] == status["open_position"]["size"]
+    assert status2["pending_order"] is None
+
+    # 3. Third setup in OPPOSITE direction (Bullish Long) arrives -> closes Short #1 as signal_flipped and opens Long
+    pred_long1 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-08-10 15:00", tz="UTC"),
+        bias="bullish",
+        setup_type="continuation",
+        entry=65100.0,
+        stop=64700.0,
+        target=65800.0,
+        position_size=0.8,
+        zone="zone_long_1",
+    )
+    event_l1 = {
+        "event_id": "e_l1",
+        "event_type": "setup_confirmed",
+        "signal_id": "sig-long-1",
+        "created_at": "2026-08-10T15:00:00Z",
+        "snapshot": dict(pred_long1.__dict__, timestamp="2026-08-10T15:00:00Z"),
+    }
+    flip_bar = pd.DataFrame(
+        {"open": [64950.0], "high": [65000.0], "low": [64900.0], "close": [64950.0]},
+        index=[pd.Timestamp("2026-08-10 15:00", tz="UTC")],
+    )
+    status3 = ledger.apply_lifecycle([event_l1], flip_bar)
+    assert status3["closed_trades"] == closed_before + 1
+    assert status3["last_closed"]["signal_id"] == "sig-short-1"
+    assert status3["last_closed"]["exit_reason"] == "signal_flipped"
+    assert status3["pending_order"] is not None
+    assert status3["pending_order"]["signal_id"] == "sig-long-1"
+    assert status3["pending_order"]["side"] == "long"

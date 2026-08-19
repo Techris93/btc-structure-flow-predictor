@@ -189,7 +189,8 @@ def test_nearby_different_zone_cannot_replace_active_setup():
     assert state["candidate"] is None
 
 
-def test_material_better_replacement_requires_two_unique_bars():
+def test_same_direction_setup_cannot_replace_active_setup():
+    """Option A: Same-direction setups are diagnostic only while an active signal is held."""
     engine = SignalLifecycle(confirm_observations=2, replacement_distance_atr=.25)
     state, _ = activate(engine)
     replacement = prediction(
@@ -210,8 +211,9 @@ def test_material_better_replacement_requires_two_unique_bars():
         {},
         OBSERVED + pd.Timedelta(minutes=3, seconds=30),
     )
-    assert [event["event_type"] for event in events] == ["setup_confirmed"]
-    assert events[0]["replaced_signal_id"] is not None
+    # Under Option A, same direction does NOT emit setup_confirmed and does NOT replace active
+    assert events == []
+    assert state["active"]["snapshot"]["zone"] == "equal_lows:abc"
 
 
 def test_recovery_before_threshold_resets_invalidation_counter():

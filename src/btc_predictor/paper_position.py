@@ -245,8 +245,21 @@ class PaperLedger:
                         })
                         self._attach_decision_fields(existing, snapshot, event)
                         continue
+                    if existing and existing.get("side") == expected_side:
+                        logger.info(
+                            "Dropping same-direction setup confirmation %s while %s (%s) is active",
+                            signal_id,
+                            existing.get("signal_id"),
+                            existing.get("side"),
+                        )
+                        self._last_reject = {
+                            "reason": "same_direction_trade_already_active",
+                            "signal_id": signal_id,
+                            "active_signal_id": existing.get("signal_id"),
+                        }
+                        continue
                     if self._open is not None:
-                        self._close(event.get("created_at"), last_close, "superseded_by_confirmed_setup")
+                        self._close(event.get("created_at"), last_close, "signal_flipped")
                     if self._pending is not None:
                         self._pending = None
                     self._place_confirmed(event)
