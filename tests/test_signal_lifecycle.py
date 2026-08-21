@@ -443,3 +443,132 @@ def test_signal_neutralized_emits_one_invalidation_event():
     assert [event["event_type"] for event in events] == ["setup_invalidated"]
     assert events[0]["reason"] == "signal_neutralized"
     assert events[0]["body"] == "Bullish · Signal neutralized"
+
+
+def test_continuation_micro_drifting_in_trend_produces_single_initial_confirmation():
+    """Verify that micro-drifting price action in a trend produces exactly 1 clean confirmation instead of 10 rapid duplicate notifications."""
+    engine = SignalLifecycle(
+        confirm_observations=2,
+        continuation_rearm_seconds=1800,  # 30 minutes cooldown
+        continuation_rearm_atr=1.0,       # 1.0 ATR spacing
+    )
+    state = engine.initial_state()
+    flat_paper = {"open_position": None, "pending_order": None, "closed_trades": 0}
+    base_time = pd.Timestamp("2026-08-21 10:00:00", tz="UTC")
+    all_events = []
+
+    # 1. Initial continuation setup at 10:00 UTC (Entry $70,000, ATR $250)
+    p0 = prediction(
+        timestamp=base_time,
+        setup_type="continuation",
+        zone="zone_cont_0",
+        sweep_time="2026-08-21T09:58:00Z",
+        entry=70000.0,
+        stop=69300.0,
+        target=71400.0,
+        setup_atr=250.0,
+    )
+    state, ev = engine.evaluate(state, p0, flat_paper, base_time + pd.Timedelta(seconds=30))
+    assert ev == []
+    all_events.extend(ev)
+
+    p1 = replace(p0, timestamp=base_time + pd.Timedelta(minutes=1))
+    state, ev = engine.evaluate(state, p1, flat_paper, base_time + pd.Timedelta(minutes=1, seconds=30))
+    assert len(ev) == 1
+    assert ev[0]["event_type"] == "setup_confirmed"
+    assert ev[0]["snapshot"]["entry"] == 70000.0
+    all_events.extend(ev)
+
+    # 2. Simulate 9 consecutive 1-minute bars of micro price drift ($70,010 -> $70,090, drift < 1.0 ATR)
+    for minute in range(2, 11):
+        bar_time = base_time + pd.Timedelta(minutes=minute)
+        obs_time = bar_time + pd.Timedelta(seconds=30)
+        drift_price = 70000.0 + minute * 10.0  # Drift is only $20..$100, which is < 1.0 ATR ($250)
+        p_drift = prediction(
+            timestamp=bar_time,
+            setup_type="continuation",
+            zone=f"zone_cont_{minute}",
+            sweep_time=f"2026-08-21T10:{minute:02d}:00Z",
+            reclaim_time=f"2026-08-21T10:{minute:02d}:15Z",
+            entry=drift_price,
+            stop=drift_price - 700.0,
+            target=drift_price + 1400.0,
+            setup_atr=250.0,
+        )
+        state, ev = engine.evaluate(state, p_drift, flat_paper, obs_time)
+        assert ev == [], f"Minute {minute} should be throttled by refractory period but emitted {ev}"
+        all_events.extend(ev)
+
+    # Across all 10 initial bars + micro-drifts, EXACTLY 1 confirmation notification was generated
+    assert len(all_events) == 1
+
+    # 3. After 35 minutes (past 30m cooldown), a new continuation setup confirms cleanly
+    t35 = base_time + pd.Timedelta(minutes=35)
+    p35_a = prediction(
+        timestamp=t35,
+        setup_type="continuation",
+        zone="zone_cont_35",
+        sweep_time="2026-08-21T10:33:00Z",
+        entry=70150.0,
+        stop=69448.5,
+        target=71553.0,
+        setup_atr=250.0,
+    )
+    state, ev = engine.evaluate(state, p35_a, flat_paper, t35 + pd.Timedelta(seconds=30))
+    assert ev == []
+
+    t36 = base_time + pd.Timedelta(minutes=36)
+    p35_b = replace(p35_a, timestamp=t36)
+    state, ev = engine.evaluate(state, p35_b, flat_paper, t36 + pd.Timedelta(seconds=30))
+    assert len(ev) == 1
+    assert ev[0]["event_type"] == "setup_confirmed"
+    assert ev[0]["snapshot"]["entry"] == 70150.0
+    all_events.extend(ev)
+    assert len(all_events) == 2
+
+
+def test_continuation_structural_expansion_rearms_before_cooldown_expires():
+    """Verify that a genuine structural expansion (>= 1.0 ATR) confirms even within the 30m window."""
+    engine = SignalLifecycle(
+        confirm_observations=2,
+        continuation_rearm_seconds=1800,
+        continuation_rearm_atr=1.0,
+    )
+    state = engine.initial_state()
+    flat_paper = {"open_position": None, "pending_order": None, "closed_trades": 0}
+    base_time = pd.Timestamp("2026-08-21 10:00:00", tz="UTC")
+
+    # 1. Setup #1 confirmed at $70,000 (ATR = 250)
+    p0 = prediction(
+        timestamp=base_time,
+        setup_type="continuation",
+        zone="zone_0",
+        entry=70000.0,
+        setup_atr=250.0,
+    )
+    state, _ = engine.evaluate(state, p0, flat_paper, base_time + pd.Timedelta(seconds=30))
+    p1 = replace(p0, timestamp=base_time + pd.Timedelta(minutes=1))
+    state, ev1 = engine.evaluate(state, p1, flat_paper, base_time + pd.Timedelta(minutes=1, seconds=30))
+    assert len(ev1) == 1
+    assert ev1[0]["event_type"] == "setup_confirmed"
+
+    # 2. Only 8 minutes later, price expands by $300 (which is > 1.0 ATR $250)
+    t8 = base_time + pd.Timedelta(minutes=8)
+    p8 = prediction(
+        timestamp=t8,
+        setup_type="continuation",
+        zone="zone_expanded",
+        sweep_time="2026-08-21T10:07:00Z",
+        entry=70300.0,  # 70,300 - 70,000 = 300 >= 1.0 * 250
+        setup_atr=250.0,
+    )
+    state, ev8_a = engine.evaluate(state, p8, flat_paper, t8 + pd.Timedelta(seconds=30))
+    assert ev8_a == []
+    t9 = base_time + pd.Timedelta(minutes=9)
+    p9 = replace(p8, timestamp=t9)
+    state, ev8_b = engine.evaluate(state, p9, flat_paper, t9 + pd.Timedelta(seconds=30))
+    # Confirms because structural expansion condition (>= 1.0 ATR) is satisfied
+    assert len(ev8_b) == 1
+    assert ev8_b[0]["event_type"] == "setup_confirmed"
+    assert ev8_b[0]["snapshot"]["entry"] == 70300.0
+

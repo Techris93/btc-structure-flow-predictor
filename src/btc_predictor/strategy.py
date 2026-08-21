@@ -179,7 +179,7 @@ class Predictor:
     def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=False,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5,sweep_rearm_bars=3,sweep_rearm_atr=.5,flow_gate_mode="independent",legacy_orderflow_threshold=.40,market_flow_threshold=.40,raw_footprint_threshold=.40,footprint_price_bucket=25.0,footprint_full_credit_ratio=1.5,venue_freshness_seconds=150,cache_closed_frames=False,use_fixed_pct_exits=None,stop_pct=None,target_pct=None):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         # Default off so isolated strategy tests keep ATR/structural geometry.
-        # Live app passes True (0.5% SL / 1% TP).
+        # Live app passes True (1% SL / 2% TP).
         self.use_fixed_pct_exits=bool(use_fixed_pct_exits) if use_fixed_pct_exits is not None else False
         self.stop_pct=live_policy.FIXED_STOP_PCT if stop_pct is None else float(stop_pct)
         self.target_pct=live_policy.FIXED_TARGET_PCT if target_pct is None else float(target_pct)

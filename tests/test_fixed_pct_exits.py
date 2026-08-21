@@ -1,4 +1,4 @@
-"""Fixed 0.5% SL / 1% TP geometry, fill rebase, magnet push, time stop."""
+"""Fixed 1.0% SL / 2.0% TP geometry, fill rebase, magnet push, time stop."""
 
 import pandas as pd
 import pytest
@@ -17,23 +17,23 @@ from btc_predictor.strategy import Predictor
 
 def test_fixed_pct_is_two_r():
     geo = fixed_pct_exits(64000.0, "long", push_through_100=False)
-    assert geo["stop"] == 64000.0 * 0.995
-    assert geo["target"] == 64000.0 * 1.01
+    assert geo["stop"] == 64000.0 * 0.99
+    assert geo["target"] == 64000.0 * 1.02
     assert abs(geo["reward_risk"] - 2.0) < 1e-9
 
 
 def test_short_fixed_pct():
     geo = fixed_pct_exits(64000.0, "short", push_through_100=False)
-    assert geo["stop"] == 64000.0 * 1.005
-    assert geo["target"] == 64000.0 * 0.99
+    assert geo["stop"] == 64000.0 * 1.01
+    assert geo["target"] == 64000.0 * 0.98
     assert abs(geo["reward_risk"] - 2.0) < 1e-9
 
 
 def test_push_stop_through_hundred_long():
-    # 0.5% of 64157 ≈ 63836; 63900 sits between stop and entry.
-    stop, pushed = push_stop_beyond_hundred(64157.0, 63836.0, "long", buffer=1.0)
+    # 1% of 64157 ≈ 63515; 63600 sits between stop and entry.
+    stop, pushed = push_stop_beyond_hundred(64157.0, 63515.0, "long", buffer=1.0)
     assert pushed is True
-    assert stop == 63899.0
+    assert stop == 63599.0
 
 
 def test_fill_min_rr_rejects_thin_reward():
@@ -63,12 +63,12 @@ def test_predictor_fixed_pct_on_confirmed_setup(monkeypatch):
             "extreme": 89.0, "time": idx[-2], "reclaim_time": idx[-1],
         },
     )
-    result = Predictor(use_fixed_pct_exits=True, stop_pct=0.005, target_pct=0.01).predict(
+    result = Predictor(use_fixed_pct_exits=True, stop_pct=0.01, target_pct=0.02).predict(
         o, trades, frames={"15m": o.iloc[::15], "1h": o.iloc[-40:], "4h": o.iloc[-40:]}
     )
     assert result.entry is not None
-    assert result.stop == pytest.approx(result.entry * 0.995)
-    assert result.target == pytest.approx(result.entry * 1.01)
+    assert result.stop == pytest.approx(result.entry * 0.99)
+    assert result.target == pytest.approx(result.entry * 1.02)
     assert (result.target - result.entry) / (result.entry - result.stop) == pytest.approx(2.0)
 
 
@@ -97,8 +97,8 @@ def test_paper_rebases_sl_tp_on_next_open_fill():
     )
     ledger.update_market(fill)
     assert ledger._open is not None
-    assert ledger._open["stop"] == pytest.approx(64100.0 * 0.995)
-    assert ledger._open["target"] == pytest.approx(64100.0 * 1.01)
+    assert ledger._open["stop"] == pytest.approx(64100.0 * 0.99)
+    assert ledger._open["target"] == pytest.approx(64100.0 * 1.02)
     assert live_policy.fill_min_rr_ok(
         ledger._open["entry"], ledger._open["stop"], ledger._open["target"], "long"
     )

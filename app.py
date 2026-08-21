@@ -88,8 +88,8 @@ predictor = Predictor(
     footprint_full_credit_ratio=flow_gate_config["full_credit_ratio"],
     venue_freshness_seconds=COLLECTOR_STALE_SECONDS,
     use_fixed_pct_exits=os.getenv("USE_FIXED_PCT_EXITS", "1").lower() in ("1", "true", "yes", "on"),
-    stop_pct=float(os.getenv("FIXED_STOP_PCT", "0.005")),
-    target_pct=float(os.getenv("FIXED_TARGET_PCT", "0.01")),
+    stop_pct=float(os.getenv("FIXED_STOP_PCT", "0.01")),
+    target_pct=float(os.getenv("FIXED_TARGET_PCT", "0.02")),
 )
 live_lock = threading.Lock()
 push_lock = threading.Lock()
@@ -155,6 +155,8 @@ SIGNAL_CONFIRM_OBSERVATIONS = max(1, int(os.getenv("SIGNAL_CONFIRM_OBSERVATIONS"
 SIGNAL_INVALIDATION_OBSERVATIONS = max(1, int(os.getenv("SIGNAL_INVALIDATION_OBSERVATIONS", "3")))
 BIAS_CONFIRM_OBSERVATIONS = max(1, int(os.getenv("BIAS_CONFIRM_OBSERVATIONS", "2")))
 SIGNAL_REPLACEMENT_DISTANCE_ATR = max(0.0, float(os.getenv("SIGNAL_REPLACEMENT_DISTANCE_ATR", "0.25")))
+CONTINUATION_REARM_SECONDS = max(0, int(os.getenv("CONTINUATION_REARM_SECONDS", "1800")))
+CONTINUATION_REARM_ATR = max(0.0, float(os.getenv("CONTINUATION_REARM_ATR", "1.0")))
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://btc-structure-flow-predictor.onrender.com"
 ).rstrip("/")
@@ -204,6 +206,8 @@ signal_lifecycle = SignalLifecycle(
     invalidation_observations=SIGNAL_INVALIDATION_OBSERVATIONS,
     bias_observations=BIAS_CONFIRM_OBSERVATIONS,
     replacement_distance_atr=SIGNAL_REPLACEMENT_DISTANCE_ATR,
+    continuation_rearm_seconds=CONTINUATION_REARM_SECONDS,
+    continuation_rearm_atr=CONTINUATION_REARM_ATR,
 )
 funnel_diary = live_policy.FunnelDiary(funnel_diary_store)
 decision_snapshot_log = live_policy.DecisionSnapshotLog(decision_snapshot_store)

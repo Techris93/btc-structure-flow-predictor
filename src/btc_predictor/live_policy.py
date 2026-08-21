@@ -30,9 +30,9 @@ MAX_HOLD_HOURS = float(os.getenv("PAPER_MAX_HOLD_HOURS", "12"))
 SAME_SIDE_COOLDOWN_HOURS = float(os.getenv("PAPER_SAME_SIDE_COOLDOWN_HOURS", "8"))
 FILL_MIN_RR = float(os.getenv("PAPER_FILL_MIN_RR", "1.5"))
 
-# Fixed percent exits: 0.5% stop / 1% target → 2R from the fill.
-FIXED_STOP_PCT = float(os.getenv("FIXED_STOP_PCT", "0.005"))
-FIXED_TARGET_PCT = float(os.getenv("FIXED_TARGET_PCT", "0.01"))
+# Fixed percent exits: 1% stop / 2% target → 2R from the fill.
+FIXED_STOP_PCT = float(os.getenv("FIXED_STOP_PCT", "0.01"))
+FIXED_TARGET_PCT = float(os.getenv("FIXED_TARGET_PCT", "0.02"))
 USE_FIXED_PCT_EXITS = os.getenv("USE_FIXED_PCT_EXITS", "1").lower() in ("1", "true", "yes", "on")
 HUNDRED_PUSH_BUFFER = float(os.getenv("PAPER_HUNDRED_PUSH_BUFFER", "1.0"))  # dollars beyond the 100
 
@@ -59,7 +59,7 @@ REVIEW_METRICS = (
 )
 
 # Shadow book: Book A = production paper; Book B adds one extra skip rule.
-# Fixed 0.5%/1% makes RR≈2 always, so Book B tracks untested_breakout skips.
+# Fixed 1%/2% makes RR≈2 always, so Book B tracks untested_breakout skips.
 SHADOW_RULE = os.getenv("PAPER_SHADOW_RULE", "skip_untested_breakout")
 SHADOW_RR_CAP = float(os.getenv("PAPER_SHADOW_RR_CAP", "2.5"))
 SHADOW_MAGNET_DOLLARS = float(os.getenv("PAPER_SHADOW_MAGNET_DOLLARS", "50"))
@@ -236,7 +236,7 @@ def fixed_pct_exits(
     target_pct: float | None = None,
     push_through_100: bool = False,
 ) -> dict[str, Any]:
-    """0.5% stop / 1% target from *this* price (signal or fill). Always ~2R."""
+    """1% stop / 2% target from *this* price (signal or fill). Always ~2R."""
     stop_pct = FIXED_STOP_PCT if stop_pct is None else float(stop_pct)
     target_pct = FIXED_TARGET_PCT if target_pct is None else float(target_pct)
     entry_f = float(entry)
@@ -305,7 +305,7 @@ def enrich_decision_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     kind = snap.get("zone_kind") or (zone.split(":", 1)[0] if zone else None)
     if kind and not snap.get("zone_kind"):
         snap["zone_kind"] = kind
-    # With fixed 0.5% stops, width is uniform. Flag the zone kind only.
+    # With fixed 1% stops, width is uniform. Flag the zone kind only.
     snap["wide_untested_breakout"] = bool(kind in SOFT_WIDE_BREAKOUT_KINDS)
     # Soft expectancy diagnostic only — never size or hard-gate from this.
     p = snap.get("probability_tp_before_sl")
@@ -358,7 +358,7 @@ def evaluate_soft_filters(
         warnings.append("stop_near_100_print")
 
     if snap.get("wide_untested_breakout"):
-        # Book A: warning only — 0.5% SL is now uniform. Book B shadows the skip.
+        # Book A: warning only — 1% SL is now uniform. Book B shadows the skip.
         warnings.append("untested_breakout_zone")
 
     # After a stop, require a new zone and block same-side re-entry for a cooldown.

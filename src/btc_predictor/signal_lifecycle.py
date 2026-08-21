@@ -39,11 +39,13 @@ class SignalLifecycle:
 
     VERSION = 2
 
-    def __init__(self, confirm_observations=2, invalidation_observations=3, bias_observations=2, replacement_distance_atr=.25):
+    def __init__(self, confirm_observations=2, invalidation_observations=3, bias_observations=2, replacement_distance_atr=.25, continuation_rearm_seconds=1800, continuation_rearm_atr=1.0):
         self.confirm_observations = max(1, int(confirm_observations))
         self.invalidation_observations = max(1, int(invalidation_observations))
         self.bias_observations = max(1, int(bias_observations))
         self.replacement_distance_atr = max(0.0, float(replacement_distance_atr))
+        self.continuation_rearm_seconds = max(0, int(continuation_rearm_seconds))
+        self.continuation_rearm_atr = max(0.0, float(continuation_rearm_atr))
 
     @staticmethod
     def initial_state():
@@ -59,6 +61,8 @@ class SignalLifecycle:
             "last_bias_decision_at": None,
             "event_sequence": 0,
             "retired_signal_ids": [],
+            "last_confirmed_by_bias": {},
+            "last_confirmed_at": None,
             "updated_at": None,
         }
 
@@ -150,6 +154,41 @@ class SignalLifecycle:
         probability = float(probability)
         return probability * float(reward_risk) - (1.0 - probability)
 
+    def _is_refractory(self, state, snapshot, observed_at):
+        bias = snapshot.get("bias")
+        setup_type = snapshot.get("setup_type")
+        if not bias:
+            return False
+        last_info = (state.get("last_confirmed_by_bias") or {}).get(bias)
+        if not last_info:
+            return False
+        # If this is a continuation setup, require time / distance spacing from previous confirmed setup in same direction
+        if setup_type == "continuation":
+            confirmed_at_str = last_info.get("confirmed_at")
+            if confirmed_at_str:
+                confirmed_at = pd.Timestamp(confirmed_at_str)
+                now = pd.Timestamp(observed_at)
+                if confirmed_at.tzinfo is not None and now.tzinfo is None:
+                    now = now.tz_localize("UTC")
+                elif confirmed_at.tzinfo is None and now.tzinfo is not None:
+                    confirmed_at = confirmed_at.tz_localize("UTC")
+                elapsed_sec = (now - confirmed_at).total_seconds()
+                if elapsed_sec < self.continuation_rearm_seconds:
+                    entry = snapshot.get("entry")
+                    last_entry = last_info.get("entry")
+                    atr_val = snapshot.get("setup_atr")
+                    if entry is not None and last_entry is not None and atr_val is not None and float(atr_val) > 0:
+                        price_dist = abs(float(entry) - float(last_entry))
+                        if price_dist < self.continuation_rearm_atr * float(atr_val):
+                            snapshot["rearm_status"] = "in_refractory_period"
+                            snapshot["diagnostic_only"] = True
+                            return True
+                    else:
+                        snapshot["rearm_status"] = "in_refractory_period"
+                        snapshot["diagnostic_only"] = True
+                        return True
+        return False
+
     def _material_replacement(self, active, snapshot, has_active_position=True):
         """Reject same-direction replacements while an actual trade is active.
 
@@ -231,6 +270,15 @@ class SignalLifecycle:
             "adopted": True,
         }
         state["stable_bias"] = state.get("stable_bias") or bias
+        last_by_bias = dict(state.get("last_confirmed_by_bias") or {})
+        last_by_bias[bias] = {
+            "confirmed_at": position.get("confirmed_at") or position.get("entry_time") or now,
+            "entry": position.get("entry"),
+            "setup_type": "reversal",
+            "zone": position.get("zone"),
+        }
+        state["last_confirmed_by_bias"] = last_by_bias
+        state["last_confirmed_at"] = position.get("confirmed_at") or position.get("entry_time") or now
         state["updated_at"] = now
         return state, signal_id
 
@@ -341,6 +389,10 @@ class SignalLifecycle:
 
         # Candidate confirmation counts unique completed decision bars, never
         # repeated 45-second polls of the same timestamp.
+        if actionable and self._is_refractory(state, snapshot, observed_at):
+            actionable = False
+            signal_id = None
+            state["candidate"] = None
         if actionable and signal_id in set(state.get("retired_signal_ids") or []):
             actionable = False
             signal_id = None
@@ -406,6 +458,15 @@ class SignalLifecycle:
                 state["stable_bias"] = snapshot.get("bias")
                 state["bias_candidate"] = None
                 state["bias_observations"] = 0
+                last_by_bias = dict(state.get("last_confirmed_by_bias") or {})
+                last_by_bias[snapshot.get("bias")] = {
+                    "confirmed_at": pd.Timestamp(observed_at).isoformat(),
+                    "entry": snapshot.get("entry"),
+                    "setup_type": snapshot.get("setup_type"),
+                    "zone": snapshot.get("zone"),
+                }
+                state["last_confirmed_by_bias"] = last_by_bias
+                state["last_confirmed_at"] = pd.Timestamp(observed_at).isoformat()
         else:
             state["candidate"] = None
             if active:

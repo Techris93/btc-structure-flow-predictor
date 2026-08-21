@@ -45,7 +45,7 @@ Paper accounting matches research defaults: **fee 5 bps + slippage 2 bps**. Dash
 | Decision snapshots | Full geometry/flow/regime fields on each confirmed setup (`decision_snapshots.json`, closed trades) |
 | Fail closed | No new paper entries unless `MARKET_TYPE=linear` and Binance+Bybit futures feeds are fresh (not spot/mixed/stale) |
 | Risk | 0.25% risk; max notional **1.0×** equity; daily −2R / weekly −4R; one open unit |
-| Exits | **0.5% stop / 1% target** of Bitcoin price from the fill (2R). Exact percents — no $100 magnet nudge. |
+| Exits | **1% stop / 2% target** of Bitcoin price from the fill (2R). Exact percents — no $100 magnet nudge. |
 | Fill gate | Next-open fill is cancelled if RR &lt; 1.5 after rebase |
 | Time / cooldown | Flatten at **12h** if SL/TP not hit; no same-side re-entry for **8h** after a stop |
 | Retrace | Deep sweeps (`RETRACE_ENTRY_ATR=1.2`) use a limit pullback instead of chasing next open |

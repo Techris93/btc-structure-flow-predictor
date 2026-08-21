@@ -303,3 +303,75 @@ def test_flat_ledger_allows_subsequent_setup_confirmation_after_skipped_signal()
     assert len(events2_b) == 1
     assert events2_b[0]["event_type"] == "setup_confirmed"
     assert events2_b[0]["snapshot"]["entry"] == 64775.00
+
+
+def test_continuation_rearm_refractory_period_prevents_rapid_reconfirmation():
+    """Verify that same-direction continuation setups within 30m / 1.0 ATR are throttled."""
+    engine = web_app.SignalLifecycle(confirm_observations=2, continuation_rearm_seconds=1800, continuation_rearm_atr=1.0)
+    state = engine.initial_state()
+    flat_status = {"open_position": None, "pending_order": None, "closed_trades": 0}
+
+    # 1. Setup #1 confirmed at 10:00 UTC (Entry $70,000, ATR 250)
+    p1 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-08-21 10:00", tz="UTC"),
+        bias="bullish",
+        setup_type="continuation",
+        entry=70000.0,
+        stop=69300.0,
+        target=71400.0,
+        position_size=1.0,
+        zone="zone_1",
+        sweep_status="confirmed",
+        sweep_time="2026-08-21T09:58:00+00:00",
+        orderflow_confirmation=True,
+        setup_atr=250.0,
+    )
+    state, _ = engine.evaluate(state, p1, flat_status, pd.Timestamp("2026-08-21 10:00:30Z"))
+    p1_next = PredictorOutput(**{**p1.__dict__, "timestamp": pd.Timestamp("2026-08-21 10:01", tz="UTC")})
+    state, events1 = engine.evaluate(state, p1_next, flat_status, pd.Timestamp("2026-08-21 10:01:30Z"))
+    assert len(events1) == 1
+    assert events1[0]["event_type"] == "setup_confirmed"
+
+    # 2. Setup #2 arrives 5 minutes later at 10:06 with Entry $70,100 (diff is $100 < 1.0 ATR ($250))
+    p2 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-08-21 10:06", tz="UTC"),
+        bias="bullish",
+        setup_type="continuation",
+        entry=70100.0,
+        stop=69399.0,
+        target=71502.0,
+        position_size=1.0,
+        zone="zone_2",
+        sweep_status="confirmed",
+        sweep_time="2026-08-21T10:05:00+00:00",
+        orderflow_confirmation=True,
+        setup_atr=250.0,
+    )
+    state, events2_a = engine.evaluate(state, p2, flat_status, pd.Timestamp("2026-08-21 10:06:30Z"))
+    p2_next = PredictorOutput(**{**p2.__dict__, "timestamp": pd.Timestamp("2026-08-21 10:07", tz="UTC")})
+    state, events2_b = engine.evaluate(state, p2_next, flat_status, pd.Timestamp("2026-08-21 10:07:30Z"))
+    # Should be throttled by refractory period (no new notification)
+    assert events2_a == []
+    assert events2_b == []
+
+    # 3. Setup #3 arrives after 35 minutes (elapsed > 30m) -> Confirms normally
+    p3 = PredictorOutput(
+        timestamp=pd.Timestamp("2026-08-21 10:38", tz="UTC"),
+        bias="bullish",
+        setup_type="continuation",
+        entry=70800.0,
+        stop=70092.0,
+        target=72216.0,
+        position_size=1.0,
+        zone="zone_3",
+        sweep_status="confirmed",
+        sweep_time="2026-08-21T10:36:00+00:00",
+        orderflow_confirmation=True,
+        setup_atr=250.0,
+    )
+    state, events3_a = engine.evaluate(state, p3, flat_status, pd.Timestamp("2026-08-21 10:38:30Z"))
+    p3_next = PredictorOutput(**{**p3.__dict__, "timestamp": pd.Timestamp("2026-08-21 10:39", tz="UTC")})
+    state, events3_b = engine.evaluate(state, p3_next, flat_status, pd.Timestamp("2026-08-21 10:39:30Z"))
+    assert len(events3_b) == 1
+    assert events3_b[0]["event_type"] == "setup_confirmed"
+    assert events3_b[0]["snapshot"]["entry"] == 70800.0
