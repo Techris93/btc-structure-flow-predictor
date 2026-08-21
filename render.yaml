@@ -112,6 +112,10 @@ services:
         value: "80"
       - key: PAPER_LEDGER_PATH
         value: "/var/data/paper_ledger.json"
+      # Set a new unique value once to archive the current paper ledger and
+      # start a fresh book. The reset is one-shot and does not delete the archive.
+      - key: PAPER_LEDGER_RESET_ID
+        sync: false
   - type: worker
     name: btc-structure-flow-research
     repo: https://github.com/Techris93/btc-structure-flow-predictor

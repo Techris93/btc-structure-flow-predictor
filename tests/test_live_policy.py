@@ -21,6 +21,79 @@ def test_seeded_rescore_reports_gross_vs_net():
     assert report["summary"]["gross_pnl"] == 681.24 or abs(report["summary"]["gross_pnl"] - 681.24) < 0.1
 
 
+def test_superseded_churn_is_marked_and_excluded_from_performance_stats(tmp_path):
+    path = tmp_path / "paper_ledger.json"
+    rows = [
+        {
+            "entry_time": "2026-08-01T00:00:00Z",
+            "exit_time": "2026-08-01T01:00:00Z",
+            "side": "long",
+            "entry": 100.0,
+            "exit": 102.0,
+            "stop": 99.0,
+            "target": 102.0,
+            "size": 1.0,
+            "exit_reason": "target",
+        },
+        {
+            "entry_time": "2026-08-01T02:00:00Z",
+            "exit_time": "2026-08-01T02:05:00Z",
+            "side": "long",
+            "entry": 100.0,
+            "exit": 99.5,
+            "stop": 99.0,
+            "target": 102.0,
+            "size": 1.0,
+            "exit_reason": "superseded_by_confirmed_setup",
+        },
+        {
+            "entry_time": "2026-08-01T03:00:00Z",
+            "exit_time": "2026-08-01T04:00:00Z",
+            "side": "long",
+            "entry": 100.0,
+            "exit": 99.0,
+            "stop": 99.0,
+            "target": 102.0,
+            "size": 1.0,
+            "exit_reason": "stop",
+        },
+    ]
+    JsonStore(path).write({"closed": rows, "open": None, "pending": None, "equity_net": 100.0})
+
+    ledger = PaperLedger(path, soft_filters=False, use_fixed_pct_exits=False)
+    status = ledger._status()
+
+    assert status["closed_trades"] == 3  # complete audit/accounting count
+    assert status["performance_closed_trades"] == 2
+    assert status["performance_excluded_trades"] == 1
+    assert status["performance_excluded_superseded_churn"] == 1
+    assert status["wins"] == 1
+    assert status["losses"] == 1
+    assert status["performance"]["closed_trades"] == 2
+    assert status["accounting"]["closed_trades"] == 3
+    churn = next(t for t in status["recent_closed"] if t["exit_reason"] == "superseded_by_confirmed_setup")
+    assert churn["performance_eligible"] is False
+    assert churn["performance_exclusion_reason"] == "superseded_churn"
+    persisted = JsonStore(path).read({})
+    persisted_churn = next(t for t in persisted["closed"] if t["exit_reason"] == "superseded_by_confirmed_setup")
+    assert persisted_churn["performance_class"] == "excluded_superseded_churn"
+
+
+def test_paper_ledger_reset_is_one_shot_and_archives_previous_book(tmp_path):
+    path = tmp_path / "paper_ledger.json"
+    JsonStore(path).write({"closed": [{"exit_reason": "stop"}], "equity": 99_000.0})
+
+    fresh = PaperLedger(path, reset_id="post-churn-v1")
+    assert fresh._status()["closed_trades"] == 0
+    assert JsonStore(path).read({})["ledger_reset_id"] == "post-churn-v1"
+    archives = list(tmp_path.glob("paper_ledger.archive-post-churn-v1*.json"))
+    assert len(archives) == 1
+
+    restarted = PaperLedger(path, reset_id="post-churn-v1")
+    assert restarted._status()["closed_trades"] == 0
+    assert len(list(tmp_path.glob("paper_ledger.archive-post-churn-v1*.json"))) == 1
+
+
 def test_paper_ledger_uses_research_economics_on_close():
     ledger = PaperLedger(soft_filters=False, apply_research_costs=True, use_fixed_pct_exits=False)
     # Clear seeded history for a pure unit trade.

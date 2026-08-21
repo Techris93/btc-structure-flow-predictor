@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 import threading
 
@@ -63,10 +64,51 @@ HISTORICAL_SEEDED_TRADES = [
     },
 ]
 
+# These exit reasons were produced by the pre-Option-A replacement path.  The
+# rows remain in the ledger for a complete audit trail and still contribute to
+# realized account equity, but they are not evidence of an independent setup
+# outcome and must not inflate/deflate strategy performance statistics.
+SUPERSEDED_CHURN_EXIT_REASONS = frozenset(
+    {
+        "superseded_by_confirmed_setup",
+        "superseded_by_new_setup",
+        "replaced_by_confirmed_setup",
+        "superseded",
+    }
+)
+
+
+def _annotate_performance(trade: dict) -> dict:
+    """Classify a closed row without discarding historical accounting data."""
+    row = dict(trade)
+    reason = str(row.get("exit_reason") or "").strip().lower()
+    if reason in SUPERSEDED_CHURN_EXIT_REASONS:
+        row["performance_eligible"] = False
+        row["performance_exclusion_reason"] = "superseded_churn"
+        row["performance_class"] = "excluded_superseded_churn"
+    else:
+        # Preserve any explicit non-churn exclusion supplied by a research
+        # import, while making legacy rows default to eligible.
+        eligible = row.get("performance_eligible")
+        if eligible is None:
+            eligible = True
+            row["performance_eligible"] = True
+        else:
+            row["performance_eligible"] = bool(eligible)
+        row.setdefault(
+            "performance_exclusion_reason",
+            None if row["performance_eligible"] else "manual_exclusion",
+        )
+        row.setdefault(
+            "performance_class",
+            "eligible_trade" if row["performance_eligible"] else "excluded",
+        )
+    return row
+
 
 def _annotate_economics(trade: dict) -> dict:
     """Attach gross/net cost fields without inventing missing prices."""
-    row = dict(trade)
+    row = _annotate_performance(trade)
     if row.get("entry") is None or row.get("exit") is None or row.get("size") is None:
         return row
     scored = live_policy.rescore_closed_trade(row)
@@ -111,6 +153,7 @@ class PaperLedger:
         use_fixed_pct_exits: bool = live_policy.USE_FIXED_PCT_EXITS,
         max_hold_hours: float = live_policy.MAX_HOLD_HOURS,
         fill_min_rr: float = live_policy.FILL_MIN_RR,
+        reset_id: str | None = None,
     ):
         self.path = Path(path) if path else None
         self.store = JsonStore(self.path) if self.path else None
@@ -129,22 +172,78 @@ class PaperLedger:
         self.use_fixed_pct_exits = bool(use_fixed_pct_exits)
         self.max_hold_hours = float(max_hold_hours)
         self.fill_min_rr = float(fill_min_rr)
+        self.reset_id = str(
+            reset_id if reset_id is not None else os.getenv("PAPER_LEDGER_RESET_ID", "")
+        ).strip()
         self._open: dict | None = None
         self._pending: dict | None = None
         self._closed: list[dict] = []
         self._equity = live_policy.RESEARCH_INITIAL_EQUITY
         self._equity_gross = live_policy.RESEARCH_INITIAL_EQUITY
         self._last_reject: dict | None = None
+        self._performance_annotations_dirty = False
+        self._skip_historical_seed = False
+        self._reset_if_requested()
         self._load()
+
+    def _reset_if_requested(self):
+        """Start a fresh paper book once, preserving an on-disk archive.
+
+        A reset is keyed, so restarting the service cannot repeatedly erase a
+        new ledger.  The previous JSON is renamed rather than deleted, which
+        keeps the historical record available for audit/recovery.
+        """
+        if not self.reset_id or not self.store or not self.path:
+            return
+        with self.lock:
+            existing = self.store.read({})
+            if existing.get("ledger_reset_id") == self.reset_id:
+                return
+            if self.path.exists():
+                safe_id = "".join(char if char.isalnum() or char in "-_." else "-" for char in self.reset_id)
+                archive = self.path.with_name(f"{self.path.stem}.archive-{safe_id}{self.path.suffix}")
+                suffix = 2
+                while archive.exists():
+                    archive = self.path.with_name(
+                        f"{self.path.stem}.archive-{safe_id}-{suffix}{self.path.suffix}"
+                    )
+                    suffix += 1
+                self.path.replace(archive)
+                logger.warning(
+                    "Paper ledger reset id=%s; archived previous ledger at %s",
+                    self.reset_id,
+                    archive,
+                )
+            self._open = None
+            self._pending = None
+            self._closed = []
+            self._equity = live_policy.RESEARCH_INITIAL_EQUITY
+            self._equity_gross = live_policy.RESEARCH_INITIAL_EQUITY
+            self._skip_historical_seed = True
+            self.store.write({
+                "open": None,
+                "pending": None,
+                "closed": [],
+                "equity": self._equity,
+                "equity_net": self._equity,
+                "equity_gross": self._equity_gross,
+                "economics_version": 1,
+                "fee_bps": self.fee_bps,
+                "slippage_bps": self.slippage_bps,
+                "ledger_reset_id": self.reset_id,
+            })
 
     def _load(self):
         if self.store and self.path and self.path.exists():
             try:
                 with self.lock:
                     data = self.store.read({})
+                    self._skip_historical_seed = bool(data.get("ledger_reset_id"))
                     self._open = data.get("open")
                     self._pending = data.get("pending")
-                    self._closed = [_annotate_economics(t) for t in list(data.get("closed", []))]
+                    raw_closed = [dict(t) for t in list(data.get("closed", []))]
+                    self._closed = [_annotate_economics(t) for t in raw_closed]
+                    self._performance_annotations_dirty = raw_closed != self._closed
                     # Prefer net equity; fall back to recomputing from annotated trades.
                     if data.get("equity_net") is not None:
                         self._equity = float(data["equity_net"])
@@ -164,7 +263,7 @@ class PaperLedger:
             except Exception as exc:
                 logger.warning("Failed to load paper ledger from %s: %s", self.path, exc)
         with self.lock:
-            if not self._closed and self.store and self.path:
+            if not self._closed and self.store and self.path and not self._skip_historical_seed:
                 self._closed = [_annotate_economics(dict(t)) for t in HISTORICAL_SEEDED_TRADES]
                 self._equity = round(
                     live_policy.RESEARCH_INITIAL_EQUITY
@@ -179,6 +278,11 @@ class PaperLedger:
                 if self._open and any(t["entry_time"] == self._open.get("entry_time") for t in HISTORICAL_SEEDED_TRADES):
                     self._open = None
                 self._save()
+            elif self._performance_annotations_dirty:
+                # Persist the migration so the reason is visible in the JSON
+                # ledger, not only derived transiently in the API response.
+                self._save()
+                self._performance_annotations_dirty = False
 
     def _save(self):
         if self.store:
@@ -193,6 +297,7 @@ class PaperLedger:
                     "economics_version": 1,
                     "fee_bps": self.fee_bps,
                     "slippage_bps": self.slippage_bps,
+                    "ledger_reset_id": self.reset_id or None,
                 })
 
     def update_market(self, current_ohlc: pd.DataFrame | None = None):
@@ -666,25 +771,71 @@ class PaperLedger:
             trade["hold_hours"] = (
                 pd.Timestamp(trade["exit_time"]) - pd.Timestamp(trade["entry_time"])
             ).total_seconds() / 3600.0
-        self._closed.append(trade)
+        self._closed.append(_annotate_performance(trade))
         self._open = None
 
     def _status(self, last_price: float | None = None):
         with self.lock:
-            closed = self._closed
-            wins = sum(1 for t in closed if float(t.get("net_pnl", t.get("pnl", 0))) > 0)
-            losses = sum(1 for t in closed if float(t.get("net_pnl", t.get("pnl", 0))) <= 0)
-            gross_profit = sum(float(t.get("net_pnl", t.get("pnl", 0))) for t in closed if float(t.get("net_pnl", t.get("pnl", 0))) > 0)
-            gross_loss = -sum(float(t.get("net_pnl", t.get("pnl", 0))) for t in closed if float(t.get("net_pnl", t.get("pnl", 0))) < 0)
-            sum_gross = sum(float(t.get("gross_pnl", t.get("pnl_gross", t.get("pnl", 0)))) for t in closed)
-            sum_net = sum(float(t.get("net_pnl", t.get("pnl", 0))) for t in closed)
-            sum_fees = sum(float(t.get("fees", 0) or 0) for t in closed)
-            sum_slip = sum(float(t.get("slippage_cost", 0) or 0) for t in closed)
-            sum_r_net = sum(float(t.get("r_multiple_net", t.get("r_multiple", 0)) or 0) for t in closed)
-            sum_r_gross = sum(float(t.get("r_multiple_gross", t.get("r_multiple", 0)) or 0) for t in closed)
+            # Re-apply classification defensively so imported/legacy rows are
+            # honest even when a test or migration inserted them directly.
+            closed = [_annotate_performance(t) for t in self._closed]
+            self._closed = closed
+            performance_closed = [t for t in closed if t.get("performance_eligible", True)]
+            excluded_churn = [
+                t for t in closed
+                if t.get("performance_exclusion_reason") == "superseded_churn"
+            ]
+
+            def _metrics(rows):
+                wins = sum(1 for t in rows if float(t.get("net_pnl", t.get("pnl", 0))) > 0)
+                losses = sum(1 for t in rows if float(t.get("net_pnl", t.get("pnl", 0))) <= 0)
+                net_profit = sum(
+                    float(t.get("net_pnl", t.get("pnl", 0)))
+                    for t in rows
+                    if float(t.get("net_pnl", t.get("pnl", 0))) > 0
+                )
+                net_loss = -sum(
+                    float(t.get("net_pnl", t.get("pnl", 0)))
+                    for t in rows
+                    if float(t.get("net_pnl", t.get("pnl", 0))) < 0
+                )
+                return {
+                    "closed_trades": len(rows),
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate": round(wins / len(rows), 4) if rows else 0.0,
+                    "profit_factor_net": round(net_profit / net_loss, 3) if net_loss else None,
+                    "net_pnl": round(sum(float(t.get("net_pnl", t.get("pnl", 0))) for t in rows), 2),
+                    "gross_pnl": round(sum(float(t.get("gross_pnl", t.get("pnl_gross", t.get("pnl", 0)))) for t in rows), 2),
+                    "fees_paid": round(sum(float(t.get("fees", 0) or 0) for t in rows), 2),
+                    "slippage_cost": round(sum(float(t.get("slippage_cost", 0) or 0) for t in rows), 2),
+                    "sum_r_net": round(sum(float(t.get("r_multiple_net", t.get("r_multiple", 0)) or 0) for t in rows), 4),
+                    "sum_r_gross": round(sum(float(t.get("r_multiple_gross", t.get("r_multiple", 0)) or 0) for t in rows), 4),
+                }
+
+            accounting_metrics = _metrics(closed)
+            performance_metrics = _metrics(performance_closed)
+            wins = performance_metrics["wins"]
+            losses = performance_metrics["losses"]
+            gross_profit = sum(
+                float(t.get("net_pnl", t.get("pnl", 0)))
+                for t in performance_closed
+                if float(t.get("net_pnl", t.get("pnl", 0))) > 0
+            )
+            gross_loss = -sum(
+                float(t.get("net_pnl", t.get("pnl", 0)))
+                for t in performance_closed
+                if float(t.get("net_pnl", t.get("pnl", 0))) < 0
+            )
+            sum_gross = performance_metrics["gross_pnl"]
+            sum_net = performance_metrics["net_pnl"]
+            sum_fees = performance_metrics["fees_paid"]
+            sum_slip = performance_metrics["slippage_cost"]
+            sum_r_net = performance_metrics["sum_r_net"]
+            sum_r_gross = performance_metrics["sum_r_gross"]
             setup_type_stats = {}
             for st in ("reversal", "continuation"):
-                sub = [t for t in closed if str(t.get("setup_type") or "reversal").lower() == st]
+                sub = [t for t in performance_closed if str(t.get("setup_type") or "reversal").lower() == st]
                 sub_wins = sum(1 for t in sub if float(t.get("net_pnl", t.get("pnl", 0))) > 0)
                 sub_losses = sum(1 for t in sub if float(t.get("net_pnl", t.get("pnl", 0))) <= 0)
                 setup_type_stats[st] = {
@@ -721,7 +872,20 @@ class PaperLedger:
                 "fee_bps": self.fee_bps,
                 "slippage_bps": self.slippage_bps,
             }
-            retune = live_policy.retune_discipline_status(len(closed))
+            retune = live_policy.retune_discipline_status(len(performance_closed))
+            performance_metrics["expectancy_r_net"] = (
+                round(sum_r_net / len(performance_closed), 4) if performance_closed else None
+            )
+            performance_metrics["excluded_superseded_churn"] = len(excluded_churn)
+            performance_metrics["equity_net"] = round(
+                live_policy.RESEARCH_INITIAL_EQUITY + performance_metrics["net_pnl"], 2
+            )
+            performance_metrics["equity_gross"] = round(
+                live_policy.RESEARCH_INITIAL_EQUITY + performance_metrics["gross_pnl"], 2
+            )
+            accounting_metrics["expectancy_r_net"] = (
+                round(accounting_metrics["sum_r_net"] / len(closed), 4) if closed else None
+            )
             return {
                 "equity": round(self._equity, 2),
                 "equity_net": round(self._equity, 2),
@@ -736,10 +900,13 @@ class PaperLedger:
                     if unrealized_gross is not None
                     else round(self._equity_gross, 2)
                 ),
+                # `closed_trades` remains the complete accounting/audit count.
+                # Performance fields below intentionally exclude superseded
+                # churn, while equity remains the realized account equity.
                 "closed_trades": len(closed),
                 "wins": wins,
                 "losses": losses,
-                "win_rate": round(wins / len(closed), 4) if closed else 0.0,
+                "win_rate": performance_metrics["win_rate"],
                 "profit_factor": round(gross_profit / gross_loss, 3) if gross_loss else None,
                 "profit_factor_net": round(gross_profit / gross_loss, 3) if gross_loss else None,
                 "net_pnl": round(sum_net, 2),
@@ -748,16 +915,30 @@ class PaperLedger:
                 "slippage_cost": round(sum_slip, 2),
                 "sum_r_net": round(sum_r_net, 4),
                 "sum_r_gross": round(sum_r_gross, 4),
-                "expectancy_r_net": round(sum_r_net / len(closed), 4) if closed else None,
+                "expectancy_r_net": performance_metrics["expectancy_r_net"],
+                "performance_closed_trades": len(performance_closed),
+                "performance_excluded_trades": len(closed) - len(performance_closed),
+                "performance_excluded_superseded_churn": len(excluded_churn),
+                "performance_net_pnl": performance_metrics["net_pnl"],
+                "performance_gross_pnl": performance_metrics["gross_pnl"],
+                "performance_equity_net": performance_metrics["equity_net"],
+                "performance_equity_gross": performance_metrics["equity_gross"],
+                "ledger_reset_id": self.reset_id or None,
+                "performance": performance_metrics,
+                "accounting": accounting_metrics,
                 "setup_type_stats": setup_type_stats,
                 "last_closed": closed[-1] if closed else None,
+                "last_performance_closed": performance_closed[-1] if performance_closed else None,
                 "last_reject": self._last_reject,
                 "economics": economics,
                 "pnl_reporting": {
                     "gross_pnl": round(sum_gross, 2),
                     "approx_net_pnl": round(sum_net, 2),
+                    "accounting_gross_pnl": accounting_metrics["gross_pnl"],
+                    "accounting_net_pnl": accounting_metrics["net_pnl"],
+                    "performance_excluded_superseded_churn": len(excluded_churn),
                     "do_not_treat_gross_as_alpha": True,
-                    "label": "gross / approx net (research fee+slip)",
+                    "label": "gross / approx net (research fee+slip); performance book excludes superseded churn",
                 },
                 "risk_policy": {
                     "risk_fraction": self.risk_fraction,

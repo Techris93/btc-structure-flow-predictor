@@ -515,9 +515,11 @@
               <div class="row"><span>Mark-to-market (net)</span><span id="papermtm" class="mono">—</span></div>
               <div class="row"><span>Gross P&amp;L</span><span id="papergross" class="mono">—</span></div>
               <div class="row"><span>Approx net P&amp;L</span><span id="paperpnl" class="mono">—</span></div>
+              <div class="row"><span>Account net P&amp;L (incl. churn)</span><span id="paperaccountingpnl" class="mono">—</span></div>
               <div class="row"><span>Fees + slip</span><span id="papercosts" class="mono">—</span></div>
               <div class="row"><span>Open unrealized (net)</span><span id="paperunrealized" class="mono">—</span></div>
               <div class="row"><span>Closed trades</span><span id="papertrades">—</span></div>
+              <div class="row"><span>Performance sample</span><span id="papersample">—</span></div>
               <div class="row"><span>Win rate</span><span id="winrate">—</span></div>
               <div class="row"><span>Profit factor (net)</span><span id="pf">—</span></div>
               <div class="row"><span>Expectancy R (net)</span><span id="paperexpr" class="mono">—</span></div>
@@ -944,6 +946,15 @@
         setText("papermtm", fmtMoney(paper.mark_to_market_equity ?? paper.equity_net ?? paper.equity), "mono");
         setText("papergross", paper.gross_pnl == null ? "—" : fmtMoney(paper.gross_pnl), "mono");
         setText("paperpnl", paper.net_pnl == null ? "—" : fmtMoney(paper.net_pnl), "mono");
+        setText(
+          "paperaccountingpnl",
+          paper.accounting && paper.accounting.net_pnl != null
+            ? fmtMoney(paper.accounting.net_pnl)
+            : paper.net_pnl == null
+              ? "—"
+              : fmtMoney(paper.net_pnl),
+          "mono",
+        );
         const costTotal = Number(paper.fees_paid || 0) + Number(paper.slippage_cost || 0);
         setText(
           "papercosts",
@@ -961,6 +972,14 @@
             ? "—"
             : String(paper.closed_trades) + (paper.open_position ? " · open" : ""),
         );
+        const performanceTrades = paper.performance_closed_trades;
+        const excludedChurn = paper.performance_excluded_superseded_churn ?? paper.performance_excluded_trades;
+        setText(
+          "papersample",
+          performanceTrades == null
+            ? "—"
+            : String(performanceTrades) + (excludedChurn ? " · " + String(excludedChurn) + " churn excluded" : ""),
+        );
         setText("winrate", paper.win_rate == null ? "—" : fmtPct(paper.win_rate));
         const pf = paper.profit_factor_net ?? paper.profit_factor;
         setText("pf", pf == null ? "—" : fmtNumber(pf, 2), "mono");
@@ -970,7 +989,13 @@
           "mono",
         );
         if (paper.pnl_reporting && paper.pnl_reporting.label) {
-          setText("papernote", paper.pnl_reporting.label + " — do not treat gross as alpha.");
+          const excluded = paper.performance_excluded_superseded_churn || 0;
+          setText(
+            "papernote",
+            paper.pnl_reporting.label +
+              " — performance stats exclude " + excluded + " superseded-churn trade" + (excluded === 1 ? "" : "s") +
+              "; account equity includes realized history.",
+          );
         }
         const gov = s.governance || {};
         const dq = s.data_quality || gov.data_quality || {};
