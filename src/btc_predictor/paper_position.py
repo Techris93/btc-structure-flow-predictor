@@ -236,6 +236,7 @@ class PaperLedger:
                 "fee_bps": self.fee_bps,
                 "slippage_bps": self.slippage_bps,
                 "last_mark_price": None,
+                "last_reject": None,
                 "ledger_reset_id": self.reset_id,
             })
 
@@ -251,6 +252,7 @@ class PaperLedger:
                     self._last_mark_price = (
                         float(stored_mark) if stored_mark is not None else None
                     )
+                    self._last_reject = data.get("last_reject")
                     raw_closed = [dict(t) for t in list(data.get("closed", []))]
                     self._closed = [_annotate_economics(t) for t in raw_closed]
                     self._performance_annotations_dirty = raw_closed != self._closed
@@ -308,6 +310,7 @@ class PaperLedger:
                     "fee_bps": self.fee_bps,
                     "slippage_bps": self.slippage_bps,
                     "last_mark_price": self._last_mark_price,
+                    "last_reject": self._last_reject,
                     "ledger_reset_id": self.reset_id or None,
                 })
 

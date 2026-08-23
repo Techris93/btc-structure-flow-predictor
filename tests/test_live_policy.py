@@ -151,8 +151,9 @@ def test_soft_filter_skips_hero_rr_and_round_magnet_stop():
     )
 
 
-def test_soft_filter_blocks_on_ledger_place():
-    ledger = PaperLedger(soft_filters=True, use_fixed_pct_exits=False)
+def test_soft_filter_blocks_on_ledger_place(tmp_path):
+    path = tmp_path / "rejected-ledger.json"
+    ledger = PaperLedger(path, soft_filters=True, use_fixed_pct_exits=False)
     ledger._closed = []
     ledger._equity = 100_000.0
     event = {
@@ -179,6 +180,9 @@ def test_soft_filter_blocks_on_ledger_place():
     assert status["entry_status"]["state"] == "rejected"
     assert status["entry_status"]["signal_id"] == "s1"
     assert status["open_unrealized_pnl"] is None
+
+    restarted = PaperLedger(path, soft_filters=True, use_fixed_pct_exits=False)
+    assert restarted._status()["entry_status"] == status["entry_status"]
 
 
 def test_open_fill_reports_transition_and_persists_mark_to_market(tmp_path):
