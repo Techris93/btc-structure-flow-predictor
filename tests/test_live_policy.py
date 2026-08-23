@@ -173,9 +173,70 @@ def test_soft_filter_blocks_on_ledger_place():
             "entry_type": "market",
         },
     }
-    ledger.apply_lifecycle([event])
+    status = ledger.apply_lifecycle([event])
     assert ledger._open is None and ledger._pending is None
     assert ledger._last_reject and ledger._last_reject["reason"] == "soft_filter"
+    assert status["entry_status"]["state"] == "rejected"
+    assert status["entry_status"]["signal_id"] == "s1"
+    assert status["open_unrealized_pnl"] is None
+
+
+def test_open_fill_reports_transition_and_persists_mark_to_market(tmp_path):
+    path = tmp_path / "paper-ledger.json"
+    ledger = PaperLedger(
+        path,
+        soft_filters=False,
+        apply_research_costs=False,
+        use_fixed_pct_exits=False,
+        fill_min_rr=0.0,
+    )
+    ledger._closed = []
+    ledger._equity = 100_000.0
+    ledger._equity_gross = 100_000.0
+    event = {
+        "event_id": "open-transition",
+        "event_type": "setup_confirmed",
+        "signal_id": "signal-open-1",
+        "created_at": "2026-08-23T00:00:00+00:00",
+        "snapshot": {
+            "timestamp": "2026-08-23T00:00:00+00:00",
+            "bias": "bullish",
+            "entry": 100.0,
+            "stop": 95.0,
+            "target": 110.0,
+            "position_size": 1.0,
+            "reward_risk": 2.0,
+            "zone": "equal_lows:test",
+            "zone_kind": "equal_lows",
+            "entry_type": "market",
+        },
+    }
+
+    accepted = ledger.apply_lifecycle([event])
+    assert accepted["entry_status"]["state"] == "pending"
+    assert accepted["open_unrealized_pnl"] is None
+
+    bar = pd.DataFrame(
+        {"open": [101.0], "high": [103.0], "low": [100.0], "close": [102.0]},
+        index=[pd.Timestamp("2026-08-23T00:01:00Z")],
+    )
+    filled = ledger.update_market(bar)
+
+    assert filled["entry_status"]["state"] == "open"
+    assert filled["open_position"]["signal_id"] == "signal-open-1"
+    assert [row["signal_id"] for row in filled["newly_opened"]] == ["signal-open-1"]
+    assert filled["open_unrealized_pnl"] is not None
+
+    restarted = PaperLedger(
+        path,
+        soft_filters=False,
+        apply_research_costs=False,
+        use_fixed_pct_exits=False,
+        fill_min_rr=0.0,
+    )
+    restored = restarted._status()
+    assert restored["entry_status"]["state"] == "open"
+    assert restored["open_unrealized_pnl"] == filled["open_unrealized_pnl"]
 
 
 def test_notional_cap_reduces_size():

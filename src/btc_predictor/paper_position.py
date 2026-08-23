@@ -181,6 +181,10 @@ class PaperLedger:
         self._equity = live_policy.RESEARCH_INITIAL_EQUITY
         self._equity_gross = live_policy.RESEARCH_INITIAL_EQUITY
         self._last_reject: dict | None = None
+        # Retain the last observed close so an open position can still be
+        # marked to market while the API is serving persisted state during a
+        # restart or between live-loop updates.
+        self._last_mark_price: float | None = None
         self._performance_annotations_dirty = False
         self._skip_historical_seed = False
         self._reset_if_requested()
@@ -219,6 +223,7 @@ class PaperLedger:
             self._closed = []
             self._equity = live_policy.RESEARCH_INITIAL_EQUITY
             self._equity_gross = live_policy.RESEARCH_INITIAL_EQUITY
+            self._last_mark_price = None
             self._skip_historical_seed = True
             self.store.write({
                 "open": None,
@@ -230,6 +235,7 @@ class PaperLedger:
                 "economics_version": 1,
                 "fee_bps": self.fee_bps,
                 "slippage_bps": self.slippage_bps,
+                "last_mark_price": None,
                 "ledger_reset_id": self.reset_id,
             })
 
@@ -241,6 +247,10 @@ class PaperLedger:
                     self._skip_historical_seed = bool(data.get("ledger_reset_id"))
                     self._open = data.get("open")
                     self._pending = data.get("pending")
+                    stored_mark = data.get("last_mark_price")
+                    self._last_mark_price = (
+                        float(stored_mark) if stored_mark is not None else None
+                    )
                     raw_closed = [dict(t) for t in list(data.get("closed", []))]
                     self._closed = [_annotate_economics(t) for t in raw_closed]
                     self._performance_annotations_dirty = raw_closed != self._closed
@@ -297,6 +307,7 @@ class PaperLedger:
                     "economics_version": 1,
                     "fee_bps": self.fee_bps,
                     "slippage_bps": self.slippage_bps,
+                    "last_mark_price": self._last_mark_price,
                     "ledger_reset_id": self.reset_id or None,
                 })
 
@@ -304,15 +315,30 @@ class PaperLedger:
         """Apply market facts only: pending fills/expiry and TP/SL exits."""
         with self.lock:
             closed_before_update = len(self._closed)
+            open_before_update = (
+                (self._open.get("signal_id"), self._open.get("entry_time"))
+                if self._open is not None
+                else None
+            )
             last_close = None
             if current_ohlc is not None and not current_ohlc.empty:
                 last_close = float(current_ohlc["close"].iloc[-1])
+                self._last_mark_price = last_close
             self._update_pending_market(current_ohlc)
+            newly_opened = []
+            if self._open is not None:
+                open_after_pending = (
+                    self._open.get("signal_id"),
+                    self._open.get("entry_time"),
+                )
+                if open_after_pending != open_before_update:
+                    newly_opened.append(dict(self._open))
             if self._open is not None and current_ohlc is not None and not current_ohlc.empty:
                 self._check_exit(current_ohlc)
             self._save()
             status = self._status(last_close)
             status["newly_closed"] = [dict(trade) for trade in self._closed[closed_before_update:]]
+            status["newly_opened"] = newly_opened
             return status
 
     def apply_lifecycle(self, events, current_ohlc: pd.DataFrame | None = None):
@@ -322,6 +348,7 @@ class PaperLedger:
             last_close = None
             if current_ohlc is not None and not current_ohlc.empty:
                 last_close = float(current_ohlc["close"].iloc[-1])
+                self._last_mark_price = last_close
             for event in events or []:
                 event_type = str(event.get("event_type") or "")
                 signal_id = event.get("signal_id")
@@ -776,6 +803,8 @@ class PaperLedger:
 
     def _status(self, last_price: float | None = None):
         with self.lock:
+            if last_price is None:
+                last_price = self._last_mark_price
             # Re-apply classification defensively so imported/legacy rows are
             # honest even when a test or migration inserted them directly.
             closed = [_annotate_performance(t) for t in self._closed]
@@ -886,12 +915,38 @@ class PaperLedger:
             accounting_metrics["expectancy_r_net"] = (
                 round(accounting_metrics["sum_r_net"] / len(closed), 4) if closed else None
             )
+            if self._open is not None:
+                entry_status = {
+                    "state": "open",
+                    "signal_id": self._open.get("signal_id"),
+                    "side": self._open.get("side"),
+                    "entry_type": self._open.get("entry_type"),
+                    "entry": self._open.get("entry"),
+                    "filled_at": self._open.get("filled_at") or self._open.get("entry_time"),
+                }
+            elif self._pending is not None:
+                entry_status = {
+                    "state": "pending",
+                    "signal_id": self._pending.get("signal_id"),
+                    "side": self._pending.get("side"),
+                    "entry_type": self._pending.get("entry_type"),
+                    "entry": self._pending.get("entry"),
+                    "confirmed_at": self._pending.get("confirmed_at"),
+                }
+            elif self._last_reject is not None:
+                entry_status = {
+                    "state": "rejected",
+                    **dict(self._last_reject),
+                }
+            else:
+                entry_status = {"state": "flat"}
             return {
                 "equity": round(self._equity, 2),
                 "equity_net": round(self._equity, 2),
                 "equity_gross": round(self._equity_gross, 2),
                 "open_position": self._open,
                 "pending_order": self._pending,
+                "entry_status": entry_status,
                 "open_unrealized_pnl": unrealized,
                 "open_unrealized_pnl_gross": unrealized_gross,
                 "mark_to_market_equity": round(self._equity + unrealized, 2) if unrealized is not None else round(self._equity, 2),

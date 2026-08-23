@@ -517,6 +517,7 @@
               <div class="row"><span>Approx net P&amp;L</span><span id="paperpnl" class="mono">—</span></div>
               <div class="row"><span>Account net P&amp;L (incl. churn)</span><span id="paperaccountingpnl" class="mono">—</span></div>
               <div class="row"><span>Fees + slip</span><span id="papercosts" class="mono">—</span></div>
+              <div class="row"><span>Paper position</span><span id="paperposition">—</span></div>
               <div class="row"><span>Open unrealized (net)</span><span id="paperunrealized" class="mono">—</span></div>
               <div class="row"><span>Closed trades</span><span id="papertrades">—</span></div>
               <div class="row"><span>Performance sample</span><span id="papersample">—</span></div>
@@ -695,6 +696,7 @@
         if (
           r.includes("conflict") ||
           r.includes("insufficient") ||
+          r.includes("rejected") ||
           r.includes("failed") ||
           r.includes("unavailable") ||
           r.includes("degraded")
@@ -779,26 +781,66 @@
       function render(s) {
         const x = s.prediction || {};
         const paper = s.paper || {};
-        const bias = x.bias || "neutral";
+        const openPosition = paper.open_position || null;
+        const pendingOrder = paper.pending_order || null;
+        const entryStatus = paper.entry_status || {
+          state: openPosition ? "open" : pendingOrder ? "pending" : "flat",
+        };
+        let bias = x.bias || "neutral";
         const feedStatus = s.status || "starting";
         const confirmed = !!x.orderflow_confirmation && !x.no_trade_reason;
-        const reasonRaw = x.no_trade_reason || (confirmed ? "setup_confirmed" : null);
-        const reasonText =
-          reasonRaw === "setup_confirmed"
-            ? "Setup confirmed"
+        const rejectMatchesCurrent =
+          entryStatus.state === "rejected" &&
+          confirmed &&
+          (!entryStatus.signal_id || !x.signal_id || entryStatus.signal_id === x.signal_id);
+        let reasonRaw = x.no_trade_reason || (confirmed ? "signal_confirmed" : null);
+        let reasonText =
+          reasonRaw === "signal_confirmed"
+            ? "Signal confirmed · awaiting paper execution"
             : humanize(reasonRaw) || "Connecting to Bybit and Binance…";
+        let reasonDetail = reasonText;
+        let shownEntry = x.entry;
+        let shownStop = x.stop;
+        let shownTarget = x.target;
+        let executionConfirmed = false;
+
+        if (openPosition) {
+          bias = openPosition.side === "long" ? "bullish" : "bearish";
+          reasonRaw = "paper_trade_open";
+          reasonText = "Paper trade open";
+          reasonDetail = `${humanize(openPosition.side)} position filled · unrealized P&L is live`;
+          shownEntry = openPosition.entry;
+          shownStop = openPosition.stop;
+          shownTarget = openPosition.target;
+          executionConfirmed = true;
+        } else if (pendingOrder) {
+          bias = pendingOrder.side === "long" ? "bullish" : "bearish";
+          reasonRaw = "paper_entry_pending";
+          reasonText = pendingOrder.entry_type === "limit" ? "Limit entry pending" : "Entry queued for next bar";
+          reasonDetail = "Signal accepted by paper ledger · no position exposure until filled";
+          shownEntry = pendingOrder.entry;
+          shownStop = pendingOrder.stop;
+          shownTarget = pendingOrder.target;
+        } else if (rejectMatchesCurrent) {
+          const rejectReasons = (entryStatus.hard_skips || entryStatus.risk?.reasons || [])
+            .map(humanize)
+            .join(" · ");
+          reasonRaw = "paper_entry_rejected";
+          reasonText = "Signal confirmed · paper entry rejected";
+          reasonDetail = rejectReasons || humanize(entryStatus.reason);
+        }
 
         $("signal").textContent = humanize(bias).toUpperCase();
         $("signal").className = "bias " + bias;
 
         const pill = $("statusPill");
         pill.textContent = reasonText;
-        pill.className = "status-pill " + statusTone(reasonRaw || reasonText, confirmed);
-        $("reason").textContent = reasonText;
+        pill.className = "status-pill " + statusTone(reasonRaw || reasonText, executionConfirmed);
+        $("reason").textContent = reasonDetail;
 
-        $("entry").textContent = fmtPrice(x.entry);
-        $("stop").textContent = fmtPrice(x.stop);
-        $("target").textContent = fmtPrice(x.target);
+        $("entry").textContent = fmtPrice(shownEntry);
+        $("stop").textContent = fmtPrice(shownStop);
+        $("target").textContent = fmtPrice(shownTarget);
 
         setText("setup", humanize(x.setup_type));
         setToneText("regime4h", x.regime_4h, humanize(x.regime_4h));
@@ -960,6 +1002,18 @@
           "papercosts",
           paper.fees_paid == null && paper.slippage_cost == null ? "—" : fmtMoney(costTotal),
           "mono",
+        );
+        const paperPositionText = openPosition
+          ? `Open ${humanize(openPosition.side)} · ${fmtPrice(openPosition.entry)}`
+          : pendingOrder
+            ? `Pending ${humanize(pendingOrder.side)} · ${humanize(pendingOrder.entry_type)}`
+            : entryStatus.state === "rejected"
+              ? `Flat · last entry rejected (${humanize(entryStatus.reason)})`
+              : "Flat";
+        setText(
+          "paperposition",
+          paperPositionText,
+          openPosition ? toneClass(bias) : pendingOrder ? "tone-neutral" : "",
         );
         setText(
           "paperunrealized",

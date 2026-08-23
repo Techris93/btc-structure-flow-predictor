@@ -712,6 +712,8 @@ def _enqueue_signal_events(events):
         signal_id = event.get("signal_id")
         if event_type in ("setup_invalidated", "setup_expired") and signal_id:
             superseded[signal_id] = event_type
+        if event_type == "trade_opened" and signal_id:
+            superseded[signal_id] = "paper_entry_filled"
         replaced = event.get("replaced_signal_id")
         if event_type == "setup_confirmed" and replaced:
             superseded[replaced] = "replaced_by_confirmed_setup"
@@ -745,6 +747,34 @@ def _enqueue_signal_events(events):
             )
     _write_signal_queue(state)
     return len(state["pending"])
+
+
+def _discard_strategy_only_notifications():
+    """Remove legacy signal alerts that do not prove paper execution.
+
+    Strategy confirmation remains visible in diagnostics, but Web Push is
+    reserved for an actual paper fill or terminal paper exit.  This migration
+    also prevents setup alerts queued by an older deployment from being sent
+    after the execution-truth change ships.
+    """
+    state = _signal_queue_state()
+    retained = []
+    removed = 0
+    for event in state["pending"]:
+        if str(event.get("event_type") or "").startswith("setup_"):
+            removed += 1
+            _record_push_decision(
+                event.get("event_id"),
+                status="suppressed_not_executed",
+                suppressed_at=_utcnow().isoformat(),
+                suppressed_reason="paper_execution_not_proven",
+            )
+        else:
+            retained.append(event)
+    if removed:
+        state["pending"] = retained
+        _write_signal_queue(state)
+    return removed
 
 
 def _cancel_signal_events(signal_id, reason):
@@ -923,6 +953,53 @@ def _pipeline_watchdog(collectors, now):
         push_dispatch_alerted = False
         logger.info("Push dispatcher alert cleared: queue is no longer lagging")
     return push
+
+
+def _paper_open_event_id(position):
+    identity = {
+        key: position.get(key)
+        for key in ("signal_id", "entry_time", "side", "entry", "size")
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+    return f"paper-open-{digest}"
+
+
+def _paper_open_event(position):
+    side = str(position.get("side") or "trade").capitalize()
+    entry = float(position.get("entry") or 0.0)
+    stop = float(position.get("stop") or 0.0)
+    target = float(position.get("target") or 0.0)
+    event_id = _paper_open_event_id(position)
+    return {
+        "event_id": event_id,
+        "event_type": "trade_opened",
+        "signal_id": position.get("signal_id"),
+        "created_at": position.get("filled_at") or position.get("entry_time") or _utcnow().isoformat(),
+        "cooldown_exempt": True,
+        "title": "BTC paper trade opened",
+        "body": (
+            f"{side} filled · Entry ${entry:,.2f} · "
+            f"SL ${stop:,.2f} · TP ${target:,.2f}"
+        ),
+    }
+
+
+def _paper_open_notification_events(paper_status):
+    """Return fill notifications only for positions that remain open."""
+    newly_closed = list((paper_status or {}).get("newly_closed") or [])
+    closed_identities = {
+        (trade.get("signal_id"), trade.get("entry_time"))
+        for trade in newly_closed
+    }
+    events = []
+    for position in (paper_status or {}).get("newly_opened") or []:
+        identity = (position.get("signal_id"), position.get("entry_time"))
+        if identity in closed_identities:
+            continue
+        events.append(_paper_open_event(position))
+    return events
 
 
 def _paper_exit_event_id(trade):
@@ -1735,6 +1812,10 @@ def _live_loop():
                     list(market_paper_status.get("newly_closed") or [])
                     + list(decision_paper_status.get("newly_closed") or [])
                 )
+                paper_status["newly_opened"] = (
+                    list(market_paper_status.get("newly_opened") or [])
+                    + list(decision_paper_status.get("newly_opened") or [])
+                )
                 # Instrumentation: funnel, decision snapshots, shadow book.
                 try:
                     funnel_diary.record_prediction(
@@ -1744,7 +1825,7 @@ def _live_loop():
                     )
                     if paper_status.get("newly_closed"):
                         funnel_diary.record("paper_exits", ts=notification_now, n=len(paper_status["newly_closed"]))
-                    if any(str(e.get("event_type")) == "setup_confirmed" for e in lifecycle_events):
+                    if paper_status.get("newly_opened"):
                         funnel_diary.record("paper_entries", ts=notification_now)
                     reject = paper_status.get("last_reject") or {}
                     if reject.get("reason") == "soft_filter":
@@ -1768,10 +1849,18 @@ def _live_loop():
                 _notify_paper_exits(paper_status.get("newly_closed") or [])
             except Exception:
                 logger.exception("Paper exit notification dispatch failed")
-            _enqueue_signal_events(lifecycle_events)
+            for closed_trade in paper_status.get("newly_closed") or []:
+                _cancel_signal_events(
+                    closed_trade.get("signal_id"), "paper_trade_closed"
+                )
+            # Strategy lifecycle events are diagnostics, not proof that the
+            # ledger accepted or filled an entry.  Push only actual fills;
+            # paper exits are handled by the durable exit dispatcher above.
+            _discard_strategy_only_notifications()
+            _enqueue_signal_events(_paper_open_notification_events(paper_status))
             # TP/SL is always the only alert dispatched in its poll. Lifecycle
             # alerts resume next poll and retain their durable queue position.
-            if not definitive_exit:
+            if not paper_status.get("newly_closed"):
                 _dispatch_signal_event(notification_now)
             push_dispatch_diagnostics = _pipeline_watchdog(collectors, notification_now)
             _set_live_loop_phase("pruning")
@@ -1876,6 +1965,9 @@ def _live_loop():
                 binance_data_path=binance_data_path,
             )
             pred_dict = dict(result.__dict__) if hasattr(result, "__dict__") else dict(result or {})
+            pred_dict["signal_id"] = SignalLifecycle.signal_id(
+                SignalLifecycle.snapshot(result)
+            )
             pred_dict["probability_source"] = live_policy.PROBABILITY_SOURCE
             pred_dict["probability_use"] = live_policy.PROBABILITY_USE
             pred_dict["probability_tp_before_sl_is_heuristic"] = True

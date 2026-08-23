@@ -498,6 +498,68 @@ def test_lifecycle_push_queue_deduplicates_and_respects_safety_cooldown(
     assert len(sent) == 1
 
 
+def test_strategy_confirmation_is_suppressed_until_paper_fill(monkeypatch, tmp_path):
+    queue_store = web_app.JsonStore(tmp_path / "signal-events.json")
+    decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
+    monkeypatch.setattr(web_app, "signal_event_queue_store", queue_store)
+    monkeypatch.setattr(web_app, "push_decision_events_store", decision_store)
+    setup = {
+        "event_id": "setup-not-executed",
+        "event_type": "setup_confirmed",
+        "signal_id": "signal-1",
+        "title": "BTC setup confirmed",
+        "body": "Bullish continuation confirmed",
+    }
+    web_app._enqueue_signal_events([setup])
+
+    assert web_app._discard_strategy_only_notifications() == 1
+    assert queue_store.read({})["pending"] == []
+    decision = decision_store.read([])[-1]
+    assert decision["status"] == "suppressed_not_executed"
+
+
+def test_actual_paper_fill_creates_truthful_open_notification():
+    position = {
+        "signal_id": "signal-1",
+        "side": "long",
+        "entry": 73_000.0,
+        "stop": 72_270.0,
+        "target": 74_460.0,
+        "size": 0.25,
+        "entry_time": "2026-08-23T00:01:00+00:00",
+        "filled_at": "2026-08-23T00:01:00+00:00",
+    }
+    events = web_app._paper_open_notification_events({
+        "newly_opened": [position],
+        "newly_closed": [],
+    })
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "trade_opened"
+    assert events[0]["title"] == "BTC paper trade opened"
+    assert "Long filled" in events[0]["body"]
+    assert "Entry $73,000.00" in events[0]["body"]
+    assert events[0]["cooldown_exempt"] is True
+
+
+def test_same_poll_fill_and_exit_does_not_send_stale_open_notification():
+    position = {
+        "signal_id": "signal-1",
+        "side": "long",
+        "entry": 100.0,
+        "stop": 99.0,
+        "target": 102.0,
+        "size": 1.0,
+        "entry_time": "2026-08-23T00:01:00+00:00",
+    }
+    status = {
+        "newly_opened": [position],
+        "newly_closed": [{**position, "exit_time": "2026-08-23T00:02:00+00:00"}],
+    }
+
+    assert web_app._paper_open_notification_events(status) == []
+
+
 def test_failed_lifecycle_push_remains_durable(monkeypatch, tmp_path):
     queue_store = web_app.JsonStore(tmp_path / "signal-events.json")
     decision_store = web_app.JsonStore(tmp_path / "push-decisions.json")
@@ -693,6 +755,15 @@ def test_dashboard_does_not_create_foreground_only_notifications():
     dashboard = (Path(__file__).parents[1] / "templates" / "dashboard.html").read_text()
 
     assert 'new Notification("BTC Predictor update"' not in dashboard
+
+
+def test_dashboard_distinguishes_signal_from_paper_execution():
+    dashboard = (Path(__file__).parents[1] / "templates" / "dashboard.html").read_text()
+
+    assert "Signal confirmed · paper entry rejected" in dashboard
+    assert "Entry queued for next bar" in dashboard
+    assert "Paper trade open" in dashboard
+    assert 'id="paperposition"' in dashboard
 
 
 def test_service_worker_supports_background_subscription_rotation():
