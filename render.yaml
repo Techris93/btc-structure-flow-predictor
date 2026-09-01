@@ -37,6 +37,10 @@ services:
         value: "1800"
       - key: CONTINUATION_REARM_ATR
         value: "1.0"
+      - key: TP_REARM_SECONDS
+        value: "7200"
+      - key: PAPER_SAME_SIDE_TP_COOLDOWN_HOURS
+        value: "2"
       - key: USE_FIXED_PCT_EXITS
         value: "1"
       - key: FIXED_STOP_PCT

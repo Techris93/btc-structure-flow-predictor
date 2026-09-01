@@ -460,3 +460,58 @@ def test_write_seeded_rescore_report(tmp_path):
 
 def test_seeded_trades_list_unchanged_count():
     assert len(HISTORICAL_SEEDED_TRADES) == 3
+
+
+def test_soft_filter_cooldown_and_same_zone_after_target():
+    last_closed_tp = {
+        "side": "short",
+        "entry": 76500.0,
+        "stop": 77265.0,
+        "target": 74970.0,
+        "exit": 74970.0,
+        "exit_reason": "target",
+        "zone": "vwap_lower:short1",
+        "exit_time": "2026-09-01T21:00:00+00:00",
+    }
+    snap_base = {
+        "timestamp": "2026-09-01T21:05:00+00:00",
+        "bias": "bearish",
+        "entry": 74980.0,
+        "stop": 75729.8,
+        "target": 73480.4,
+        "reward_risk": 2.0,
+        "zone": "vwap_lower:short1",
+        "zone_kind": "vwap_lower",
+        "entry_type": "market",
+    }
+
+    # 1. Immediate same zone + same side after TP -> blocked by same_zone_after_target & cooldown
+    eval_same_zone = live_policy.evaluate_soft_filters(snap_base, last_closed=last_closed_tp)
+    assert eval_same_zone["allow"] is False
+    assert "same_zone_after_target" in eval_same_zone["hard_skips"]
+    assert "same_side_cooldown_after_target" in eval_same_zone["hard_skips"]
+
+    # 2. Immediate different zone + same side after TP (5 min later) -> blocked by cooldown
+    eval_diff_zone = live_policy.evaluate_soft_filters(
+        {**snap_base, "zone": "untested_breakout:short2"}, last_closed=last_closed_tp
+    )
+    assert eval_diff_zone["allow"] is False
+    assert "same_side_cooldown_after_target" in eval_diff_zone["hard_skips"]
+
+    # 3. Immediate opposite side (bullish bounce) -> allowed
+    eval_opposite = live_policy.evaluate_soft_filters(
+        {**snap_base, "bias": "bullish", "zone": "equal_lows:bounce"}, last_closed=last_closed_tp
+    )
+    assert eval_opposite["allow"] is True
+
+    # 4. Same side after 2.5 hours (cooldown elapsed > 2.0h) -> allowed
+    eval_later = live_policy.evaluate_soft_filters(
+        {
+            **snap_base,
+            "timestamp": "2026-09-01T23:35:00+00:00",
+            "zone": "untested_breakout:short3",
+        },
+        last_closed=last_closed_tp,
+    )
+    assert eval_later["allow"] is True
+

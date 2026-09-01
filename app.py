@@ -157,6 +157,7 @@ BIAS_CONFIRM_OBSERVATIONS = max(1, int(os.getenv("BIAS_CONFIRM_OBSERVATIONS", "2
 SIGNAL_REPLACEMENT_DISTANCE_ATR = max(0.0, float(os.getenv("SIGNAL_REPLACEMENT_DISTANCE_ATR", "0.25")))
 CONTINUATION_REARM_SECONDS = max(0, int(os.getenv("CONTINUATION_REARM_SECONDS", "1800")))
 CONTINUATION_REARM_ATR = max(0.0, float(os.getenv("CONTINUATION_REARM_ATR", "1.0")))
+TP_REARM_SECONDS = max(0, int(os.getenv("TP_REARM_SECONDS", "7200")))
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://btc-structure-flow-predictor.onrender.com"
 ).rstrip("/")
@@ -208,6 +209,7 @@ signal_lifecycle = SignalLifecycle(
     replacement_distance_atr=SIGNAL_REPLACEMENT_DISTANCE_ATR,
     continuation_rearm_seconds=CONTINUATION_REARM_SECONDS,
     continuation_rearm_atr=CONTINUATION_REARM_ATR,
+    tp_rearm_seconds=TP_REARM_SECONDS,
 )
 funnel_diary = live_policy.FunnelDiary(funnel_diary_store)
 decision_snapshot_log = live_policy.DecisionSnapshotLog(decision_snapshot_store)

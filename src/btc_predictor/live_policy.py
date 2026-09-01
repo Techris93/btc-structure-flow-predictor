@@ -28,6 +28,7 @@ DAILY_LOSS_R = float(os.getenv("PAPER_DAILY_LOSS_R", "2.0"))
 WEEKLY_LOSS_R = float(os.getenv("PAPER_WEEKLY_LOSS_R", "4.0"))
 MAX_HOLD_HOURS = float(os.getenv("PAPER_MAX_HOLD_HOURS", "12"))
 SAME_SIDE_COOLDOWN_HOURS = float(os.getenv("PAPER_SAME_SIDE_COOLDOWN_HOURS", "8"))
+SAME_SIDE_TP_COOLDOWN_HOURS = float(os.getenv("PAPER_SAME_SIDE_TP_COOLDOWN_HOURS", "2.0"))
 FILL_MIN_RR = float(os.getenv("PAPER_FILL_MIN_RR", "1.5"))
 
 # Fixed percent exits: 1% stop / 2% target → 2R from the fill.
@@ -100,6 +101,7 @@ def policy_manifest() -> dict[str, Any]:
             "one_open_risk_unit": True,
             "max_hold_hours": MAX_HOLD_HOURS,
             "same_side_cooldown_hours": SAME_SIDE_COOLDOWN_HOURS,
+            "same_side_tp_cooldown_hours": SAME_SIDE_TP_COOLDOWN_HOURS,
             "fill_min_rr": FILL_MIN_RR,
         },
         "exits": {
@@ -362,7 +364,7 @@ def evaluate_soft_filters(
         warnings.append("untested_breakout_zone")
 
     # After a stop, require a new zone and block same-side re-entry for a cooldown.
-    if last_closed and str(last_closed.get("exit_reason") or "") == "stop":
+    if last_closed and str(last_closed.get("exit_reason") or "").lower() == "stop":
         prev_geom = stop_geometry(last_closed.get("entry"), last_closed.get("stop"), last_closed.get("side"))
         if prev_geom.get("stop_on_major_magnet"):
             prev_zone = last_closed.get("zone")
@@ -377,6 +379,23 @@ def evaluate_soft_filters(
                 ).total_seconds() / 3600.0
                 if gap_h < SAME_SIDE_COOLDOWN_HOURS:
                     hard_skips.append("same_side_cooldown_after_stop")
+            except (TypeError, ValueError):
+                pass
+
+    # After a take profit (target), require a new zone and block same-side re-entry for a cooldown.
+    if last_closed and str(last_closed.get("exit_reason") or "").lower() in ("target", "tp"):
+        prev_zone = last_closed.get("zone")
+        if prev_zone and snap.get("zone") == prev_zone:
+            hard_skips.append("same_zone_after_target")
+        last_side = last_closed.get("side")
+        next_side = "long" if snap.get("bias") == "bullish" else "short" if snap.get("bias") == "bearish" else None
+        if last_side and next_side == last_side and last_closed.get("exit_time") and snap.get("timestamp"):
+            try:
+                gap_h = (
+                    pd.Timestamp(snap["timestamp"]) - pd.Timestamp(last_closed["exit_time"])
+                ).total_seconds() / 3600.0
+                if gap_h < SAME_SIDE_TP_COOLDOWN_HOURS:
+                    hard_skips.append("same_side_cooldown_after_target")
             except (TypeError, ValueError):
                 pass
 

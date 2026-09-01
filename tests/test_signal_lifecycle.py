@@ -572,3 +572,103 @@ def test_continuation_structural_expansion_rearms_before_cooldown_expires():
     assert ev8_b[0]["event_type"] == "setup_confirmed"
     assert ev8_b[0]["snapshot"]["entry"] == 70300.0
 
+
+def test_post_tp_cooldown_prevents_immediate_same_direction_reentry():
+    """Verify that after a take-profit exit, same-direction setups are throttled for the TP cooldown period."""
+    engine = SignalLifecycle(confirm_observations=2, tp_rearm_seconds=7200)
+    state = engine.initial_state()
+    base_time = pd.Timestamp("2026-09-01 21:00:00", tz="UTC")
+
+    # 1. Simulate a trade closing at target (Take Profit)
+    paper_tp = {
+        "open_position": None,
+        "pending_order": None,
+        "newly_closed": [
+            {
+                "side": "short",
+                "entry": 76500.0,
+                "exit": 74970.0,
+                "exit_reason": "target",
+                "zone": "vwap_lower:short1",
+                "exit_time": base_time.isoformat(),
+            }
+        ],
+    }
+    # Pass a neutral update while closing
+    state, ev = engine.evaluate(
+        state,
+        prediction(timestamp=base_time, bias="neutral", entry=None, stop=None, target=None, position_size=None),
+        paper_tp,
+        base_time + pd.Timedelta(seconds=30),
+    )
+    assert ev == []
+    assert state["last_exit_by_bias"]["bearish"]["exit_reason"] == "target"
+
+    # 2. Next bar (21:01): Scanner outputs a new Bearish setup at the bottom of the move ($74,980)
+    flat_paper = {"open_position": None, "pending_order": None, "closed_trades": 1}
+    p_next = prediction(
+        timestamp=base_time + pd.Timedelta(minutes=1),
+        bias="bearish",
+        setup_type="continuation",
+        zone="session_low:short2",
+        sweep_time="2026-09-01T20:59:00Z",
+        entry=74980.0,
+        stop=75729.8,
+        target=73480.4,
+        setup_atr=250.0,
+    )
+    state, ev = engine.evaluate(state, p_next, flat_paper, base_time + pd.Timedelta(minutes=1, seconds=30))
+    # Must be blocked by post-TP cooldown!
+    assert ev == []
+    assert state["candidate"] is None
+
+    # Even with repeated 1-minute polls in the next 30 minutes, it remains blocked
+    for m in range(2, 30):
+        p_drift = replace(p_next, timestamp=base_time + pd.Timedelta(minutes=m), zone=f"zone_{m}")
+        state, ev = engine.evaluate(state, p_drift, flat_paper, base_time + pd.Timedelta(minutes=m, seconds=30))
+        assert ev == []
+        assert state["candidate"] is None
+
+    # 3. An opposite Bullish setup (reversal bounce) is NOT blocked
+    t_bounce = base_time + pd.Timedelta(minutes=35)
+    p_bull = prediction(
+        timestamp=t_bounce,
+        bias="bullish",
+        setup_type="reversal",
+        zone="equal_lows:bottom",
+        sweep_time="2026-09-01T21:34:00Z",
+        entry=75100.0,
+        stop=74349.0,
+        target=76602.0,
+        setup_atr=250.0,
+    )
+    state, ev = engine.evaluate(state, p_bull, flat_paper, t_bounce + pd.Timedelta(seconds=30))
+    assert ev == []
+    p_bull2 = replace(p_bull, timestamp=t_bounce + pd.Timedelta(minutes=1))
+    state, ev = engine.evaluate(state, p_bull2, flat_paper, t_bounce + pd.Timedelta(minutes=1, seconds=30))
+    assert len(ev) == 1
+    assert ev[0]["event_type"] == "setup_confirmed"
+    assert ev[0]["snapshot"]["bias"] == "bullish"
+
+    # 4. After 2.5 hours (elapsed > 7200s), a fresh Bearish setup is allowed to confirm
+    t_later = base_time + pd.Timedelta(hours=2, minutes=30)
+    p_later = prediction(
+        timestamp=t_later,
+        bias="bearish",
+        setup_type="reversal",
+        zone="previous_day_high:top",
+        sweep_time="2026-09-01T23:28:00Z",
+        entry=76800.0,
+        stop=77568.0,
+        target=75264.0,
+        setup_atr=250.0,
+    )
+    state, ev = engine.evaluate(state, p_later, flat_paper, t_later + pd.Timedelta(seconds=30))
+    assert ev == []
+    p_later2 = replace(p_later, timestamp=t_later + pd.Timedelta(minutes=1))
+    state, ev = engine.evaluate(state, p_later2, flat_paper, t_later + pd.Timedelta(minutes=1, seconds=30))
+    assert len(ev) == 1
+    assert ev[0]["event_type"] == "setup_confirmed"
+    assert ev[0]["snapshot"]["bias"] == "bearish"
+
+

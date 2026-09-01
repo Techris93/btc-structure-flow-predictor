@@ -47,7 +47,7 @@ Paper accounting matches research defaults: **fee 5 bps + slippage 2 bps**. Dash
 | Risk | 0.25% risk; max notional **1.0×** equity; daily −2R / weekly −4R; one open unit |
 | Exits | **1% stop / 2% target** of Bitcoin price from the fill (2R). Exact percents — no $100 magnet nudge. |
 | Fill gate | Next-open fill is cancelled if RR &lt; 1.5 after rebase |
-| Time / cooldown | Flatten at **12h** if SL/TP not hit; no same-side re-entry for **8h** after a stop |
+| Time / cooldown | Flatten at **12h** if SL/TP not hit; no same-side re-entry for **8h** after a stop, **2h** after take profit |
 | Retrace | Deep sweeps (`RETRACE_ENTRY_ATR=1.2`) use a limit pullback instead of chasing next open |
 | Soft filters | Unproven (hero RR, major magnet, same-side cooldown); `untested_breakout` is Book B shadow-only |
 | Probability | Heuristic **display/log only** — never used for sizing or hard lifecycle ranking |

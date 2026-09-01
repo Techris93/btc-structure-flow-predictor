@@ -39,13 +39,14 @@ class SignalLifecycle:
 
     VERSION = 2
 
-    def __init__(self, confirm_observations=2, invalidation_observations=3, bias_observations=2, replacement_distance_atr=.25, continuation_rearm_seconds=1800, continuation_rearm_atr=1.0):
+    def __init__(self, confirm_observations=2, invalidation_observations=3, bias_observations=2, replacement_distance_atr=.25, continuation_rearm_seconds=1800, continuation_rearm_atr=1.0, tp_rearm_seconds=7200):
         self.confirm_observations = max(1, int(confirm_observations))
         self.invalidation_observations = max(1, int(invalidation_observations))
         self.bias_observations = max(1, int(bias_observations))
         self.replacement_distance_atr = max(0.0, float(replacement_distance_atr))
         self.continuation_rearm_seconds = max(0, int(continuation_rearm_seconds))
         self.continuation_rearm_atr = max(0.0, float(continuation_rearm_atr))
+        self.tp_rearm_seconds = max(0, int(tp_rearm_seconds))
 
     @staticmethod
     def initial_state():
@@ -63,6 +64,8 @@ class SignalLifecycle:
             "retired_signal_ids": [],
             "last_confirmed_by_bias": {},
             "last_confirmed_at": None,
+            "last_exit_by_bias": {},
+            "last_exit_at": None,
             "updated_at": None,
         }
 
@@ -157,8 +160,32 @@ class SignalLifecycle:
     def _is_refractory(self, state, snapshot, observed_at):
         bias = snapshot.get("bias")
         setup_type = snapshot.get("setup_type")
+        zone = snapshot.get("zone")
         if not bias:
             return False
+
+        # 1. Post-TP (target) cooldown: block immediate same-direction entries after taking profit
+        last_exit = (state.get("last_exit_by_bias") or {}).get(bias)
+        if last_exit and str(last_exit.get("exit_reason") or "").lower() in ("target", "tp"):
+            if zone and zone == last_exit.get("zone"):
+                snapshot["rearm_status"] = "same_zone_after_target"
+                snapshot["diagnostic_only"] = True
+                return True
+            exit_time_str = last_exit.get("exit_time")
+            if exit_time_str:
+                exit_time = pd.Timestamp(exit_time_str)
+                now = pd.Timestamp(observed_at)
+                if exit_time.tzinfo is not None and now.tzinfo is None:
+                    now = now.tz_localize("UTC")
+                elif exit_time.tzinfo is None and now.tzinfo is not None:
+                    exit_time = exit_time.tz_localize("UTC")
+                elapsed_sec = (now - exit_time).total_seconds()
+                if elapsed_sec < self.tp_rearm_seconds:
+                    snapshot["rearm_status"] = "in_tp_cooldown"
+                    snapshot["diagnostic_only"] = True
+                    return True
+
+        # 2. Continuation spacing & cooldown
         last_info = (state.get("last_confirmed_by_bias") or {}).get(bias)
         if not last_info:
             return False
@@ -361,9 +388,21 @@ class SignalLifecycle:
             state["active"] = None
             state["missing_observations"] = 0
 
-        # Definitive paper closures terminate the matching active lifecycle.
+        # Definitive paper closures terminate the matching active lifecycle and track exit state.
         for trade in (paper_status or {}).get("newly_closed") or []:
-            reason = str(trade.get("exit_reason") or "")
+            reason = str(trade.get("exit_reason") or "").lower()
+            side = trade.get("side")
+            trade_bias = "bullish" if side == "long" else "bearish" if side == "short" else None
+            if trade_bias:
+                last_exits = dict(state.get("last_exit_by_bias") or {})
+                last_exits[trade_bias] = {
+                    "exit_time": trade.get("exit_time") or pd.Timestamp(observed_at).isoformat(),
+                    "exit_reason": reason,
+                    "exit_price": trade.get("exit"),
+                    "zone": trade.get("zone"),
+                }
+                state["last_exit_by_bias"] = last_exits
+                state["last_exit_at"] = trade.get("exit_time") or pd.Timestamp(observed_at).isoformat()
             if not active:
                 continue
             if reason in ("target", "stop"):
