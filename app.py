@@ -61,7 +61,7 @@ logger.setLevel(_log_level)
 data_dir = runtime_dir()
 COLLECTOR_STALE_SECONDS = max(30, int(os.getenv("COLLECTOR_STALE_SECONDS", "90")))
 # Late-entry guard: deep sweeps enter on a retrace limit. Set empty to disable.
-_retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "1.2").strip()
+_retrace_atr = os.getenv("RETRACE_ENTRY_ATR", "0.5").strip()
 flow_gate_config, flow_calibration_artifact = load_flow_gate(
     os.getenv("FLOW_CALIBRATION_PATH", str(data_dir / "flow_calibration.json")),
     requested_mode=os.getenv("FLOW_GATE_MODE", "independent"),
@@ -77,7 +77,7 @@ if os.getenv("FLOW_GATE_MODE", "independent").lower() == "calibrated" and flow_g
     logger.warning("Calibrated flow gate requested but no passed artifact is available; remaining in shadow mode")
 predictor = Predictor(
     retrace_entry_atr=float(_retrace_atr) if _retrace_atr else None,
-    retrace_pct=float(os.getenv("RETRACE_PCT", "0.5")),
+    retrace_pct=float(os.getenv("RETRACE_PCT", "0.382")),
     sweep_rearm_bars=max(1, int(os.getenv("SWEEP_REARM_BARS", "3"))),
     sweep_rearm_atr=max(0.0, float(os.getenv("SWEEP_REARM_ATR", "0.5"))),
     flow_gate_mode=flow_gate_config["gate_mode"],
@@ -87,9 +87,11 @@ predictor = Predictor(
     footprint_price_bucket=flow_gate_config["price_bucket"],
     footprint_full_credit_ratio=flow_gate_config["full_credit_ratio"],
     venue_freshness_seconds=COLLECTOR_STALE_SECONDS,
-    use_fixed_pct_exits=os.getenv("USE_FIXED_PCT_EXITS", "1").lower() in ("1", "true", "yes", "on"),
+    use_fixed_pct_exits=os.getenv("USE_FIXED_PCT_EXITS", "0").lower() in ("1", "true", "yes", "on"),
     stop_pct=float(os.getenv("FIXED_STOP_PCT", "0.01")),
     target_pct=float(os.getenv("FIXED_TARGET_PCT", "0.02")),
+    min_rr=float(os.getenv("MIN_RR", "2.0")),
+    min_adx_continuation=float(os.getenv("MIN_ADX_CONTINUATION", "25.0")),
 )
 live_lock = threading.Lock()
 push_lock = threading.Lock()
@@ -198,7 +200,7 @@ paper_ledger = PaperLedger(
     risk_fraction=float(os.getenv("PAPER_RISK_FRACTION", str(live_policy.RISK_FRACTION))),
     soft_filters=os.getenv("PAPER_SOFT_FILTERS", "1").lower() in ("1", "true", "yes", "on"),
     apply_research_costs=os.getenv("PAPER_APPLY_RESEARCH_COSTS", "1").lower() in ("1", "true", "yes", "on"),
-    use_fixed_pct_exits=os.getenv("USE_FIXED_PCT_EXITS", "1").lower() in ("1", "true", "yes", "on"),
+    use_fixed_pct_exits=os.getenv("USE_FIXED_PCT_EXITS", "0").lower() in ("1", "true", "yes", "on"),
     max_hold_hours=float(os.getenv("PAPER_MAX_HOLD_HOURS", str(live_policy.MAX_HOLD_HOURS))),
     fill_min_rr=float(os.getenv("PAPER_FILL_MIN_RR", str(live_policy.FILL_MIN_RR))),
 )

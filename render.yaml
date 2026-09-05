@@ -42,7 +42,17 @@ services:
       - key: PAPER_SAME_SIDE_TP_COOLDOWN_HOURS
         value: "2"
       - key: USE_FIXED_PCT_EXITS
-        value: "1"
+        value: "0"
+      - key: RETRACE_ENTRY_ATR
+        value: "0.5"
+      - key: RETRACE_PCT
+        value: "0.382"
+      - key: MIN_RR
+        value: "2.0"
+      - key: MIN_ADX_CONTINUATION
+        value: "25.0"
+      - key: PAPER_SOFT_MAX_RR
+        value: "3.5"
       - key: FIXED_STOP_PCT
         value: "0.01"
       - key: FIXED_TARGET_PCT

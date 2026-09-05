@@ -8,11 +8,21 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 from .footprint import footprint_confirmation
-from .indicators import atr
+from .indicators import adx, atr, ema
 from .models import PredictorOutput
 from .structure import structure_events
 from .zones import build_projected_zones
 from . import live_policy
+
+LIQUIDITY_SWEEP_ZONES = frozenset({
+    "london_high", "london_low",
+    "new_york_high", "new_york_low",
+    "asian_high", "asian_low",
+    "previous_day_high", "previous_day_low",
+    "previous_week_high", "previous_week_low",
+    "equal_highs", "equal_lows",
+    "range_high", "range_low",
+})
 
 
 def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,reclaim_bars=15,rearm_bars=3,rearm_atr=.5):
@@ -72,7 +82,7 @@ def detect_sweep(ohlc,zone,direction,setup_atr,min_depth=.05,max_depth=2.0,recla
     return {"status":"confirmed","confirmed":True,"time":breach_time,"reclaim_time":reclaim_time,"depth_atr":depth,"extreme":extreme}
 
 
-def detect_continuation(ohlc,zone,direction,setup_atr,min_acceptance_bars=1,max_retest_bars=40,retest_tolerance_atr=0.5):
+def detect_continuation(ohlc,zone,direction,setup_atr,min_acceptance_bars=2,max_retest_bars=40,retest_tolerance_atr=0.5):
     """Find a causal breakout & retest continuation episode from closed 1m bars."""
     eligible=ohlc.copy()
     eligible.index=pd.to_datetime(eligible.index,utc=True)
@@ -176,7 +186,7 @@ def pending_flow_reason(sweep):
 
 
 class Predictor:
-    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=1.5,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=False,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.5,sweep_rearm_bars=3,sweep_rearm_atr=.5,flow_gate_mode="independent",legacy_orderflow_threshold=.40,market_flow_threshold=.40,raw_footprint_threshold=.40,footprint_price_bucket=25.0,footprint_full_credit_ratio=1.5,venue_freshness_seconds=150,cache_closed_frames=False,use_fixed_pct_exits=None,stop_pct=None,target_pct=None):
+    def __init__(self,risk_fraction=.0025,atr_mult=1.5,min_rr=2.0,sweep_atr=(.05,2.0),flow_freq="1min",reclaim_bars=60,require_15m_align=False,half_life_minutes=30.0,retrace_entry_atr=None,retrace_pct=0.382,sweep_rearm_bars=3,sweep_rearm_atr=.5,flow_gate_mode="independent",legacy_orderflow_threshold=.40,market_flow_threshold=.40,raw_footprint_threshold=.40,footprint_price_bucket=25.0,footprint_full_credit_ratio=1.5,venue_freshness_seconds=150,cache_closed_frames=False,use_fixed_pct_exits=None,stop_pct=None,target_pct=None,min_adx_continuation=25.0):
         self.risk_fraction,self.atr_mult,self.min_rr,self.sweep_atr,self.flow_freq=risk_fraction,atr_mult,min_rr,sweep_atr,flow_freq
         # Default off so isolated strategy tests keep ATR/structural geometry.
         # Live app passes True (1% SL / 2% TP).
@@ -190,6 +200,7 @@ class Predictor:
         # sweep leg (pending limit) instead of at market. None = disabled
         # (market entry, original behavior).
         self.retrace_entry_atr=retrace_entry_atr; self.retrace_pct=float(retrace_pct)
+        self.min_adx_continuation=float(min_adx_continuation)
         requested_gate=str(flow_gate_mode or "independent").lower()
         self.flow_gate_mode=requested_gate if requested_gate in ("independent","calibrated") else "shadow"
         self.legacy_orderflow_threshold=float(legacy_orderflow_threshold)
@@ -285,8 +296,13 @@ class Predictor:
         bias=self._regime_bias(frames) if frames else self._last(o)[0]
         now=o.index[-1]; price=float(o.close.iloc[-1]); setup_atr=self._setup_atr(setup); a=float(setup_atr.iloc[-1]) if len(setup_atr) else np.nan
         if bias=="neutral" or not np.isfinite(a):return self._output(now,bias,no_trade_reason="timeframe_conflict" if self.last_regimes["4h"]!=self.last_regimes["1h"] else "neutral_or_unready_structure")
+        trend_frame = frames.get("4h", frames.get("1h", setup))
+        trend_adx_series = adx(trend_frame) if trend_frame is not None and len(trend_frame) >= 28 else pd.Series(dtype=float)
+        trend_adx = float(trend_adx_series.iloc[-1]) if len(trend_adx_series) and np.isfinite(trend_adx_series.iloc[-1]) else 0.0
+        is_trending = (trend_adx >= self.min_adx_continuation) if self.min_adx_continuation > 0 else True
+
         zones=self._projected_zones(setup); directional=[z for z in zones if zone_reclaim_eligible(z,now,self.reclaim_bars,self.flow_freq) and ((bias=="bullish" and z.side=="below") or (bias=="bearish" and z.side=="above"))]
-        continuation_zones=[z for z in zones if zone_reclaim_eligible(z,now,self.reclaim_bars,self.flow_freq) and ((bias=="bullish" and z.side=="above") or (bias=="bearish" and z.side=="below"))]
+        continuation_zones=[z for z in zones if is_trending and z.kind not in LIQUIDITY_SWEEP_ZONES and zone_reclaim_eligible(z,now,self.reclaim_bars,self.flow_freq) and ((bias=="bullish" and z.side=="above") or (bias=="bearish" and z.side=="below"))]
         if not directional and not continuation_zones:return self._output(now,bias,no_trade_reason="no_projected_zone")
         evaluated=[]
         for z in directional:
@@ -328,10 +344,15 @@ class Predictor:
                 "orderflow_score":flow.get("score"),"contributing_exchanges":flow.get("contributing_exchanges") or [],
                 "fresh_exchanges":flow.get("fresh_exchanges") or [],
             })
-        confirmed=[item for item in flow_evaluated if item[2].get("confirmed")]
+        confirmed_reversals=[item for item in flow_evaluated if item[1]=="reversal" and item[2].get("confirmed")]
+        confirmed_continuations=[item for item in flow_evaluated if item[1]=="continuation" and item[2].get("confirmed")]
+        confirmed = confirmed_reversals if confirmed_reversals else confirmed_continuations
         if not confirmed:
-            waiting=[p for p in flow_evaluated if p[2].get("status") in ("waiting_reclaim","waiting_retest_confirm")]
-            selected=max(waiting or flow_evaluated,key=lambda p:(p[0].score,-abs(price-p[0].midpoint))) if (waiting or flow_evaluated) else None
+            waiting_rev=[p for p in flow_evaluated if p[1]=="reversal" and p[2].get("status") in ("waiting_reclaim","waiting_retest_confirm")]
+            waiting_cont=[p for p in flow_evaluated if p[1]=="continuation" and p[2].get("status") in ("waiting_reclaim","waiting_retest_confirm")]
+            waiting=waiting_rev or waiting_cont
+            pool=waiting or [p for p in flow_evaluated if p[1]=="reversal"] or flow_evaluated
+            selected=max(pool,key=lambda p:(p[0].score,-abs(price-p[0].midpoint))) if pool else None
             if selected is None:return self._output(now,bias,no_trade_reason="no_projected_zone")
             z,stype,sweep,_,flow=selected
             diagnostics={"flow_state":"waiting_for_breach"}
@@ -360,18 +381,22 @@ class Predictor:
             geo=live_policy.fixed_pct_exits(entry,bias,stop_pct=self.stop_pct,target_pct=self.target_pct)
             stop,target,risk,rr=geo["stop"],geo["target"],geo["risk"],geo["reward_risk"]
         elif bias=="bullish":
-            stop=min(sweep["extreme"]-.5*a,price-self.atr_mult*a); risk=price-stop
+            min_dist=max(self.atr_mult*a, price*0.0075)
+            sweep_extreme=float(sweep["extreme"]) if sweep.get("extreme") is not None else (price-min_dist)
+            stop=min(sweep_extreme-.5*a, price-min_dist); risk=price-stop
             options=sorted(q.midpoint for q in active_targets if q.side=="above" and q.midpoint>price)
             target=next((t for t in options if risk>0 and (t-price)/risk>=self.min_rr), None)
             if target is None:
-                target=max(price+self.min_rr*risk,price+2*a) if risk>0 else price+2*a
+                target=price+max(self.min_rr*risk, 2.0*a) if risk>0 else price+2.0*a
             rr=(target-price)/risk if risk>0 else 0.0
         else:
-            stop=max(sweep["extreme"]+.5*a,price+self.atr_mult*a); risk=stop-price
+            min_dist=max(self.atr_mult*a, price*0.0075)
+            sweep_extreme=float(sweep["extreme"]) if sweep.get("extreme") is not None else (price+min_dist)
+            stop=max(sweep_extreme+.5*a, price+min_dist); risk=stop-price
             options=sorted((q.midpoint for q in active_targets if q.side=="below" and q.midpoint<price),reverse=True)
             target=next((t for t in options if risk>0 and (price-t)/risk>=self.min_rr), None)
             if target is None:
-                target=min(price-self.min_rr*risk,price-2*a) if risk>0 else price-2*a
+                target=price-max(self.min_rr*risk, 2.0*a) if risk>0 else price-2.0*a
             rr=(price-target)/risk if risk>0 else 0.0
         if entry_type=="limit" and not self.use_fixed_pct_exits:
             candidate_risk=(entry-stop) if bias=="bullish" else (stop-entry)
@@ -379,13 +404,13 @@ class Predictor:
                 risk=candidate_risk
                 options=sorted(q.midpoint for q in active_targets if q.side==("above" if bias=="bullish" else "below"))
                 if bias=="bullish":
-                    target=next((t for t in options if t>entry and (t-entry)/risk>=self.min_rr),max(entry+self.min_rr*risk,entry+2*a))
+                    target=next((t for t in options if t>entry and (t-entry)/risk>=self.min_rr),entry+max(self.min_rr*risk,2.0*a))
                     rr=(target-entry)/risk
                 else:
-                    target=next((t for t in options if t<entry and (entry-t)/risk>=self.min_rr),min(entry-self.min_rr*risk,entry-2*a))
+                    target=next((t for t in options if t<entry and (entry-t)/risk>=self.min_rr),entry-max(self.min_rr*risk,2.0*a))
                     rr=(entry-target)/risk
             else:
-                log.info("retrace_entry_skipped bias=%s depth_atr=%.2f market=%.2f candidate=%.2f invalid_risk=%.2f",bias,sweep["depth_atr"],price,entry,candidate_risk)
+                log.info("retrace_entry_skipped bias=%s depth_atr=%.2f market=%.2f candidate=%.2f invalid_risk=%.2f",bias,sweep.get("depth_atr",0.0),price,entry,candidate_risk)
                 entry=price; entry_type="market"
 
         skipped=[]

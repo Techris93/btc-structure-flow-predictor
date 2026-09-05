@@ -34,13 +34,22 @@ FILL_MIN_RR = float(os.getenv("PAPER_FILL_MIN_RR", "1.5"))
 # Fixed percent exits: 1% stop / 2% target → 2R from the fill.
 FIXED_STOP_PCT = float(os.getenv("FIXED_STOP_PCT", "0.01"))
 FIXED_TARGET_PCT = float(os.getenv("FIXED_TARGET_PCT", "0.02"))
-USE_FIXED_PCT_EXITS = os.getenv("USE_FIXED_PCT_EXITS", "1").lower() in ("1", "true", "yes", "on")
+USE_FIXED_PCT_EXITS = os.getenv("USE_FIXED_PCT_EXITS", "0").lower() in ("1", "true", "yes", "on")
 HUNDRED_PUSH_BUFFER = float(os.getenv("PAPER_HUNDRED_PUSH_BUFFER", "1.0"))  # dollars beyond the 100
+
+LIQUIDITY_SWEEP_ZONES = frozenset({
+    "london_high", "london_low",
+    "new_york_high", "new_york_low",
+    "asian_high", "asian_low",
+    "previous_day_high", "previous_day_low",
+    "equal_highs", "equal_lows",
+    "range_high", "range_low",
+})
 
 # Soft filters from 3-trade postmortem — labeled unproven.
 SOFT_FILTERS_ENABLED = os.getenv("PAPER_SOFT_FILTERS", "1").lower() in ("1", "true", "yes", "on")
-SOFT_MAX_PLANNED_RR = float(os.getenv("PAPER_SOFT_MAX_RR", "2.5"))
-SOFT_HERO_RR = float(os.getenv("PAPER_SOFT_HERO_RR", "3.5"))
+SOFT_MAX_PLANNED_RR = float(os.getenv("PAPER_SOFT_MAX_RR", "3.5"))
+SOFT_HERO_RR = float(os.getenv("PAPER_SOFT_HERO_RR", "4.5"))
 SOFT_PREFERRED_RR_MIN = 1.5
 SOFT_PREFERRED_RR_MAX = 2.2
 SOFT_ROUND_MAGNET_PCT = float(os.getenv("PAPER_ROUND_MAGNET_PCT", "0.001"))  # 0.1%
@@ -362,6 +371,9 @@ def evaluate_soft_filters(
     if snap.get("wide_untested_breakout"):
         # Book A: warning only — 1% SL is now uniform. Book B shadows the skip.
         warnings.append("untested_breakout_zone")
+
+    if snap.get("setup_type") == "continuation" and snap.get("zone_kind") in LIQUIDITY_SWEEP_ZONES:
+        hard_skips.append("continuation_on_liquidity_sweep_zone")
 
     # After a stop, require a new zone and block same-side re-entry for a cooldown.
     if last_closed and str(last_closed.get("exit_reason") or "").lower() == "stop":
