@@ -2401,6 +2401,18 @@ def api_paper_economics():
     })
 
 
+@app.get("/api/paper/trades")
+def api_paper_trades():
+    with paper_ledger.lock:
+        closed = list(paper_ledger._closed)
+        open_pos = dict(paper_ledger._open) if paper_ledger._open else None
+    return jsonify({
+        "count": len(closed),
+        "trades": closed,
+        "open": open_pos,
+    })
+
+
 @app.get("/api/paper/rescore")
 def api_paper_rescore():
     return jsonify(live_policy.rescore_seeded_trades())
